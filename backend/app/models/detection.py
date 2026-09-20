@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import dataclasses
 
+from pydantic import BaseModel
+
 
 @dataclasses.dataclass(frozen=True)
 class Detection:
@@ -24,3 +26,22 @@ class DetectionResult:
     source_frame_seq: int
     source_timestamp: float
     detections: list[Detection]
+
+
+class DetectionResponse(BaseModel):
+    """JSON representation of one detection."""
+
+    class_id: int
+    class_name: str
+    confidence: float
+    xyxy: tuple[float, float, float, float]
+
+
+class DetectionResultResponse(BaseModel):
+    """JSON representation of the latest completed detector result."""
+
+    detection_seq: int
+    source_session_id: str
+    source_frame_seq: int
+    source_timestamp: float
+    detections: list[DetectionResponse]

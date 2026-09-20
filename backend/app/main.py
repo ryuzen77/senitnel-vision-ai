@@ -4,6 +4,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api import health
+from app.api import detections as detections_router
 from app.api import video as video_router
 from app.services.detector_service import detector_service
 from app.services.video_service import UPLOAD_DIR, video_service
@@ -39,4 +40,5 @@ app.add_middleware(
 )
 
 app.include_router(health.router, prefix="/api")
+app.include_router(detections_router.router, prefix="/api")
 app.include_router(video_router.router, prefix="/api")
