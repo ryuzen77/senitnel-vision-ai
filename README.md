@@ -39,8 +39,8 @@ sentinel-vision-ai/
 │   └── tests/
 │       ├── __init__.py
 │       ├── conftest.py                    # FakeCapture + fixtures
-│       ├── test_video_service.py          # Unit tests (13 tests)
-│       └── test_video_api.py              # Integration tests (11 tests)
+│       ├── test_video_service.py          # Unit tests (26 tests)
+│       └── test_video_api.py              # Integration tests (22 tests)
 └── frontend/
     ├── index.html
     ├── package.json
@@ -65,19 +65,36 @@ sentinel-vision-ai/
 
 ## Running the backend
 
-```bash
+```powershell
 # Activate the Miniconda environment
 conda activate sentinel-vision
 
 # Install dependencies (first time only)
 cd backend
 pip install -r requirements.txt
-
-# Start the dev server — exactly one worker (VideoService is an in-memory singleton)
-uvicorn app.main:app --reload --workers 1 --host 0.0.0.0 --port 8000
 ```
 
-API available at `http://localhost:8000`  
+**Development** (auto-reload on file change):
+```powershell
+conda activate sentinel-vision
+cd backend
+uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+```
+
+**Stable / production** (exactly one worker — required):
+```powershell
+conda activate sentinel-vision
+cd backend
+uvicorn app.main:app --workers 1 --host 0.0.0.0 --port 8000
+```
+
+> **Important:** `VideoService` is an in-memory singleton. Running more than
+> one worker would give each worker its own independent state copy, causing
+> split-brain behaviour (one worker starts the webcam; another reports IDLE).
+> Always use exactly `--workers 1` for stable operation. Do not combine
+> `--reload` with `--workers`.
+
+API available at `http://localhost:8000`
 Interactive docs at `http://localhost:8000/docs`
 
 ---

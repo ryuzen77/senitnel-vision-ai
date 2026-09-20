@@ -20,6 +20,11 @@ export interface VideoStatusResponse {
   error: string | null
 }
 
+export interface VideoStartResponse {
+  state: VideoState
+  message: string
+}
+
 /** Thrown for client-side validation failures before any request is sent. */
 export class VideoValidationError extends Error {
   constructor(message: string) {
@@ -31,22 +36,30 @@ export class VideoValidationError extends Error {
 export const VIDEO_STREAM_URL = '/api/video/stream'
 
 const ALLOWED_MIME_TYPES = ['video/mp4', 'video/webm']
+const ALLOWED_EXTENSIONS = ['.mp4', '.webm']
 const MAX_FILE_BYTES = 200 * 1024 * 1024 // 200 MB
 
-export async function startWebcam(): Promise<VideoStatusResponse> {
+export async function startWebcam(): Promise<VideoStartResponse> {
   const res = await fetch('/api/video/webcam/start', { method: 'POST' })
   if (!res.ok) {
     const body = await res.json().catch(() => ({}))
     throw new Error(body?.detail ?? `HTTP ${res.status}`)
   }
-  return res.json() as Promise<VideoStatusResponse>
+  return res.json() as Promise<VideoStartResponse>
 }
 
-export async function uploadVideo(file: File): Promise<VideoStatusResponse> {
+export async function uploadVideo(file: File): Promise<VideoStartResponse> {
   // Client-side guards — no request sent on failure
   if (!ALLOWED_MIME_TYPES.includes(file.type)) {
     throw new VideoValidationError(
       `Tipe file tidak didukung: ${file.type}. Gunakan MP4 atau WebM.`,
+    )
+  }
+  const dotIndex = file.name.lastIndexOf('.')
+  const extension = dotIndex >= 0 ? file.name.slice(dotIndex).toLowerCase() : ''
+  if (!ALLOWED_EXTENSIONS.includes(extension)) {
+    throw new VideoValidationError(
+      `Ekstensi file tidak didukung: "${extension || '(tidak ada)'}". Gunakan .mp4 atau .webm.`,
     )
   }
   if (file.size > MAX_FILE_BYTES) {
@@ -63,7 +76,7 @@ export async function uploadVideo(file: File): Promise<VideoStatusResponse> {
     const body = await res.json().catch(() => ({}))
     throw new Error(body?.detail ?? `HTTP ${res.status}`)
   }
-  return res.json() as Promise<VideoStatusResponse>
+  return res.json() as Promise<VideoStartResponse>
 }
 
 export async function stopVideo(): Promise<VideoStatusResponse> {
