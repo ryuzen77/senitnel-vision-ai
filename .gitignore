@@ -20,6 +20,12 @@ backend/app/storage/uploads/*
 !backend/app/storage/uploads/.gitkeep
 *.log
 
+# -- Local media --------------------------------------------------------------
+*.mp4
+*.webm
+*.avi
+*.mov
+
 # -- Frontend -----------------------------------------------------------------
 frontend/node_modules/
 frontend/dist/
