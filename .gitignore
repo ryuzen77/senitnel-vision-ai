@@ -1,0 +1,37 @@
+# -- Secrets ------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# -- Python -------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+env/
+
+# -- Uploads and runtime data -------------------------------------------------
+backend/app/storage/uploads/*
+!backend/app/storage/uploads/.gitkeep
+*.log
+
+# -- Frontend -----------------------------------------------------------------
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+
+# -- Models and generated inference artifacts ---------------------------------
+*.pt
+*.pth
+*.onnx
+*.engine
+*.torchscript
+
+# -- IDE and OS ---------------------------------------------------------------
+.DS_Store
+Thumbs.db
