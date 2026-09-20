@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import {
   startWebcam,
   stopVideo,
@@ -9,33 +9,59 @@ import {
 
 interface Props {
   state: VideoState
+  /** Called whenever pendingState changes so App can derive effectiveState. */
+  onPendingStateChange: (pending: VideoState | null) => void
 }
 
 type Tab = 'webcam' | 'upload'
 
-export function VideoSourceSelector({ state }: Props) {
+export function VideoSourceSelector({ state, onPendingStateChange }: Props) {
   const [activeTab, setActiveTab] = useState<Tab>('webcam')
   const [actionError, setActionError] = useState<string | null>(null)
   const [isActing, setIsActing] = useState(false)
+  const [pendingState, setPendingStateRaw] = useState<VideoState | null>(null)
 
+  // Keep parent in sync whenever pendingState changes.
+  function setPendingState(next: VideoState | null) {
+    setPendingStateRaw(next)
+    onPendingStateChange(next)
+  }
+
+  // Clear pendingState once the polled backend state confirms it.
+  useEffect(() => {
+    if (pendingState !== null && state === pendingState) {
+      setPendingState(null)
+    }
+  }, [state, pendingState]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  const effectiveState = pendingState ?? state
   const isTransitioning =
-    state === VideoState.STARTING || state === VideoState.STOPPING
+    effectiveState === VideoState.STARTING || effectiveState === VideoState.STOPPING
   const disabled = isTransitioning || isActing
 
   async function handleWebcamClick() {
     setActionError(null)
     setIsActing(true)
-    try {
-      if (state === VideoState.RUNNING || state === VideoState.ERROR) {
-        await stopVideo()
-      } else {
-        await startWebcam()
+    if (effectiveState === VideoState.RUNNING || effectiveState === VideoState.ERROR) {
+      setPendingState(VideoState.STOPPING)
+      try {
+        const res = await stopVideo()
+        setPendingState(res.state)
+      } catch (err: unknown) {
+        setPendingState(null)
+        setActionError(err instanceof Error ? err.message : String(err))
       }
-    } catch (err: unknown) {
-      setActionError(err instanceof Error ? err.message : String(err))
-    } finally {
-      setIsActing(false)
+    } else {
+      setPendingState(VideoState.STARTING)
+      try {
+        const res = await startWebcam()
+        setPendingState(res.state)
+      } catch (err: unknown) {
+        setPendingState(null)
+        setActionError(err instanceof Error ? err.message : String(err))
+      }
     }
+    setIsActing(false)
   }
 
   async function handleFileChange(e: React.ChangeEvent<HTMLInputElement>) {
@@ -45,21 +71,23 @@ export function VideoSourceSelector({ state }: Props) {
     e.target.value = ''
     setActionError(null)
     setIsActing(true)
+    setPendingState(VideoState.STARTING)
     try {
-      await uploadVideo(file)
+      const res = await uploadVideo(file)
+      setPendingState(res.state)
     } catch (err: unknown) {
+      setPendingState(null)
       if (err instanceof VideoValidationError) {
         setActionError(err.message)
       } else {
         setActionError(err instanceof Error ? err.message : String(err))
       }
-    } finally {
-      setIsActing(false)
     }
+    setIsActing(false)
   }
 
   const webcamLabel =
-    state === VideoState.RUNNING || state === VideoState.ERROR
+    effectiveState === VideoState.RUNNING || effectiveState === VideoState.ERROR
       ? 'Hentikan'
       : 'Mulai Webcam'
 

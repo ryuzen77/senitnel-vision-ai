@@ -13,6 +13,7 @@ interface HealthResponse {
 function App() {
   const [health, setHealth] = useState<HealthResponse | null>(null)
   const { status, fetchError } = useVideoStatus()
+  const [pendingState, setPendingState] = useState<VideoState | null>(null)
 
   useEffect(() => {
     fetch('/api/health')
@@ -22,6 +23,9 @@ function App() {
   }, [])
 
   const videoState = status?.state ?? VideoState.IDLE
+  // Use the optimistic pending state from VideoSourceSelector until
+  // the backend poll confirms it, then fall back to the polled state.
+  const effectiveState = pendingState ?? videoState
 
   return (
     <main style={{ fontFamily: 'system-ui, sans-serif', padding: '2rem', maxWidth: 800, margin: '0 auto' }}>
@@ -42,7 +46,7 @@ function App() {
       <section>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: '0.75rem' }}>
           <h2 style={{ margin: 0, fontSize: '1rem' }}>Sumber Video</h2>
-          <VideoStatusBadge state={videoState} />
+          <VideoStatusBadge state={effectiveState} />
         </div>
 
         {fetchError && (
@@ -52,8 +56,11 @@ function App() {
         )}
 
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem' }}>
-          <VideoSourceSelector state={videoState} />
-          <VideoPreview state={videoState} />
+          <VideoSourceSelector
+            state={videoState}
+            onPendingStateChange={setPendingState}
+          />
+          <VideoPreview state={effectiveState} />
         </div>
       </section>
     </main>
