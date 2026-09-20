@@ -40,6 +40,7 @@ class FramePacket:
     jpeg  : JPEG-encoded bytes of the frame ready for MJPEG delivery.
     """
 
+    session_id: str
     seq: int
     ts: float
     frame: np.ndarray

@@ -48,10 +48,14 @@ import threading
 import time
 import uuid
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import cv2
 
 from app.models.video import FramePacket, VideoStartResponse, VideoState, VideoStatusResponse
+
+if TYPE_CHECKING:
+    from app.services.detector_service import DetectorService
 
 # ---------------------------------------------------------------------------
 # Module-level constants
@@ -78,8 +82,9 @@ class VideoService:
                                            → ERROR → (stop) → IDLE
     """
 
-    def __init__(self) -> None:
+    def __init__(self, detector: DetectorService | None = None) -> None:
         self._lock = threading.Lock()
+        self._detector = detector
 
         # State fields — all guarded by _lock
         self._state: VideoState = VideoState.IDLE
@@ -95,6 +100,7 @@ class VideoService:
         # Used to detect stop/upload races: if the token has changed by the
         # time start_file() hands off, a stop() has intervened.
         self._start_token: str | None = None
+        self._session_id: str | None = None
 
         # Packet slot — guarded exclusively by _packet_cond
         self._packet_cond: threading.Condition = threading.Condition()
@@ -115,11 +121,20 @@ class VideoService:
             if self._state != VideoState.IDLE:
                 return None
             token = str(uuid.uuid4())
+            session_id = str(uuid.uuid4())
             self._start_token = token
+            self._session_id = session_id
             self._state = VideoState.STARTING
             self._stop_event.clear()
             self._released = False
-            return token
+        # This only switches a small in-memory slot; model work remains in its
+        # worker and capture never waits for it.
+        if self._detector is not None:
+            try:
+                self._detector.start_session(session_id)
+            except Exception:
+                logger.exception("Unable to start detector session")
+        return token
 
     def _release_resources(self) -> None:
         """
@@ -138,6 +153,8 @@ class VideoService:
             self._cap = None
             self._thread = None
             self._upload_path = None
+            session_id = self._session_id
+            self._session_id = None
             # Signal the capture thread to stop (idempotent)
             self._stop_event.set()
         # --- Lock released before join to avoid deadlock ---
@@ -160,6 +177,13 @@ class VideoService:
         with self._packet_cond:
             self._packet = None
             self._packet_cond.notify_all()
+
+        if session_id is not None and self._detector is not None:
+            try:
+                self._detector.end_session(session_id)
+            except Exception:
+                # Detection is optional: lifecycle failures must not break video cleanup.
+                logger.exception("Unable to end detector session")
 
     # ------------------------------------------------------------------
     # Public start methods
@@ -363,7 +387,12 @@ class VideoService:
                 if not ok:
                     continue
 
+                with self._lock:
+                    session_id = self._session_id
+                if session_id is None:
+                    continue
                 packet = FramePacket(
+                    session_id=session_id,
                     seq=seq,
                     ts=time.monotonic(),
                     frame=frame,
@@ -374,6 +403,8 @@ class VideoService:
                 with self._packet_cond:
                     self._packet = packet
                     self._packet_cond.notify_all()
+                if self._detector is not None:
+                    self._detector.offer(packet)
 
         except Exception as exc:
             with self._lock:
@@ -427,7 +458,12 @@ class VideoService:
                         time.sleep(remaining)
                     continue
 
+                with self._lock:
+                    session_id = self._session_id
+                if session_id is None:
+                    continue
                 packet = FramePacket(
+                    session_id=session_id,
                     seq=seq,
                     ts=time.monotonic(),
                     frame=frame,
@@ -438,6 +474,8 @@ class VideoService:
                 with self._packet_cond:
                     self._packet = packet
                     self._packet_cond.notify_all()
+                if self._detector is not None:
+                    self._detector.offer(packet)
 
                 # Monotonic deadline: sleep only the time remaining after encode.
                 remaining = deadline - time.monotonic()
@@ -465,4 +503,6 @@ class VideoService:
 # Module-level singleton
 # ---------------------------------------------------------------------------
 
-video_service = VideoService()
+from app.services.detector_service import detector_service
+
+video_service = VideoService(detector=detector_service)

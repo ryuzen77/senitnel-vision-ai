@@ -5,6 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api import health
 from app.api import video as video_router
+from app.services.detector_service import detector_service
 from app.services.video_service import UPLOAD_DIR, video_service
 
 
@@ -15,6 +16,7 @@ async def lifespan(app: FastAPI):  # noqa: ANN001
     yield
     # ── Shutdown ─────────────────────────────────────────────────────────────
     video_service.stop()
+    detector_service.close()
 
 
 app = FastAPI(
