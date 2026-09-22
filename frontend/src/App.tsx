@@ -1,9 +1,11 @@
 import { useEffect, useState } from 'react'
 import { VideoPreview } from './components/VideoPreview'
+import { DetectionPanel } from './components/DetectionPanel'
 import { VideoSourceSelector } from './components/VideoSourceSelector'
 import { VideoStatusBadge } from './components/VideoStatusBadge'
 import { VideoState } from './api/videoApi'
 import { useVideoStatus } from './hooks/useVideoStatus'
+import { useLatestDetection } from './hooks/useLatestDetection'
 
 interface HealthResponse {
   status: string
@@ -26,9 +28,12 @@ function App() {
   // Use the optimistic pending state from VideoSourceSelector until
   // the backend poll confirms it, then fall back to the polled state.
   const effectiveState = pendingState ?? videoState
+  const { result: latestDetection, fetchError: detectionError } = useLatestDetection(
+    videoState === VideoState.RUNNING,
+  )
 
   return (
-    <main style={{ fontFamily: 'system-ui, sans-serif', padding: '2rem', maxWidth: 800, margin: '0 auto' }}>
+    <main className="app-shell">
       <h1 style={{ marginBottom: '0.25rem' }}>Sentinel Vision AI</h1>
 
       {/* Health */}
@@ -55,12 +60,19 @@ function App() {
           </p>
         )}
 
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem' }}>
+        <div className="video-workspace">
+          <VideoPreview state={effectiveState} />
+          <DetectionPanel
+            state={videoState}
+            result={latestDetection}
+            fetchError={detectionError}
+          />
+        </div>
+        <div style={{ marginTop: '1rem', maxWidth: 420 }}>
           <VideoSourceSelector
             state={videoState}
             onPendingStateChange={setPendingState}
           />
-          <VideoPreview state={effectiveState} />
         </div>
       </section>
     </main>

@@ -25,6 +25,21 @@ export interface VideoStartResponse {
   message: string
 }
 
+export interface Detection {
+  class_id: number
+  class_name: string
+  confidence: number
+  xyxy: [number, number, number, number]
+}
+
+export interface DetectionResult {
+  detection_seq: number
+  source_session_id: string
+  source_frame_seq: number
+  source_timestamp: number
+  detections: Detection[]
+}
+
 /** Thrown for client-side validation failures before any request is sent. */
 export class VideoValidationError extends Error {
   constructor(message: string) {
@@ -94,4 +109,17 @@ export async function getVideoStatus(): Promise<VideoStatusResponse> {
     throw new Error(`HTTP ${res.status}`)
   }
   return res.json() as Promise<VideoStatusResponse>
+}
+
+/** Returns null when the detector has not completed a result for this session. */
+export async function getLatestDetection(signal?: AbortSignal): Promise<DetectionResult | null> {
+  const res = await fetch('/api/detections/latest', { signal })
+  if (res.status === 204) {
+    return null
+  }
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}))
+    throw new Error(body?.detail ?? `HTTP ${res.status}`)
+  }
+  return res.json() as Promise<DetectionResult>
 }
