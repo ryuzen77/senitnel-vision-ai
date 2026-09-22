@@ -9,6 +9,8 @@ from __future__ import annotations
 import dataclasses
 import enum
 
+from pydantic import BaseModel
+
 
 class DomainName(str, enum.Enum):
     UNKNOWN = "UNKNOWN"
@@ -23,6 +25,19 @@ class DomainState(str, enum.Enum):
 
 @dataclasses.dataclass(frozen=True)
 class DomainSnapshot:
+    source_session_id: str | None
+    state: DomainState
+    domain: DomainName
+    observation_count: int
+    evidence_hits: int
+    confidence: float
+    locked: bool
+    last_detection_seq: int | None
+
+
+class DomainSnapshotResponse(BaseModel):
+    """Stable JSON representation of the current domain snapshot."""
+
     source_session_id: str | None
     state: DomainState
     domain: DomainName
