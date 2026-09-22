@@ -48,7 +48,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 import cv2
 
@@ -56,6 +56,16 @@ from app.models.video import FramePacket, VideoStartResponse, VideoState, VideoS
 
 if TYPE_CHECKING:
     from app.services.detector_service import DetectorService
+
+
+class FramePacketConsumer(Protocol):
+    """Small nonblocking capture consumer contract used by optional workers."""
+
+    def start_session(self, session_id: str) -> None: ...
+
+    def offer(self, packet: FramePacket) -> None: ...
+
+    def end_session(self, session_id: str) -> None: ...
 
 # ---------------------------------------------------------------------------
 # Module-level constants
@@ -82,9 +92,14 @@ class VideoService:
                                            → ERROR → (stop) → IDLE
     """
 
-    def __init__(self, detector: DetectorService | None = None) -> None:
+    def __init__(
+        self,
+        detector: DetectorService | None = None,
+        scene_classifier: FramePacketConsumer | None = None,
+    ) -> None:
         self._lock = threading.Lock()
         self._detector = detector
+        self._scene_classifier = scene_classifier
 
         # State fields — all guarded by _lock
         self._state: VideoState = VideoState.IDLE
@@ -134,6 +149,12 @@ class VideoService:
                 self._detector.start_session(session_id)
             except Exception:
                 logger.exception("Unable to start detector session")
+        if self._scene_classifier is not None:
+            try:
+                self._scene_classifier.start_session(session_id)
+            except Exception:
+                # Scene sampling is optional and must not make video start fail.
+                logger.exception("Unable to start scene classifier session")
         return token
 
     def _release_resources(self) -> None:
@@ -184,6 +205,21 @@ class VideoService:
             except Exception:
                 # Detection is optional: lifecycle failures must not break video cleanup.
                 logger.exception("Unable to end detector session")
+        if session_id is not None and self._scene_classifier is not None:
+            try:
+                self._scene_classifier.end_session(session_id)
+            except Exception:
+                logger.exception("Unable to end scene classifier session")
+
+    def _offer_consumers(self, packet: FramePacket) -> None:
+        """Keep capture alive if either optional asynchronous consumer fails."""
+        for label, consumer in (("detector", self._detector), ("scene classifier", self._scene_classifier)):
+            if consumer is None:
+                continue
+            try:
+                consumer.offer(packet)
+            except Exception:
+                logger.exception("Unable to offer packet to %s", label)
 
     # ------------------------------------------------------------------
     # Public start methods
@@ -403,8 +439,7 @@ class VideoService:
                 with self._packet_cond:
                     self._packet = packet
                     self._packet_cond.notify_all()
-                if self._detector is not None:
-                    self._detector.offer(packet)
+                self._offer_consumers(packet)
 
         except Exception as exc:
             with self._lock:
@@ -474,8 +509,7 @@ class VideoService:
                 with self._packet_cond:
                     self._packet = packet
                     self._packet_cond.notify_all()
-                if self._detector is not None:
-                    self._detector.offer(packet)
+                self._offer_consumers(packet)
 
                 # Monotonic deadline: sleep only the time remaining after encode.
                 remaining = deadline - time.monotonic()
@@ -500,9 +534,10 @@ class VideoService:
 
 
 # ---------------------------------------------------------------------------
-# Module-level singleton
-# ---------------------------------------------------------------------------
+def __getattr__(name: str):  # noqa: ANN202
+    """Compatibility export; production ownership lives in ``runtime``."""
+    if name == "video_service":
+        from app.services.runtime import video_service
 
-from app.services.detector_service import detector_service
-
-video_service = VideoService(detector=detector_service)
+        return video_service
+    raise AttributeError(name)

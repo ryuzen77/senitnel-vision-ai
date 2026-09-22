@@ -11,7 +11,7 @@ import logging
 import threading
 from collections.abc import Callable
 from pathlib import Path
-from typing import Protocol
+from typing import ContextManager, Protocol
 
 import numpy as np
 
@@ -68,9 +68,13 @@ class DetectorService:
         self,
         model_factory: ModelFactory | None = None,
         result_consumer: DetectionResultConsumer | None = None,
+        cuda_gate: ContextManager[None] | None = None,
     ) -> None:
         self._model_factory = model_factory or _default_model_factory
         self._result_consumer = result_consumer
+        # Production injects the application-wide gate.  This per-instance
+        # fallback keeps isolated CPU-only unit tests independent.
+        self._cuda_gate = cuda_gate or threading.Lock()
         self._runner: InferenceRunner | None = None
         self._cond = threading.Condition()
         self._active_session_id: str | None = None
@@ -145,10 +149,13 @@ class DetectorService:
                 continue
 
             try:
-                if self._runner is None:
-                    self._runner = self._model_factory()
-                # The detector must never mutate VideoService's raw frame.
-                detections = self._runner(packet.frame.copy())
+                # Only lazy loading and inference use the CUDA gate.  Waiting,
+                # packet state and publishing results remain outside it.
+                with self._cuda_gate:
+                    if self._runner is None:
+                        self._runner = self._model_factory()
+                    # The detector must never mutate VideoService's raw frame.
+                    detections = self._runner(packet.frame.copy())
             except Exception:
                 logger.exception("Detector inference failed for frame %s", packet.seq)
                 continue
@@ -170,5 +177,10 @@ class DetectorService:
                 self._result_consumer.observe(result)
 
 
-# The application singleton is safe because the model is lazy-loaded in the worker.
-detector_service = DetectorService(result_consumer=domain_service)
+def __getattr__(name: str):  # noqa: ANN202
+    """Compatibility export; production ownership lives in ``runtime``."""
+    if name == "detector_service":
+        from app.services.runtime import detector_service
+
+        return detector_service
+    raise AttributeError(name)

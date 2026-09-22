@@ -7,8 +7,8 @@ from app.api import health
 from app.api import domain as domain_router
 from app.api import detections as detections_router
 from app.api import video as video_router
-from app.services.detector_service import detector_service
-from app.services.video_service import UPLOAD_DIR, video_service
+from app.services.runtime import detector_service, scene_domain_classifier, video_service
+from app.services.video_service import UPLOAD_DIR
 
 
 @asynccontextmanager
@@ -18,6 +18,7 @@ async def lifespan(app: FastAPI):  # noqa: ANN001
     yield
     # ── Shutdown ─────────────────────────────────────────────────────────────
     video_service.stop()
+    scene_domain_classifier.close()
     detector_service.close()
 
 
