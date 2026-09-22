@@ -40,6 +40,27 @@ export interface DetectionResult {
   detections: Detection[]
 }
 
+export type DomainState = 'IDLE' | 'PROBING' | 'LOCKED'
+export type DomainName = 'UNKNOWN' | 'PARKING_MOTORCYCLE' | 'RETAIL_STORE'
+export type DecisionSource = 'YOLO' | 'CLIP'
+
+export interface DomainSnapshot {
+  source_session_id: string | null
+  state: DomainState
+  domain: DomainName
+  observation_count: number
+  evidence_hits: number
+  confidence: number
+  locked: boolean
+  last_detection_seq: number | null
+  decision_source: DecisionSource | null
+  scene_model: string | null
+  scene_sample_count: number | null
+  scene_top_score: number | null
+  scene_mean_margin: number | null
+  scene_consistency: number | null
+}
+
 /** Thrown for client-side validation failures before any request is sent. */
 export class VideoValidationError extends Error {
   constructor(message: string) {
@@ -122,4 +143,14 @@ export async function getLatestDetection(signal?: AbortSignal): Promise<Detectio
     throw new Error(body?.detail ?? `HTTP ${res.status}`)
   }
   return res.json() as Promise<DetectionResult>
+}
+
+/** Returns the current read-only, session-scoped domain snapshot. */
+export async function getCurrentDomain(signal?: AbortSignal): Promise<DomainSnapshot> {
+  const res = await fetch('/api/domain/current', { signal })
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}))
+    throw new Error(body?.detail ?? `HTTP ${res.status}`)
+  }
+  return res.json() as Promise<DomainSnapshot>
 }

@@ -6,6 +6,8 @@ import { VideoStatusBadge } from './components/VideoStatusBadge'
 import { VideoState } from './api/videoApi'
 import { useVideoStatus } from './hooks/useVideoStatus'
 import { useLatestDetection } from './hooks/useLatestDetection'
+import { useCurrentDomain } from './hooks/useCurrentDomain'
+import { DomainStatusBadge, getDomainUiState } from './components/DomainStatusBadge'
 
 interface HealthResponse {
   status: string
@@ -31,6 +33,10 @@ function App() {
   const { result: latestDetection, fetchError: detectionError } = useLatestDetection(
     videoState === VideoState.RUNNING,
   )
+  const { snapshot: domainSnapshot, fetchError: domainError } = useCurrentDomain(
+    effectiveState === VideoState.RUNNING,
+  )
+  const domainUi = getDomainUiState(effectiveState, domainSnapshot, domainError)
   const sourceLabel = status?.source
     ? status.source === 'webcam' ? 'Webcam' : 'Uploaded Video'
     : 'Tidak ada'
@@ -46,7 +52,7 @@ function App() {
         <ol className="pipeline-list">
           <PipelineStep label="Video Feed" detail={videoState === VideoState.RUNNING ? 'Aktif' : 'Menunggu'} active={videoState === VideoState.RUNNING} />
           <PipelineStep label="Object Detection" detail={latestDetection ? 'Aktif' : 'Menunggu'} active={latestDetection !== null} />
-          <PipelineStep label="Domain Analysis" detail="Belum aktif" active={false} />
+          <PipelineStep label="Domain Analysis" detail={domainUi.stage} active={domainUi.active} tone={domainUi.tone} />
           <PipelineStep label="Response System" detail="Belum aktif" active={false} />
         </ol>
       </section>
@@ -64,7 +70,7 @@ function App() {
         <div className="video-workspace">
           <div className="video-column">
             <VideoPreview state={effectiveState} />
-            <div className="video-status-strip" aria-label="Status video dan AI"><span><small>Sumber aktif</small><strong>{sourceLabel}</strong></span><span><small>Status AI detector</small><strong>{detectorStatus(videoState, latestDetection, detectionError)}</strong></span></div>
+            <div className="video-status-strip" aria-label="Status video dan AI"><span><small>Sumber aktif</small><strong>{sourceLabel}</strong></span><span><small>Status AI detector</small><strong>{detectorStatus(videoState, latestDetection, detectionError)}</strong></span><span><small>Status domain</small><strong><DomainStatusBadge value={domainUi} /></strong>{domainUi.detail && <small className="domain-detail">{domainUi.detail}</small>}</span></div>
             <VideoSourceSelector state={videoState} onPendingStateChange={setPendingState} />
           </div>
           <DetectionPanel
@@ -78,8 +84,8 @@ function App() {
   )
 }
 
-function PipelineStep({ label, detail, active }: { label: string; detail: string; active: boolean }) {
-  return <li className={active ? 'pipeline-step is-active' : 'pipeline-step'}><span className="pipeline-marker" aria-hidden="true" /><span><strong>{label}</strong><small>{detail}</small></span></li>
+function PipelineStep({ label, detail, active, tone }: { label: string; detail: string; active: boolean; tone?: string }) {
+  return <li className={`${active ? 'pipeline-step is-active' : 'pipeline-step'} ${tone ? `is-${tone}` : ''}`}><span className="pipeline-marker" aria-hidden="true" /><span><strong>{label}</strong><small>{detail}</small></span></li>
 }
 
 function detectorStatus(state: VideoState, result: unknown, error: string | null): string {
