@@ -4,30 +4,19 @@ interface Props {
   state: VideoState
 }
 
-const STATE_CONFIG: Record<VideoState, { label: string; bg: string; color: string }> = {
-  [VideoState.IDLE]: { label: 'Idle', bg: '#e5e7eb', color: '#374151' },
-  [VideoState.STARTING]: { label: 'Memulai…', bg: '#fef3c7', color: '#92400e' },
-  [VideoState.RUNNING]: { label: 'Berjalan', bg: '#d1fae5', color: '#065f46' },
-  [VideoState.STOPPING]: { label: 'Menghentikan…', bg: '#fee2e2', color: '#991b1b' },
-  [VideoState.ERROR]: { label: 'Error', bg: '#fecaca', color: '#7f1d1d' },
+const STATE_CONFIG: Record<VideoState, { label: string; tone: string }> = {
+  [VideoState.IDLE]: { label: 'IDLE', tone: 'idle' },
+  [VideoState.STARTING]: { label: 'STARTING', tone: 'starting' },
+  [VideoState.RUNNING]: { label: 'RUNNING', tone: 'running' },
+  [VideoState.STOPPING]: { label: 'STOPPING', tone: 'stopping' },
+  [VideoState.ERROR]: { label: 'ERROR', tone: 'error' },
 }
 
 export function VideoStatusBadge({ state }: Props) {
-  const { label, bg, color } = STATE_CONFIG[state] ?? STATE_CONFIG[VideoState.IDLE]
+  const { label, tone } = STATE_CONFIG[state] ?? STATE_CONFIG[VideoState.IDLE]
 
   return (
-    <span
-      style={{
-        display: 'inline-block',
-        padding: '2px 10px',
-        borderRadius: '9999px',
-        fontSize: '0.75rem',
-        fontWeight: 600,
-        letterSpacing: '0.03em',
-        background: bg,
-        color,
-      }}
-    >
+    <span className={`video-state-badge ${tone}`}><span className="status-dot" aria-hidden="true" />
       {label}
     </span>
   )

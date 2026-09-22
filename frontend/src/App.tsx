@@ -31,52 +31,61 @@ function App() {
   const { result: latestDetection, fetchError: detectionError } = useLatestDetection(
     videoState === VideoState.RUNNING,
   )
+  const sourceLabel = status?.source
+    ? status.source === 'webcam' ? 'Webcam' : 'Uploaded Video'
+    : 'Tidak ada'
 
   return (
     <main className="app-shell">
-      <h1 style={{ marginBottom: '0.25rem' }}>Sentinel Vision AI</h1>
-
-      {/* Health */}
-      {health ? (
-        <p style={{ margin: '0 0 1.5rem', color: '#57606a', fontSize: '0.875rem' }}>
-          Backend: <strong>{health.status}</strong> — {health.service}
-        </p>
-      ) : (
-        <p style={{ margin: '0 0 1.5rem', color: '#57606a', fontSize: '0.875rem' }}>
-          Menghubungkan ke backend…
-        </p>
-      )}
-
-      {/* Video panel */}
-      <section>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: '0.75rem' }}>
-          <h2 style={{ margin: 0, fontSize: '1rem' }}>Sumber Video</h2>
+      <header className="dashboard-header">
+        <div><p className="eyebrow">MONITORING CONSOLE</p><h1>SENTINEL VISION AI</h1><p className="header-subtitle">Autonomous Video Analytics &amp; Real-Time Object Detection</p></div>
+        <span className={`backend-badge ${health?.status === 'online' ? 'is-online' : 'is-offline'}`}><span className="status-dot" aria-hidden="true" />Backend {health?.status === 'online' ? 'Online' : health ? 'Offline' : 'Menghubungkan'}</span>
+      </header>
+      <section className="pipeline-card" aria-labelledby="pipeline-heading">
+        <div className="section-heading"><div><p className="eyebrow">SYSTEM PIPELINE</p><h2 id="pipeline-heading">Status Analitik</h2></div></div>
+        <ol className="pipeline-list">
+          <PipelineStep label="Video Feed" detail={videoState === VideoState.RUNNING ? 'Aktif' : 'Menunggu'} active={videoState === VideoState.RUNNING} />
+          <PipelineStep label="Object Detection" detail={latestDetection ? 'Aktif' : 'Menunggu'} active={latestDetection !== null} />
+          <PipelineStep label="Domain Analysis" detail="Belum aktif" active={false} />
+          <PipelineStep label="Response System" detail="Belum aktif" active={false} />
+        </ol>
+      </section>
+      <section className="monitoring-section">
+        <div className="section-heading source-heading"><div><p className="eyebrow">VIDEO INPUT</p><h2>Sumber Video</h2></div>
           <VideoStatusBadge state={effectiveState} />
         </div>
 
         {fetchError && (
-          <p style={{ color: '#991b1b', fontSize: '0.8rem', marginBottom: 8 }}>
-            Status error: {fetchError}
+          <p className="inline-error" role="status">
+            Status video tidak tersedia: {fetchError}
           </p>
         )}
 
         <div className="video-workspace">
-          <VideoPreview state={effectiveState} />
+          <div className="video-column">
+            <VideoPreview state={effectiveState} />
+            <div className="video-status-strip" aria-label="Status video dan AI"><span><small>Sumber aktif</small><strong>{sourceLabel}</strong></span><span><small>Status AI detector</small><strong>{detectorStatus(videoState, latestDetection, detectionError)}</strong></span></div>
+            <VideoSourceSelector state={videoState} onPendingStateChange={setPendingState} />
+          </div>
           <DetectionPanel
             state={videoState}
             result={latestDetection}
             fetchError={detectionError}
           />
         </div>
-        <div style={{ marginTop: '1rem', maxWidth: 420 }}>
-          <VideoSourceSelector
-            state={videoState}
-            onPendingStateChange={setPendingState}
-          />
-        </div>
       </section>
     </main>
   )
+}
+
+function PipelineStep({ label, detail, active }: { label: string; detail: string; active: boolean }) {
+  return <li className={active ? 'pipeline-step is-active' : 'pipeline-step'}><span className="pipeline-marker" aria-hidden="true" /><span><strong>{label}</strong><small>{detail}</small></span></li>
+}
+
+function detectorStatus(state: VideoState, result: unknown, error: string | null): string {
+  if (state !== VideoState.RUNNING) return 'Menunggu'
+  if (error) return 'Tidak tersedia'
+  return result ? 'Aktif' : 'Menganalisis'
 }
 
 export default App

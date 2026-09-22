@@ -8,12 +8,12 @@ interface Props {
 
 export function DetectionPanel({ state, result, fetchError }: Props) {
   if (state !== VideoState.RUNNING) {
-    return <PanelShell><p className="detection-muted">AI detector menunggu sumber video</p></PanelShell>
+    return <PanelShell status="Menunggu"><p className="detection-muted">AI detector menunggu sumber video</p></PanelShell>
   }
 
   if (fetchError) {
     return (
-      <PanelShell>
+      <PanelShell status="Tidak tersedia">
         <p className="detection-error">Data deteksi sementara tidak tersedia</p>
         <p className="detection-muted">{fetchError}</p>
       </PanelShell>
@@ -21,19 +21,19 @@ export function DetectionPanel({ state, result, fetchError }: Props) {
   }
 
   if (result === null) {
-    return <PanelShell><p className="detection-muted">Menganalisis frame…</p></PanelShell>
+    return <PanelShell status="Menganalisis"><p className="detection-muted">Menganalisis frame…</p></PanelShell>
   }
 
   if (result.detections.length === 0) {
     return (
-      <PanelShell result={result}>
+      <PanelShell result={result} status="Aktif">
         <p className="detection-muted">Tidak ada objek pada frame terbaru</p>
       </PanelShell>
     )
   }
 
   return (
-    <PanelShell result={result}>
+    <PanelShell result={result} status="Aktif">
       <p className="detection-count">{result.detections.length} objek terdeteksi</p>
       <ul className="detection-list">
         {result.detections.map((detection, index) => (
@@ -47,10 +47,10 @@ export function DetectionPanel({ state, result, fetchError }: Props) {
   )
 }
 
-function PanelShell({ children, result }: { children: React.ReactNode; result?: DetectionResult }) {
+function PanelShell({ children, result, status }: { children: React.ReactNode; result?: DetectionResult; status: string }) {
   return (
     <aside className="detection-panel" aria-live="polite">
-      <h2>Deteksi Objek</h2>
+      <div className="detection-heading"><div><p className="eyebrow">REAL-TIME ANALYSIS</p><h2>Live Detection</h2></div><span className="detector-state">{status}</span></div>
       {result && (
         <div className="detection-meta">
           <span>Frame #{result.source_frame_seq}</span>

@@ -29,39 +29,21 @@ export function VideoPreview({ state }: Props) {
 
   if (streamUrl !== null) {
     return (
-      <div style={wrapperStyle}>
+      <div className="video-preview is-running">
         <img
           src={streamUrl}
           alt="Preview video langsung"
-          style={{ width: '100%', display: 'block' }}
         />
       </div>
     )
   }
 
   return (
-    <div
-      style={{
-        ...wrapperStyle,
-        background: '#f3f4f6',
-        display: 'flex',
-        alignItems: 'center',
-        justifyContent: 'center',
-        minHeight: 240,
-        color: '#6b7280',
-        fontSize: '0.875rem',
-      }}
-    >
-      {state === VideoState.IDLE && 'Tidak ada sumber video aktif'}
-      {state === VideoState.STARTING && 'Memulai sumber video…'}
-      {state === VideoState.STOPPING && 'Menghentikan sumber video…'}
-      {state === VideoState.ERROR && 'Terjadi kesalahan pada sumber video'}
+    <div className="video-preview video-empty" role="status"><div>
+      <span className="video-empty-icon" aria-hidden="true">▣</span>
+      <p>{state === VideoState.IDLE && 'Tidak ada sumber video aktif'}</p><p>{state === VideoState.STARTING && 'Memulai sumber video…'}</p><p>{state === VideoState.STOPPING && 'Menghentikan sumber video…'}</p><p>{state === VideoState.ERROR && 'Terjadi kesalahan pada sumber video'}</p>
+      {state === VideoState.IDLE && <small>Pilih Webcam atau upload video untuk memulai pemantauan.</small>}
+    </div>
     </div>
   )
-}
-
-const wrapperStyle: React.CSSProperties = {
-  border: '1px solid #e5e7eb',
-  borderRadius: 8,
-  overflow: 'hidden',
 }

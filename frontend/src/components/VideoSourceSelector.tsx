@@ -37,7 +37,8 @@ export function VideoSourceSelector({ state, onPendingStateChange }: Props) {
   const effectiveState = pendingState ?? state
   const isTransitioning =
     effectiveState === VideoState.STARTING || effectiveState === VideoState.STOPPING
-  const disabled = isTransitioning || isActing
+  const sourceControlsDisabled =
+    isTransitioning || isActing || effectiveState === VideoState.RUNNING || effectiveState === VideoState.ERROR
 
   async function handleWebcamClick() {
     setActionError(null)
@@ -92,26 +93,18 @@ export function VideoSourceSelector({ state, onPendingStateChange }: Props) {
       : 'Mulai Webcam'
 
   return (
-    <div style={{ border: '1px solid #e5e7eb', borderRadius: 8, overflow: 'hidden' }}>
+    <div className="source-controls">
       {/* Tab bar */}
-      <div style={{ display: 'flex', borderBottom: '1px solid #e5e7eb' }}>
+      <div className="source-tabs" role="tablist" aria-label="Pilih sumber video">
         {(['webcam', 'upload'] as Tab[]).map((tab) => (
           <button
             key={tab}
+            disabled={sourceControlsDisabled}
             onClick={() => {
               setActiveTab(tab)
               setActionError(null)
             }}
-            style={{
-              flex: 1,
-              padding: '8px 0',
-              border: 'none',
-              cursor: 'pointer',
-              background: activeTab === tab ? '#f9fafb' : '#ffffff',
-              fontWeight: activeTab === tab ? 600 : 400,
-              borderBottom: activeTab === tab ? '2px solid #3b82d4' : '2px solid transparent',
-              fontSize: '0.875rem',
-            }}
+            className={activeTab === tab ? 'source-tab is-active' : 'source-tab'}
           >
             {tab === 'webcam' ? 'Webcam' : 'Upload Video'}
           </button>
@@ -119,60 +112,46 @@ export function VideoSourceSelector({ state, onPendingStateChange }: Props) {
       </div>
 
       {/* Tab content */}
-      <div style={{ padding: '1rem' }}>
-        {activeTab === 'webcam' && (
+      <div className="source-tab-content">
+        {(effectiveState === VideoState.RUNNING || effectiveState === VideoState.ERROR || effectiveState === VideoState.STOPPING) ? (
           <button
             onClick={handleWebcamClick}
-            disabled={disabled}
-            style={btnStyle(disabled)}
+            disabled={isTransitioning || isActing}
+            className="stop-button"
           >
-            {webcamLabel}
+            {effectiveState === VideoState.STOPPING
+              ? 'Menghentikan…'
+              : effectiveState === VideoState.ERROR
+                ? 'Kembali ke Idle'
+                : 'Hentikan Video'}
           </button>
-        )}
-
-        {activeTab === 'upload' && (
-          <label style={{ display: 'block' }}>
-            <span style={{ fontSize: '0.875rem', color: '#374151' }}>
-              Pilih file MP4 atau WebM (maks. 200 MB)
-            </span>
+        ) : activeTab === 'webcam' ? (
+          <button
+            onClick={handleWebcamClick}
+            disabled={sourceControlsDisabled}
+            className="primary-button"
+          >
+            {effectiveState === VideoState.STARTING ? 'Memulai…' : webcamLabel}
+          </button>
+        ) : (
+          <label className="file-input-label">
+            <span>Pilih file MP4 atau WebM (maks. 200 MB)</span>
             <input
               type="file"
               accept="video/mp4,video/webm"
-              disabled={disabled}
+              disabled={sourceControlsDisabled}
               onChange={handleFileChange}
-              style={{ display: 'block', marginTop: 8 }}
             />
+            {effectiveState === VideoState.STARTING && <small>Memulai sumber video…</small>}
           </label>
         )}
 
         {actionError && (
-          <p
-            style={{
-              marginTop: 8,
-              fontSize: '0.8rem',
-              color: '#991b1b',
-              background: '#fee2e2',
-              padding: '6px 10px',
-              borderRadius: 4,
-            }}
-          >
+          <p className="action-error" role="alert">
             {actionError}
           </p>
         )}
       </div>
     </div>
   )
-}
-
-function btnStyle(disabled: boolean): React.CSSProperties {
-  return {
-    padding: '8px 20px',
-    border: 'none',
-    borderRadius: 6,
-    background: disabled ? '#d1d5db' : '#3b82d4',
-    color: disabled ? '#6b7280' : '#ffffff',
-    cursor: disabled ? 'not-allowed' : 'pointer',
-    fontWeight: 600,
-    fontSize: '0.875rem',
-  }
 }
