@@ -23,4 +23,10 @@ async def get_current_domain() -> DomainSnapshotResponse:
         confidence=snapshot.confidence,
         locked=snapshot.locked,
         last_detection_seq=snapshot.last_detection_seq,
+        decision_source=snapshot.decision_source,
+        scene_model=snapshot.scene_model,
+        scene_sample_count=snapshot.scene_sample_count,
+        scene_top_score=snapshot.scene_top_score,
+        scene_mean_margin=snapshot.scene_mean_margin,
+        scene_consistency=snapshot.scene_consistency,
     )

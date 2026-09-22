@@ -15,6 +15,12 @@ from pydantic import BaseModel
 class DomainName(str, enum.Enum):
     UNKNOWN = "UNKNOWN"
     PARKING_MOTORCYCLE = "PARKING_MOTORCYCLE"
+    RETAIL_STORE = "RETAIL_STORE"
+
+
+class DecisionSource(str, enum.Enum):
+    YOLO = "YOLO"
+    CLIP = "CLIP"
 
 
 class DomainState(str, enum.Enum):
@@ -33,6 +39,12 @@ class DomainSnapshot:
     confidence: float
     locked: bool
     last_detection_seq: int | None
+    decision_source: DecisionSource | None = None
+    scene_model: str | None = None
+    scene_sample_count: int | None = None
+    scene_top_score: float | None = None
+    scene_mean_margin: float | None = None
+    scene_consistency: float | None = None
 
 
 class DomainSnapshotResponse(BaseModel):
@@ -46,3 +58,9 @@ class DomainSnapshotResponse(BaseModel):
     confidence: float
     locked: bool
     last_detection_seq: int | None
+    decision_source: DecisionSource | None = None
+    scene_model: str | None = None
+    scene_sample_count: int | None = None
+    scene_top_score: float | None = None
+    scene_mean_margin: float | None = None
+    scene_consistency: float | None = None

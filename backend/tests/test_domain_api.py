@@ -7,7 +7,7 @@ from fastapi.testclient import TestClient
 
 from app.main import app
 from app.models.detection import Detection, DetectionResult
-from app.models.domain import DomainName, DomainState
+from app.models.domain import DecisionSource, DomainName, DomainState
 from app.services.detector_service import detector_service
 from app.services.domain_service import DomainService, domain_service
 
@@ -51,6 +51,12 @@ def test_idle_snapshot_is_complete_and_returns_200(client: TestClient, fake_doma
         "confidence": 0.0,
         "locked": False,
         "last_detection_seq": None,
+        "decision_source": None,
+        "scene_model": None,
+        "scene_sample_count": None,
+        "scene_top_score": None,
+        "scene_mean_margin": None,
+        "scene_consistency": None,
     }
 
 
@@ -78,6 +84,12 @@ def test_locked_parking_motorcycle_snapshot_serializes(client: TestClient, fake_
         "confidence": 1.0,
         "locked": True,
         "last_detection_seq": 8,
+        "decision_source": "YOLO",
+        "scene_model": None,
+        "scene_sample_count": None,
+        "scene_top_score": None,
+        "scene_mean_margin": None,
+        "scene_consistency": None,
     }
 
 
@@ -94,6 +106,24 @@ def test_repeated_get_is_read_only_and_confidence_is_bounded(
     assert after == before
     assert isinstance(first.json()["confidence"], float)
     assert 0.0 <= first.json()["confidence"] <= 1.0
+
+
+def test_clip_retail_snapshot_serializes_new_optional_fields(
+    client: TestClient, fake_domain_service: DomainService
+) -> None:
+    fake_domain_service.start_session("session-abc")
+    assert fake_domain_service.apply_scene_decision(
+        "session-abc", DomainName.RETAIL_STORE, "openai/clip-vit-base-patch32", 0.31, 0.8, 0.04, 5
+    )
+    payload = client.get("/api/domain/current").json()
+    assert payload["domain"] == "RETAIL_STORE"
+    assert payload["locked"] is True
+    assert payload["decision_source"] == DecisionSource.CLIP.value
+    assert payload["scene_model"] == "openai/clip-vit-base-patch32"
+    assert payload["scene_sample_count"] == 5
+    assert payload["scene_top_score"] == 0.31
+    assert payload["scene_mean_margin"] == 0.04
+    assert payload["scene_consistency"] == 0.8
 
 
 def test_router_and_production_detector_share_the_domain_singleton() -> None:
