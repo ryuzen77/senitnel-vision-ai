@@ -9,7 +9,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from app.models.detection import Detection
+from app.models.detection import Detection, DetectionResult
 from app.models.video import FramePacket, VideoState
 from app.services.detector_service import DetectorService
 from app.services.video_service import VideoService
@@ -234,3 +234,50 @@ def test_close_stops_worker_cleanly() -> None:
     detector = DetectorService(model_factory=lambda: _detections)
     detector.close()
     assert not detector._worker.is_alive()  # noqa: SLF001
+
+
+def test_result_consumer_receives_only_published_active_session_results() -> None:
+    class Consumer:
+        def __init__(self) -> None:
+            self.started: list[str] = []
+            self.ended: list[str] = []
+            self.results: list[DetectionResult] = []
+
+        def start_session(self, session_id: str) -> None:
+            self.started.append(session_id)
+
+        def observe(self, result: DetectionResult) -> None:
+            self.results.append(result)
+
+        def end_session(self, session_id: str) -> None:
+            self.ended.append(session_id)
+
+    entered = threading.Event()
+    release = threading.Event()
+
+    def runner(frame: np.ndarray) -> list[Detection]:
+        if int(frame[0, 0, 0]) == 2:
+            entered.set()
+            release.wait(timeout=2.0)
+        return _detections(frame)
+
+    consumer = Consumer()
+    detector = DetectorService(model_factory=lambda: runner, result_consumer=consumer)
+    try:
+        detector.start_session("valid")
+        detector.offer(_packet("valid", 1))
+        assert _wait_for(lambda: len(consumer.results) == 1)
+        assert consumer.results[0].source_session_id == "valid"
+
+        detector.start_session("stale")
+        detector.offer(_packet("stale", 2))
+        assert entered.wait(timeout=2.0)
+        detector.end_session("stale")
+        release.set()
+        time.sleep(0.05)
+        assert len(consumer.results) == 1
+        assert consumer.started == ["valid", "stale"]
+        assert consumer.ended == ["stale"]
+    finally:
+        release.set()
+        detector.close()

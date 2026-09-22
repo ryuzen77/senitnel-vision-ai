@@ -11,16 +11,28 @@ import logging
 import threading
 from collections.abc import Callable
 from pathlib import Path
+from typing import Protocol
 
 import numpy as np
 
 from app.models.detection import Detection, DetectionResult
 from app.models.video import FramePacket
+from app.services.domain_service import domain_service
 
 logger = logging.getLogger(__name__)
 
 InferenceRunner = Callable[[np.ndarray], list[Detection]]
 ModelFactory = Callable[[], InferenceRunner]
+
+
+class DetectionResultConsumer(Protocol):
+    """Receives only published results from the detector's active session."""
+
+    def start_session(self, session_id: str) -> None: ...
+
+    def observe(self, detection_result: DetectionResult) -> None: ...
+
+    def end_session(self, session_id: str) -> None: ...
 
 
 def _default_model_factory() -> InferenceRunner:
@@ -52,8 +64,13 @@ class DetectorService:
     ``model_factory`` exists for deterministic CPU-only tests.
     """
 
-    def __init__(self, model_factory: ModelFactory | None = None) -> None:
+    def __init__(
+        self,
+        model_factory: ModelFactory | None = None,
+        result_consumer: DetectionResultConsumer | None = None,
+    ) -> None:
         self._model_factory = model_factory or _default_model_factory
+        self._result_consumer = result_consumer
         self._runner: InferenceRunner | None = None
         self._cond = threading.Condition()
         self._active_session_id: str | None = None
@@ -73,6 +90,8 @@ class DetectorService:
             self._pending = None
             self._latest_result = None
             self._cond.notify_all()
+        if self._result_consumer is not None:
+            self._result_consumer.start_session(session_id)
 
     def offer(self, frame_packet: FramePacket) -> None:
         """Offer a frame without waiting for model loading or inference."""
@@ -91,6 +110,8 @@ class DetectorService:
             self._pending = None
             self._latest_result = None
             self._cond.notify_all()
+        if self._result_consumer is not None:
+            self._result_consumer.end_session(session_id)
 
     def get_latest_result(self) -> DetectionResult | None:
         with self._cond:
@@ -102,10 +123,13 @@ class DetectorService:
             if self._closed:
                 return
             self._closed = True
+            session_id = self._active_session_id
             self._active_session_id = None
             self._pending = None
             self._latest_result = None
             self._cond.notify_all()
+        if session_id is not None and self._result_consumer is not None:
+            self._result_consumer.end_session(session_id)
         self._worker.join(timeout=3.0)
 
     def _run(self) -> None:
@@ -133,15 +157,18 @@ class DetectorService:
                 # Inference may have completed after stop or a new session.
                 if self._closed or packet.session_id != self._active_session_id:
                     continue
-                self._latest_result = DetectionResult(
+                result = DetectionResult(
                     detection_seq=self._detection_seq,
                     source_session_id=packet.session_id,
                     source_frame_seq=packet.seq,
                     source_timestamp=packet.ts,
                     detections=detections,
                 )
+                self._latest_result = result
                 self._detection_seq += 1
+            if self._result_consumer is not None:
+                self._result_consumer.observe(result)
 
 
 # The application singleton is safe because the model is lazy-loaded in the worker.
-detector_service = DetectorService()
+detector_service = DetectorService(result_consumer=domain_service)
