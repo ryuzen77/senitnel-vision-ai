@@ -54,3 +54,19 @@ class TrackedDetection:
     source_timestamp: float
     confirmed: bool
     hit_count: int
+
+
+@dataclasses.dataclass(frozen=True)
+class TrackingSnapshot:
+    """One tracker output snapshot for local downstream consumers.
+
+    This metadata-only contract deliberately does not carry a frame, JPEG, or
+    crop.  ``track_id`` values remain anonymous and session-scoped.
+    """
+
+    source_session_id: str
+    source_frame_seq: int
+    source_timestamp: float
+    frame_width: int
+    frame_height: int
+    tracks: tuple[TrackedDetection, ...]
