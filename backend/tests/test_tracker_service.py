@@ -5,16 +5,15 @@ from __future__ import annotations
 import math
 import threading
 
-from app.models.detection import Detection
-from app.models.tracking import TrackingFrame
+from app.models.tracking import TrackingDetectionInput, TrackingFrame
 from app.services.tracker_service import TrackerService
 
 
-def _detection(label: str, box: tuple[float, float, float, float], confidence: float = 0.9) -> Detection:
-    return Detection(0 if label == "person" else 3, label, confidence, box)
+def _detection(label: str, box: tuple[float, float, float, float], confidence: float = 0.9) -> TrackingDetectionInput:
+    return TrackingDetectionInput(0 if label == "person" else 3, label, confidence, box)
 
 
-def _frame(session: str, seq: int, timestamp: float, *detections: Detection, width: int = 100, height: int = 100) -> TrackingFrame:
+def _frame(session: str, seq: int, timestamp: float, *detections: TrackingDetectionInput, width: int = 100, height: int = 100) -> TrackingFrame:
     return TrackingFrame(session, seq, timestamp, width, height, tuple(detections))
 
 

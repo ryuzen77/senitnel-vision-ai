@@ -13,13 +13,19 @@ from app.services.clip_scene_runner import (
 from app.services.detector_service import DetectorService
 from app.services.domain_service import domain_service
 from app.services.scene_domain_classifier import SceneDomainClassifier
+from app.services.tracker_service import TrackerService
 from app.services.video_service import VideoService
 
 # This is the one shared production GPU gate.  It is injected, never looked up
 # by worker modules, so capture/MJPEG paths cannot acquire it accidentally.
 shared_cuda_gate = threading.Lock()
 
-detector_service = DetectorService(result_consumer=domain_service, cuda_gate=shared_cuda_gate)
+tracker_service = TrackerService()
+detector_service = DetectorService(
+    result_consumer=domain_service,
+    tracker=tracker_service,
+    cuda_gate=shared_cuda_gate,
+)
 scene_domain_classifier = SceneDomainClassifier(
     domain_service=domain_service,
     runner_factory=make_clip_scene_runner_factory(shared_cuda_gate),
@@ -27,3 +33,11 @@ scene_domain_classifier = SceneDomainClassifier(
     scene_model=f"{DEFAULT_MODEL_ID}@{DEFAULT_MODEL_REVISION}",
 )
 video_service = VideoService(detector=detector_service, scene_classifier=scene_domain_classifier)
+
+
+def shutdown_services(video, scene, detector, tracker) -> None:  # noqa: ANN001
+    """Shutdown order that prevents tracker observations after closure."""
+    video.stop()
+    scene.close()
+    detector.close()
+    tracker.close()

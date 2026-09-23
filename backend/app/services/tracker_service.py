@@ -7,14 +7,13 @@ import math
 import threading
 from collections.abc import Iterable
 
-from app.models.detection import Detection
-from app.models.tracking import TrackedDetection, TrackingFrame
+from app.models.tracking import TrackedDetection, TrackingDetectionInput, TrackingFrame
 
 
 @dataclasses.dataclass
 class _Track:
     track_id: int
-    detection: Detection
+    detection: TrackingDetectionInput
     center: tuple[float, float]
     hit_count: int
     last_timestamp: float
@@ -148,7 +147,7 @@ class TrackerService:
             self._last_frame_seq = None
             self._tracks.clear()
 
-    def _associate(self, detections: list[Detection], frame: TrackingFrame) -> dict[int, int]:
+    def _associate(self, detections: list[TrackingDetectionInput], frame: TrackingFrame) -> dict[int, int]:
         diagonal = math.hypot(frame.frame_width, frame.frame_height)
         pairs: list[tuple[float, float, int, int]] = []
         for detection_index, detection in enumerate(detections):
@@ -178,7 +177,7 @@ class TrackerService:
             if timestamp - track.last_timestamp <= self._lost_track_grace_seconds
         }
 
-    def _relevant_detections(self, detections: Iterable[Detection]) -> list[Detection]:
+    def _relevant_detections(self, detections: Iterable[TrackingDetectionInput]) -> list[TrackingDetectionInput]:
         selected = []
         for detection in detections:
             label = detection.class_name.strip().lower()

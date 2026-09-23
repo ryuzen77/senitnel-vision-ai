@@ -16,6 +16,7 @@ from typing import ContextManager, Protocol
 import numpy as np
 
 from app.models.detection import Detection, DetectionResult
+from app.models.tracking import TrackingDetectionInput, TrackingFrame
 from app.models.video import FramePacket
 from app.services.domain_service import domain_service
 
@@ -33,6 +34,18 @@ class DetectionResultConsumer(Protocol):
     def observe(self, detection_result: DetectionResult) -> None: ...
 
     def end_session(self, session_id: str) -> None: ...
+
+
+class TrackingConsumer(Protocol):
+    """Receives post-validation CPU tracking observations for active sessions."""
+
+    def start_session(self, session_id: str) -> None: ...
+
+    def observe(self, frame: TrackingFrame) -> object: ...
+
+    def end_session(self, session_id: str) -> None: ...
+
+    def close(self) -> None: ...
 
 
 def _default_model_factory() -> InferenceRunner:
@@ -68,10 +81,12 @@ class DetectorService:
         self,
         model_factory: ModelFactory | None = None,
         result_consumer: DetectionResultConsumer | None = None,
+        tracker: TrackingConsumer | None = None,
         cuda_gate: ContextManager[None] | None = None,
     ) -> None:
         self._model_factory = model_factory or _default_model_factory
         self._result_consumer = result_consumer
+        self._tracker = tracker
         # Production injects the application-wide gate.  This per-instance
         # fallback keeps isolated CPU-only unit tests independent.
         self._cuda_gate = cuda_gate or threading.Lock()
@@ -90,12 +105,17 @@ class DetectorService:
         with self._cond:
             if self._closed:
                 return
+            previous_session_id = self._active_session_id
             self._active_session_id = session_id
             self._pending = None
             self._latest_result = None
             self._cond.notify_all()
+        if previous_session_id is not None and previous_session_id != session_id and self._tracker is not None:
+            self._tracker.end_session(previous_session_id)
         if self._result_consumer is not None:
             self._result_consumer.start_session(session_id)
+        if self._tracker is not None:
+            self._tracker.start_session(session_id)
 
     def offer(self, frame_packet: FramePacket) -> None:
         """Offer a frame without waiting for model loading or inference."""
@@ -116,6 +136,8 @@ class DetectorService:
             self._cond.notify_all()
         if self._result_consumer is not None:
             self._result_consumer.end_session(session_id)
+        if self._tracker is not None:
+            self._tracker.end_session(session_id)
 
     def get_latest_result(self) -> DetectionResult | None:
         with self._cond:
@@ -134,6 +156,8 @@ class DetectorService:
             self._cond.notify_all()
         if session_id is not None and self._result_consumer is not None:
             self._result_consumer.end_session(session_id)
+        if session_id is not None and self._tracker is not None:
+            self._tracker.end_session(session_id)
         self._worker.join(timeout=3.0)
 
     def _run(self) -> None:
@@ -174,7 +198,33 @@ class DetectorService:
                 self._latest_result = result
                 self._detection_seq += 1
             if self._result_consumer is not None:
-                self._result_consumer.observe(result)
+                try:
+                    self._result_consumer.observe(result)
+                except Exception:
+                    logger.exception("Detector result consumer failed for frame %s", packet.seq)
+            if self._tracker is not None:
+                try:
+                    frame_height, frame_width = packet.frame.shape[:2]
+                    tracking_frame = TrackingFrame(
+                        source_session_id=result.source_session_id,
+                        source_frame_seq=result.source_frame_seq,
+                        source_timestamp=result.source_timestamp,
+                        frame_width=frame_width,
+                        frame_height=frame_height,
+                        detections=tuple(
+                            TrackingDetectionInput(
+                                class_id=detection.class_id,
+                                class_name=detection.class_name,
+                                confidence=detection.confidence,
+                                xyxy=detection.xyxy,
+                            )
+                            for detection in result.detections
+                        ),
+                    )
+                    self._tracker.observe(tracking_frame)
+                except Exception:
+                    # Tracking is optional; keep published detection/domain/video alive.
+                    logger.exception("Tracker observe failed for frame %s", packet.seq)
 
 
 def __getattr__(name: str):  # noqa: ANN202

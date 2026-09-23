@@ -9,7 +9,14 @@ from __future__ import annotations
 
 import dataclasses
 
-from app.models.detection import Detection
+@dataclasses.dataclass(frozen=True)
+class TrackingDetectionInput:
+    """Detector fields needed for CPU association, with no image payload."""
+
+    class_id: int
+    class_name: str
+    confidence: float
+    xyxy: tuple[float, float, float, float]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -25,7 +32,7 @@ class TrackingFrame:
     source_timestamp: float
     frame_width: int
     frame_height: int
-    detections: tuple[Detection, ...]
+    detections: tuple[TrackingDetectionInput, ...]
 
 
 # Kept as a descriptive alias for callers that use the audit terminology.
