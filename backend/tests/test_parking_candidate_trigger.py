@@ -143,3 +143,177 @@ def test_multiple_candidates_have_deterministic_priority_and_invalid_pair_does_n
         trigger.observe(_domain(), _snapshot(seq, timestamp, first, second, motorcycle, malformed))
     event = trigger.claim_next_candidate(2.2)
     assert event is not None and event.person_track_id == 9
+
+
+def _episode_frame(trigger: ParkingCandidateTrigger, seq: int, timestamp: float,
+                   person_x: float = 10, motor_x: float = 40,
+                   motor_id: int = 2, extra_motor: tuple[int, float] | None = None) -> None:
+    tracks = [_track(1, "person", (person_x, 20, person_x + 10, 50)),
+              _track(motor_id, "motorcycle", (motor_x, 25, motor_x + 25, 55))]
+    if extra_motor:
+        tracks.append(_track(extra_motor[0], "motorcycle", (extra_motor[1], 25, extra_motor[1] + 25, 55)))
+    trigger.observe(_domain(), _snapshot(seq, timestamp, *tracks))
+
+
+def test_episode_approach_brief_close_low_ratio_and_static_do_not_trigger() -> None:
+    for kind in ("approach", "brief", "low_ratio", "static"):
+        trigger = ParkingCandidateTrigger()
+        trigger.start_session("one")
+        if kind == "approach":
+            for seq in range(1, 5):
+                _episode_frame(trigger, seq, seq * .7, person_x=0, motor_x=40)
+            assert trigger.get_snapshot().pair_states[0][2] is ParkingCandidateState.APPROACHING
+        elif kind == "brief":
+            for seq in range(1, 5):
+                _episode_frame(trigger, seq, seq * .2, person_x=10 + seq * 4)
+        elif kind == "low_ratio":
+            for seq in range(1, 9):
+                _episode_frame(trigger, seq, seq * .4, person_x=10 + (seq % 2),
+                               motor_x=40 if seq in (1, 2, 5, 6) else 75)
+        else:
+            for seq in range(1, 5):
+                _episode_frame(trigger, seq, (seq - 1) * .7)
+        assert trigger.claim_next_candidate(4.0) is None, kind
+
+
+def test_cumulative_back_and_forth_creates_engaged_candidate_before_departure() -> None:
+    trigger = ParkingCandidateTrigger(separation_threshold=.2)
+    trigger.start_session("one")
+    for seq, x in enumerate((10, 17, 10, 17, 10), 1):
+        _episode_frame(trigger, seq, (seq - 1) * .55, person_x=x)
+    event = trigger.claim_next_candidate(2.3)
+    assert event is not None
+    assert event.episode_state_at_trigger is ParkingCandidateState.ENGAGED
+    assert event.evidence.person_motion_normalized < .01
+    assert event.cumulative_person_path_normalized >= .03
+    assert event.close_observation_ratio == 1.0
+    assert event.continuous_close_duration >= 2
+    assert event.episode_id == event.evidence.episode_id
+    assert event.initial_object_track_id == event.active_object_track_id == 2
+
+
+def test_transition_candidate_on_separation_after_valid_engagement() -> None:
+    trigger = ParkingCandidateTrigger(minimum_person_motion=1, minimum_motorcycle_motion=1,
+                                      minimum_distance_range=1, separation_threshold=.02)
+    trigger.start_session("one")
+    for seq, timestamp in enumerate((0, .7, 1.4, 2.1), 1):
+        _episode_frame(trigger, seq, timestamp)
+    assert trigger.claim_next_candidate(2.2) is None
+    _episode_frame(trigger, 5, 2.3, motor_x=44)
+    event = trigger.claim_next_candidate(2.4)
+    assert event is not None
+    assert event.episode_state_at_trigger is ParkingCandidateState.TRANSITION
+    assert event.separation_after_engagement >= .02
+
+
+def test_motor_lock_does_not_switch_to_slightly_nearer_neighbor() -> None:
+    trigger = ParkingCandidateTrigger()
+    trigger.start_session("one")
+    _episode_frame(trigger, 1, 0, motor_x=40, extra_motor=(3, 42))
+    for seq in range(2, 5):
+        _episode_frame(trigger, seq, (seq - 1) * .7, person_x=10 + seq * 4,
+                       motor_x=42, extra_motor=(3, 39))
+    event = trigger.claim_next_candidate(2.2)
+    assert event is not None and event.object_track_id == 2
+    assert trigger.get_snapshot().episode_states[0][3] == 2
+
+
+def test_unambiguous_reassociation_stays_in_one_episode_and_ambiguous_is_rejected() -> None:
+    trigger = ParkingCandidateTrigger()
+    trigger.start_session("one")
+    _episode_frame(trigger, 1, 0)
+    trigger.observe(_domain(), _snapshot(2, .4, _track(1, "person", (14, 20, 24, 50))))
+    _episode_frame(trigger, 3, .7, person_x=18, motor_x=41, motor_id=8)
+    assert trigger.get_snapshot().episode_states[0][2:5] == (2, 8, 1)
+    for seq, timestamp in ((4, 1.4), (5, 2.1)):
+        _episode_frame(trigger, seq, timestamp, person_x=10 + seq * 4, motor_x=41, motor_id=8)
+    event = trigger.claim_next_candidate(2.2)
+    assert event is not None
+    assert (event.initial_object_track_id, event.active_object_track_id, event.reassociation_count) == (2, 8, 1)
+    for seq in range(6, 12):
+        _episode_frame(trigger, seq, 2.1 + seq * .2, person_x=10 + seq, motor_x=41, motor_id=8)
+    assert trigger.get_snapshot().pending_event_id == event.event_id
+    assert trigger.complete(event.event_id, 4.5)
+    assert trigger.claim_next_candidate(5.0) is None
+
+    ambiguous = ParkingCandidateTrigger(); ambiguous.start_session("one")
+    _episode_frame(ambiguous, 1, 0)
+    _episode_frame(ambiguous, 2, .4, motor_x=40, extra_motor=(9, 41))
+    ambiguous.observe(_domain(), _snapshot(3, .7,
+        _track(1, "person", (18, 20, 28, 50)),
+        _track(8, "motorcycle", (40, 25, 65, 55)),
+        _track(9, "motorcycle", (41, 25, 66, 55))))
+    assert ambiguous.get_snapshot().episode_states[0][3:5] == (2, 0)
+
+
+def test_cooldown_requires_release_and_new_engagement() -> None:
+    trigger = ParkingCandidateTrigger(pair_cooldown_seconds=1, global_request_interval_seconds=0)
+    trigger.start_session("one")
+    _observe_series(trigger)
+    first = trigger.claim_next_candidate(2.2)
+    assert first is not None and trigger.fail(first.event_id, 2.3)
+    for seq in range(5, 10):
+        _episode_frame(trigger, seq, 2.3 + seq * .4, person_x=10 + seq * 4)
+    assert trigger.claim_next_candidate(6.0) is None
+    # First far observation releases the tombstone. A later close starts a new episode.
+    trigger.observe(_domain(), _snapshot(10, 6.1, _track(1, "person", (0, 20, 10, 50))))
+    assert trigger.get_snapshot().pair_states == ()
+    for seq, timestamp in ((11, 6.2), (12, 6.9), (13, 7.6), (14, 8.3)):
+        _episode_frame(trigger, seq, timestamp, person_x=10 + (seq - 10) * 4)
+    second = trigger.claim_next_candidate(8.4)
+    assert second is not None and second.episode_id != first.episode_id
+
+
+def test_history_and_sequence_buffers_remain_bounded_over_long_episode() -> None:
+    trigger = ParkingCandidateTrigger(history_limit=3, recent_sequence_limit=2, history_horizon_seconds=1)
+    trigger.start_session("one")
+    for seq in range(1, 80):
+        _episode_frame(trigger, seq, seq * .1, person_x=10 + seq % 2)
+    episode = trigger._episodes[1]
+    assert len(episode.history) <= 3
+    assert len(episode.sequences) <= 2
+    assert all(7.9 - item.timestamp <= 1 for item in episode.history)
+
+
+def test_locked_motor_replacement_requires_grace_and_unique_position() -> None:
+    trigger = ParkingCandidateTrigger()
+    trigger.start_session("one")
+    _episode_frame(trigger, 1, 0)
+    # A different ID cannot replace the locked motor after grace expires.
+    trigger.observe(_domain(), _snapshot(2, 1.6, _track(1, "person", (14, 20, 24, 50)),
+                                         _track(8, "motorcycle", (40, 25, 65, 55))))
+    assert trigger.get_snapshot().episode_states[0][3:5] == (2, 0)
+
+    ambiguous = ParkingCandidateTrigger(); ambiguous.start_session("one")
+    _episode_frame(ambiguous, 1, 0)
+    ambiguous.observe(_domain(), _snapshot(2, .4, _track(1, "person", (14, 20, 24, 50)),
+                                           _track(8, "motorcycle", (40, 25, 65, 55)),
+                                           _track(9, "motorcycle", (42, 25, 67, 55))))
+    assert ambiguous.get_snapshot().episode_states[0][3:5] == (2, 0)
+
+
+def test_candidate_releases_after_sustained_separation_and_does_not_reissue() -> None:
+    trigger = ParkingCandidateTrigger()
+    trigger.start_session("one")
+    _observe_series(trigger)
+    episode_id = trigger.get_snapshot().episode_states[0][1]
+    trigger.observe(_domain(), _snapshot(5, 2.5, _track(1, "person", (95, 20, 100, 50)),
+                                         _track(2, "motorcycle", (40, 25, 65, 55))))
+    assert trigger.get_snapshot().episode_states[0][1] == episode_id
+    trigger.observe(_domain(), _snapshot(6, 4.0, _track(1, "person", (95, 20, 100, 50)),
+                                         _track(2, "motorcycle", (40, 25, 65, 55))))
+    assert trigger.get_snapshot().pair_states == ()
+    assert trigger.claim_next_candidate(4.1) is None
+
+
+def test_long_approach_does_not_dilute_stable_close_ratio() -> None:
+    trigger = ParkingCandidateTrigger()
+    trigger.start_session("one")
+    for seq in range(1, 21):
+        _episode_frame(trigger, seq, seq * .1, person_x=-5, motor_x=40)
+    assert trigger.get_snapshot().pair_states[0][2] is ParkingCandidateState.APPROACHING
+    for seq, timestamp in enumerate((2.1, 2.8, 3.5, 4.2), 21):
+        _episode_frame(trigger, seq, timestamp, person_x=10 + (seq - 20) * 4)
+    event = trigger.claim_next_candidate(4.3)
+    assert event is not None
+    assert event.close_observation_ratio == 1.0

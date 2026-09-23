@@ -13,7 +13,9 @@ from app.models.domain import DomainName
 
 
 class ParkingCandidateState(str, enum.Enum):
-    OBSERVING = "OBSERVING"
+    APPROACHING = "APPROACHING"
+    ENGAGED = "ENGAGED"
+    TRANSITION = "TRANSITION"
     CANDIDATE = "CANDIDATE"
     API_PENDING = "API_PENDING"
     COOLDOWN = "COOLDOWN"
@@ -29,6 +31,19 @@ class ParkingCandidateEvidence:
     person_motion_normalized: float
     motorcycle_motion_normalized: float
     pair_distance_range_normalized: float
+    episode_id: str | None = None
+    initial_object_track_id: int | None = None
+    active_object_track_id: int | None = None
+    reassociation_count: int = 0
+    approach_distance_drop: float = 0.0
+    close_observation_ratio: float = 0.0
+    continuous_close_duration: float = 0.0
+    cumulative_person_path_normalized: float = 0.0
+    cumulative_motorcycle_path_normalized: float = 0.0
+    distance_direction_changes: int = 0
+    motor_motion_after_engagement: float = 0.0
+    separation_after_engagement: float = 0.0
+    episode_state_at_trigger: ParkingCandidateState | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -44,6 +59,19 @@ class ParkingCandidateEvent:
     evidence: ParkingCandidateEvidence
     candidate_frame_sequences: tuple[int, ...]
     state: ParkingCandidateState
+    episode_id: str | None = None
+    initial_object_track_id: int | None = None
+    active_object_track_id: int | None = None
+    reassociation_count: int = 0
+    approach_distance_drop: float = 0.0
+    close_observation_ratio: float = 0.0
+    continuous_close_duration: float = 0.0
+    cumulative_person_path_normalized: float = 0.0
+    cumulative_motorcycle_path_normalized: float = 0.0
+    distance_direction_changes: int = 0
+    motor_motion_after_engagement: float = 0.0
+    separation_after_engagement: float = 0.0
+    episode_state_at_trigger: ParkingCandidateState | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -53,3 +81,4 @@ class ParkingCandidateDiagnostic:
     source_session_id: str | None
     pending_event_id: str | None
     pair_states: tuple[tuple[int, int, ParkingCandidateState], ...]
+    episode_states: tuple[tuple[int, str, int, int, int, ParkingCandidateState], ...] = ()
