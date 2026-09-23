@@ -6,6 +6,7 @@ from collections import deque
 import dataclasses
 import math
 import threading
+import time
 import uuid
 
 from app.models.domain import DomainName, DomainSnapshot, DomainState
@@ -113,6 +114,8 @@ class ParkingCandidateTrigger:
         self._history_limit = history_limit
         self._history_horizon = history_horizon_seconds
         self._lock = threading.Lock()
+        self._condition = threading.Condition(self._lock)
+        self._wake_generation = 0
         self._session_id: str | None = None
         self._episodes: dict[int, _Episode] = {}
         self._last_sequence: int | None = None
@@ -129,6 +132,34 @@ class ParkingCandidateTrigger:
             self._episodes.clear()
             self._last_sequence = self._last_timestamp = self._last_claim_timestamp = None
             self._pending_event_id = None
+            self._wake_generation += 1
+            self._condition.notify_all()
+
+    def wait_for_candidate(self, timeout_seconds: float) -> bool:
+        """Wait without claiming; session changes and close interrupt the wait."""
+        if (not isinstance(timeout_seconds, (int, float))
+                or not math.isfinite(timeout_seconds) or timeout_seconds < 0):
+            raise ValueError("timeout_seconds must be finite and non-negative")
+        deadline = time.monotonic() + timeout_seconds
+        with self._condition:
+            generation = self._wake_generation
+            while True:
+                if self._closed or self._session_id is None or generation != self._wake_generation:
+                    return False
+                if self._pending_event_id is None and any(
+                    episode.state is State.CANDIDATE for episode in self._episodes.values()
+                ):
+                    return True
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._condition.wait(remaining)
+
+    def wake_waiters(self) -> None:
+        """Interrupt an external worker wait without mutating candidate state."""
+        with self._condition:
+            self._wake_generation += 1
+            self._condition.notify_all()
 
     def observe(self, domain_snapshot: DomainSnapshot, tracking_snapshot: TrackingSnapshot) -> None:
         with self._lock:
@@ -219,6 +250,8 @@ class ParkingCandidateTrigger:
             self._episodes.clear()
             self._last_sequence = self._last_timestamp = self._last_claim_timestamp = None
             self._pending_event_id = None
+            self._wake_generation += 1
+            self._condition.notify_all()
 
     def close(self) -> None:
         with self._lock:
@@ -228,6 +261,8 @@ class ParkingCandidateTrigger:
             self._session_id = None
             self._episodes.clear()
             self._pending_event_id = None
+            self._wake_generation += 1
+            self._condition.notify_all()
 
     def _record(self, e: _Episode, person: TrackedDetection, motor: TrackedDetection,
                 distance: float, now: float, seq: int, diagonal: float) -> None:
@@ -319,6 +354,7 @@ class ParkingCandidateTrigger:
             episode_state_at_trigger=evidence.episode_state_at_trigger,
         )
         e.state = State.CANDIDATE
+        self._condition.notify_all()
 
     def _evidence(self, e: _Episode, now: float, diagonal: float) -> ParkingCandidateEvidence:
         last = e.history[-1]
