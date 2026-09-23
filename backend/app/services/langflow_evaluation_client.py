@@ -8,6 +8,7 @@ import enum
 import json
 import math
 import os
+import re
 from typing import Any, Mapping
 from urllib.parse import urlsplit
 
@@ -41,37 +42,58 @@ class LangflowEvaluationClient:
     """Synchronous EvaluationWorker client for a complete Langflow run URL."""
 
     name = "langflow-http"
+    DEFAULT_COMPONENT_ID = "Webhook-exTZU"
+    DEFAULT_MODEL = "gemini-3-flash-preview"
 
     def __init__(
         self, *, url: str | None = None, api_key: str | None = None,
-        timeout_seconds: float | None = None, http_client: httpx.Client | None = None,
+        timeout_seconds: float | None = None, component_id: str | None = None,
+        model: str | None = None, http_client: httpx.Client | None = None,
     ) -> None:
         configured_url = url if url is not None else os.getenv("SENTINEL_LANGFLOW_URL", "")
         configured_key = api_key if api_key is not None else os.getenv("SENTINEL_LANGFLOW_API_KEY", "")
         raw_timeout = (timeout_seconds if timeout_seconds is not None else
                        os.getenv("SENTINEL_LANGFLOW_TIMEOUT_SECONDS", "30"))
+        configured_component = (component_id if component_id is not None else
+                                os.getenv("SENTINEL_LANGFLOW_COMPONENT_ID", self.DEFAULT_COMPONENT_ID))
+        configured_model = (model if model is not None else
+                            os.getenv("SENTINEL_LANGFLOW_MODEL", self.DEFAULT_MODEL))
         try:
             parsed = urlsplit(configured_url)
             timeout = float(raw_timeout)
             if (parsed.scheme not in ("http", "https") or not parsed.netloc
                     or parsed.username is not None or parsed.password is not None
-                    or not parsed.path or not math.isfinite(timeout) or timeout <= 0):
+                    or re.fullmatch(r"/api/v1/run/[^/]+/?", parsed.path) is None
+                    or parsed.query or parsed.fragment
+                    or not math.isfinite(timeout) or timeout <= 0
+                    or not isinstance(configured_component, str) or not configured_component.strip()
+                    or not isinstance(configured_model, str) or not configured_model.strip()):
                 raise ValueError
         except (ValueError, TypeError):
             raise LangflowEvaluationError(LangflowErrorKind.INVALID_CONFIG) from None
         self._url = configured_url
         self._api_key = configured_key.strip()
         self._timeout = timeout
+        self._component_id = configured_component.strip()
+        self._model = configured_model.strip()
         self._client = http_client if http_client is not None else httpx.Client(follow_redirects=False)
         self._owns_client = http_client is None
 
     def evaluate(self, request: EvaluationRequest) -> ThreatAssessment:
         payload = self._build_payload(request)
+        try:
+            encoded_payload = json.dumps(
+                payload, ensure_ascii=False, allow_nan=False, separators=(",", ":"),
+            ).encode("utf-8")
+        except (TypeError, ValueError):
+            raise LangflowEvaluationError(LangflowErrorKind.INVALID_REQUEST) from None
         headers = {"Content-Type": "application/json", "Accept": "application/json"}
         if self._api_key:
             headers["x-api-key"] = self._api_key
         try:
-            response = self._client.post(self._url, json=payload, headers=headers, timeout=self._timeout)
+            response = self._client.post(
+                self._url, content=encoded_payload, headers=headers, timeout=self._timeout,
+            )
         except httpx.TimeoutException:
             raise LangflowEvaluationError(LangflowErrorKind.TIMEOUT) from None
         except httpx.RequestError:
@@ -96,8 +118,7 @@ class LangflowEvaluationClient:
             raise LangflowEvaluationError(LangflowErrorKind.MALFORMED_JSON) from None
         return self._parse_assessment(assessment_data)
 
-    @staticmethod
-    def _build_payload(request: EvaluationRequest) -> dict[str, str]:
+    def _build_payload(self, request: EvaluationRequest) -> dict[str, Any]:
         bundle = request.frame_bundle
         if (bundle.event_id != request.event_id or bundle.source_session_id != request.source_session_id
                 or bundle.domain is not request.domain or len(bundle.frames) != 5
@@ -129,19 +150,40 @@ class LangflowEvaluationClient:
                         "frame_width": frame.frame_width,
                         "frame_height": frame.frame_height,
                         "mime_type": frame.mime_type,
-                        "image": "data:image/jpeg;base64," + base64.b64encode(frame.jpeg).decode("ascii"),
-                    }
-                    for frame in bundle.frames
+                    } for frame in bundle.frames
                 ],
             }
-            encoded = json.dumps(event_data, ensure_ascii=True, allow_nan=False, separators=(",", ":"))
+            metadata = json.dumps(
+                event_data, ensure_ascii=False, allow_nan=False, separators=(",", ":"),
+            )
+            prompt = (
+                "Analyze the five CCTV frames as observations, not proof of a crime. "
+                "Return only JSON with threatScore (0-100), status (NORMAL, WARNING, or CRITICAL), "
+                "reasoning, and suspectProfile containing personDetected, clothing, observedAction, "
+                "visibleObjects, and distinguishingFeatures. "
+                "Use NORMAL for 0-34, WARNING for 35-64, CRITICAL for 65-100. "
+                "Do not infer identity, ownership, or guilt. Event metadata: " + metadata
+            )
+            prompt = " ".join(prompt.splitlines())
+            provider_payload = {
+                "input": [
+                    {"type": "text", "text": prompt},
+                    *(
+                        {"type": "image", "data": "data:image/jpeg;base64,"
+                         + base64.b64encode(frame.jpeg).decode("ascii")}
+                        for frame in bundle.frames
+                    ),
+                ],
+                "model": self._model,
+            }
         except (TypeError, ValueError):
             raise LangflowEvaluationError(LangflowErrorKind.INVALID_REQUEST) from None
         return {
-            "input_value": encoded,
-            "input_type": "chat",
+            "input_value": "cctv_event",
+            "input_type": "text",
             "output_type": "chat",
-            "session_id": request.source_session_id,
+            "session_id": request.event_id,
+            "tweaks": {self._component_id: {"data": provider_payload}},
         }
 
     @staticmethod
@@ -162,6 +204,14 @@ class LangflowEvaluationClient:
                     continue
                 results = inner.get("results")
                 message = results.get("message") if isinstance(results, Mapping) else None
+                if isinstance(message, str) and message.strip():
+                    return message
+                if isinstance(results, Mapping) and isinstance(results.get("text"), str):
+                    text = results["text"]
+                    if text.strip():
+                        return text
+                if message is None:
+                    message = inner.get("message")
                 if isinstance(message, Mapping):
                     text = message.get("text")
                     if not isinstance(text, str) and isinstance(message.get("data"), Mapping):

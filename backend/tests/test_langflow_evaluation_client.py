@@ -57,13 +57,16 @@ def _mock_client(handler):
     return httpx.Client(transport=httpx.MockTransport(handler))
 
 
-def test_request_contains_five_data_uris_and_metadata_without_extra_encode_or_log() -> None:
+def test_run_envelope_contains_one_line_prompt_and_five_images() -> None:
     captured = []
     def handler(request: httpx.Request) -> httpx.Response:
         captured.append(request)
         return httpx.Response(200, json=_langflow_body(json.dumps(_assessment_data())))
     transport = _mock_client(handler)
-    client = LangflowEvaluationClient(url=URL, api_key="secret", timeout_seconds=4, http_client=transport)
+    client = LangflowEvaluationClient(
+        url=URL, api_key="secret", timeout_seconds=4,
+        component_id="Webhook-exTZU", model="gemini-3-flash-preview", http_client=transport,
+    )
     assessment = client.evaluate(_request())
     assert assessment.status is ThreatStatus.NORMAL and assessment.threat_score == 20
     assert len(captured) == 1
@@ -71,30 +74,78 @@ def test_request_contains_five_data_uris_and_metadata_without_extra_encode_or_lo
     assert sent.method == "POST" and str(sent.url) == URL
     assert sent.headers["x-api-key"] == "secret"
     outer = json.loads(sent.content)
-    assert outer["input_type"] == outer["output_type"] == "chat"
-    assert outer["session_id"] == "session-1"
-    payload = json.loads(outer["input_value"])
-    assert (payload["event_id"], payload["source_session_id"], payload["domain"]) == (
+    assert set(outer) == {"input_value", "input_type", "output_type", "session_id", "tweaks"}
+    assert outer["input_value"] == "cctv_event"
+    assert outer["input_type"] == "text" and outer["output_type"] == "chat"
+    assert outer["session_id"] == "event-1"
+    assert set(outer["tweaks"]) == {"Webhook-exTZU"}
+    assert set(outer["tweaks"]["Webhook-exTZU"]) == {"data"}
+    payload = outer["tweaks"]["Webhook-exTZU"]["data"]
+    assert set(payload) == {"input", "model"}
+    assert payload["model"] == "gemini-3-flash-preview"
+    assert len(payload["input"]) == 6
+    assert [item["type"] for item in payload["input"]] == ["text", "image", "image", "image", "image", "image"]
+    prompt = payload["input"][0]["text"]
+    assert "\n" not in prompt and "\r" not in prompt
+    metadata = json.loads(prompt.split("Event metadata: ", 1)[1])
+    assert (metadata["event_id"], metadata["source_session_id"], metadata["domain"]) == (
         "event-1", "session-1", "PARKING_MOTORCYCLE",
     )
-    assert payload["trigger"]["person_track_id"] == 7
-    assert payload["trigger"]["object_track_id"] == 5
-    assert payload["trigger"]["evidence"]["proximity_observations"] == 4
-    assert len(payload["frames"]) == 5
-    assert [frame["source_frame_seq"] for frame in payload["frames"]] == [1, 2, 3, 4, 5]
-    assert [frame["target_offset_seconds"] for frame in payload["frames"]] == [-2, -1, -.4, 0, .4]
-    for frame in payload["frames"]:
-        assert frame["source_timestamp"] > 0
-        assert frame["image"].startswith("data:image/jpeg;base64,")
-        assert base64.b64decode(frame["image"].split(",", 1)[1]) == b"\xff\xd8synthetic\xff\xd9"
+    assert metadata["trigger"]["person_track_id"] == 7
+    assert metadata["trigger"]["object_track_id"] == 5
+    assert metadata["trigger"]["evidence"]["proximity_observations"] == 4
+    assert [frame["source_frame_seq"] for frame in metadata["frames"]] == [1, 2, 3, 4, 5]
+    assert [frame["target_offset_seconds"] for frame in metadata["frames"]] == [-2, -1, -.4, 0, .4]
+    assert all("image" not in frame for frame in metadata["frames"])
+    for frame in payload["input"][1:]:
+        assert set(frame) == {"type", "data"}
+        assert frame["type"] == "image"
+        assert frame["data"].startswith("data:image/jpeg;base64,")
+        assert base64.b64decode(frame["data"].split(",", 1)[1]) == b"\xff\xd8synthetic\xff\xd9"
+    assert b'"endpoint"' not in sent.content
+    assert sent.content == json.dumps(outer, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     assert "synthetic" not in repr(client) and "secret" not in repr(client)
     assert "synthetic" not in repr(_request())
+
+
+def test_component_and_model_can_be_configured_from_environment(monkeypatch) -> None:
+    monkeypatch.setenv("SENTINEL_LANGFLOW_COMPONENT_ID", "Webhook-other")
+    monkeypatch.setenv("SENTINEL_LANGFLOW_MODEL", "model-other")
+    seen = []
+    def handler(request):
+        seen.append(request)
+        return httpx.Response(200, json=_langflow_body(json.dumps(_assessment_data())))
+    client = LangflowEvaluationClient(url=URL, http_client=_mock_client(handler))
+    client.evaluate(_request())
+    envelope = json.loads(seen[0].content)
+    assert set(envelope["tweaks"]) == {"Webhook-other"}
+    assert envelope["tweaks"]["Webhook-other"]["data"]["model"] == "model-other"
+    assert "endpoint" not in envelope["tweaks"]["Webhook-other"]
+
+
+def test_unicode_metadata_uses_utf8_not_ascii_escapes() -> None:
+    seen = []
+    def handler(request):
+        seen.append(request)
+        return httpx.Response(200, json=_langflow_body(json.dumps(_assessment_data())))
+    request = _request()
+    request = EvaluationRequest(
+        request.event_id, request.source_session_id, request.domain, request.started_at,
+        request.triggered_at, request.person_track_id, request.object_track_id,
+        {"lokasi": "parkiran mésjid"}, request.frame_bundle,
+    )
+    client = LangflowEvaluationClient(url=URL, http_client=_mock_client(handler))
+    client.evaluate(request)
+    assert "parkiran mésjid".encode("utf-8") in seen[0].content
+    assert b"\\u00e9" not in seen[0].content
 
 
 def test_env_config_and_optional_key(monkeypatch) -> None:
     monkeypatch.setenv("SENTINEL_LANGFLOW_URL", URL)
     monkeypatch.delenv("SENTINEL_LANGFLOW_API_KEY", raising=False)
     monkeypatch.setenv("SENTINEL_LANGFLOW_TIMEOUT_SECONDS", "7.5")
+    monkeypatch.delenv("SENTINEL_LANGFLOW_COMPONENT_ID", raising=False)
+    monkeypatch.delenv("SENTINEL_LANGFLOW_MODEL", raising=False)
     seen = []
     def handler(request):
         seen.append(request)
@@ -107,11 +158,23 @@ def test_env_config_and_optional_key(monkeypatch) -> None:
 
 @pytest.mark.parametrize("url,timeout", [
     ("", 2), ("not-a-url", 2), ("ftp://example.com/run", 2),
-    ("https://user:pass@example.com/run", 2), (URL, 0), (URL, float("nan")),
+    ("https://user:pass@example.com/api/v1/run/flow-id", 2),
+    ("https://langflow.example/api/v1/run", 2),
+    ("https://langflow.example/api/v1/run/flow-id?x=1", 2),
+    (URL, 0), (URL, float("nan")),
 ])
 def test_invalid_config_fails_before_network(url, timeout) -> None:
     with pytest.raises(LangflowEvaluationError) as error:
         LangflowEvaluationClient(url=url, timeout_seconds=timeout, http_client=_mock_client(lambda _: None))
+    assert error.value.kind is LangflowErrorKind.INVALID_CONFIG
+
+
+@pytest.mark.parametrize("component,model", [("", "model"), ("component", "")])
+def test_invalid_component_or_model_is_rejected(component, model) -> None:
+    with pytest.raises(LangflowEvaluationError) as error:
+        LangflowEvaluationClient(
+            url=URL, component_id=component, model=model, http_client=_mock_client(lambda _: None),
+        )
     assert error.value.kind is LangflowErrorKind.INVALID_CONFIG
 
 
@@ -197,6 +260,20 @@ def test_camel_case_aliases_and_json_fence() -> None:
     client = LangflowEvaluationClient(url=URL, http_client=_mock_client(
         lambda _: httpx.Response(200, json=_langflow_body(fenced))))
     assert client.evaluate(_request()).subject_profile.visible_objects == ("motor",)
+
+
+@pytest.mark.parametrize("inner_factory", [
+    lambda text: {"results": {"message": text}},
+    lambda text: {"results": {"text": text}},
+    lambda text: {"message": {"text": text}},
+    lambda text: {"results": {"message": {"data": {"text": text}}}},
+])
+def test_synchronous_run_text_variants(inner_factory) -> None:
+    text = json.dumps(_assessment_data())
+    body = {"outputs": [{"outputs": [inner_factory(text)]}]}
+    client = LangflowEvaluationClient(url=URL, http_client=_mock_client(
+        lambda _: httpx.Response(200, json=body)))
+    assert client.evaluate(_request()).threat_score == 20
 
 
 def test_invalid_bundle_is_rejected_before_transport() -> None:
