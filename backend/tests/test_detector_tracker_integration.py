@@ -9,6 +9,8 @@ from pathlib import Path
 import numpy as np
 
 from app.models.detection import Detection
+from app.models.domain import DomainName, DomainSnapshot, DomainState
+from app.models.tracking import TrackedDetection
 from app.models.video import FramePacket, VideoState
 from app.services.detector_service import DetectorService
 from app.services.video_service import VideoService
@@ -73,6 +75,61 @@ class FakeGate:
         self.active -= 1
 
 
+class FakeTrigger:
+    def __init__(self, gate=None, raises: bool = False) -> None:
+        self.started: list[str] = []
+        self.ended: list[str] = []
+        self.observations = []
+        self.gate = gate
+        self.raises = raises
+        self.claim_called = False
+
+    def start_session(self, session_id: str) -> None:
+        self.started.append(session_id)
+
+    def observe(self, domain, snapshot) -> None:
+        if self.gate is not None:
+            assert self.gate.active == 0
+        self.observations.append((domain, snapshot))
+        if self.raises:
+            raise RuntimeError("fake trigger failure")
+
+    def claim_next_candidate(self, *_args) -> None:
+        self.claim_called = True
+        raise AssertionError("must not be dispatched during integration")
+
+    def end_session(self, session_id: str) -> None:
+        self.ended.append(session_id)
+
+    def close(self) -> None:
+        pass
+
+
+class SnapshotTracker(FakeTracker):
+    def observe(self, frame):
+        super().observe(frame)
+        return tuple(
+            TrackedDetection(
+                track_id=index,
+                class_id=item.class_id,
+                class_name=item.class_name,
+                confidence=item.confidence,
+                xyxy=item.xyxy,
+                center=((item.xyxy[0] + item.xyxy[2]) / 2, (item.xyxy[1] + item.xyxy[3]) / 2),
+                source_session_id=frame.source_session_id,
+                source_frame_seq=frame.source_frame_seq,
+                source_timestamp=frame.source_timestamp,
+                confirmed=True,
+                hit_count=2,
+            )
+            for index, item in enumerate(frame.detections)
+        )
+
+
+def _parking_snapshot(session: str, state: DomainState = DomainState.LOCKED, domain: DomainName = DomainName.PARKING_MOTORCYCLE) -> DomainSnapshot:
+    return DomainSnapshot(session, state, domain, 3, 3, 1.0, state is DomainState.LOCKED, 2)
+
+
 def test_tracker_receives_published_result_metadata_without_image_data() -> None:
     gate = FakeGate()
     tracker = FakeTracker(gate)
@@ -93,6 +150,134 @@ def test_tracker_receives_published_result_metadata_without_image_data() -> None
         assert not hasattr(frame, "frame") and not hasattr(frame, "jpeg")
     finally:
         detector.close()
+
+
+def test_trigger_receives_post_domain_post_tracker_metadata_without_images() -> None:
+    gate = FakeGate()
+    tracker = SnapshotTracker(gate)
+    trigger = FakeTrigger(gate)
+    order: list[str] = []
+
+    class Consumer:
+        def start_session(self, _session: str) -> None: pass
+        def end_session(self, _session: str) -> None: pass
+        def observe(self, _result) -> None: order.append("domain-observe")
+
+    def provider() -> DomainSnapshot:
+        assert order == ["domain-observe"]
+        order.append("snapshot-read")
+        return _parking_snapshot("session")
+
+    detector = DetectorService(
+        model_factory=lambda: _detections,
+        result_consumer=Consumer(),
+        tracker=tracker,
+        parking_trigger=trigger,
+        domain_snapshot_provider=provider,
+        cuda_gate=gate,
+    )
+    try:
+        detector.start_session("session")
+        detector.offer(_packet("session"))
+        assert _wait_for(lambda: len(trigger.observations) == 1)
+        domain, snapshot = trigger.observations[0]
+        assert trigger.started == ["session"]
+        assert domain.domain is DomainName.PARKING_MOTORCYCLE
+        assert (snapshot.source_session_id, snapshot.source_frame_seq, snapshot.source_timestamp) == ("session", 7, 12.5)
+        assert (snapshot.frame_width, snapshot.frame_height) == (80, 48)
+        assert [track.class_name for track in snapshot.tracks] == ["person", "motorcycle", "truck"]
+        assert not hasattr(snapshot, "frame") and not hasattr(snapshot, "jpeg")
+        assert order == ["domain-observe", "snapshot-read"]
+        assert not trigger.claim_called
+    finally:
+        detector.close()
+
+
+def test_same_result_yolo_domain_lock_is_visible_to_trigger() -> None:
+    from app.services.domain_service import DomainService
+
+    domain = DomainService()
+    tracker = SnapshotTracker()
+    trigger = FakeTrigger()
+    detector = DetectorService(
+        model_factory=lambda: lambda _frame: [Detection(3, "motorcycle", 0.9, (1, 1, 20, 20))],
+        result_consumer=domain,
+        tracker=tracker,
+        parking_trigger=trigger,
+        domain_snapshot_provider=domain.get_snapshot,
+    )
+    try:
+        detector.start_session("session")
+        for seq in range(3):
+            detector.offer(_packet("session", seq))
+            assert _wait_for(lambda: len(trigger.observations) > seq)
+        assert trigger.observations[-1][0].domain is DomainName.PARKING_MOTORCYCLE
+        assert trigger.observations[-1][0].state is DomainState.LOCKED
+    finally:
+        detector.close()
+
+
+def test_trigger_failure_and_provider_failure_do_not_break_detection_or_tracker() -> None:
+    tracker = SnapshotTracker()
+    trigger = FakeTrigger(raises=True)
+    detector = DetectorService(
+        model_factory=lambda: _detections,
+        tracker=tracker,
+        parking_trigger=trigger,
+        domain_snapshot_provider=lambda: _parking_snapshot("session"),
+    )
+    try:
+        detector.start_session("session")
+        detector.offer(_packet("session"))
+        assert _wait_for(lambda: detector.get_latest_result() is not None)
+        assert _wait_for(lambda: tracker.frames and trigger.observations)
+        assert detector.get_latest_result() is not None
+    finally:
+        detector.close()
+
+    provider_tracker = SnapshotTracker()
+    provider_trigger = FakeTrigger()
+    provider_detector = DetectorService(
+        model_factory=lambda: _detections,
+        tracker=provider_tracker,
+        parking_trigger=provider_trigger,
+        domain_snapshot_provider=lambda: (_ for _ in ()).throw(RuntimeError("provider failure")),
+    )
+    try:
+        provider_detector.start_session("session")
+        provider_detector.offer(_packet("session"))
+        assert _wait_for(lambda: provider_detector.get_latest_result() is not None)
+        assert _wait_for(lambda: provider_tracker.frames)
+        assert provider_trigger.observations == []
+    finally:
+        provider_detector.close()
+
+
+def test_trigger_lifecycle_follows_replacement_and_failed_video_start(monkeypatch) -> None:
+    tracker = SnapshotTracker()
+    trigger = FakeTrigger()
+    detector = DetectorService(model_factory=lambda: _detections, tracker=tracker, parking_trigger=trigger)
+    try:
+        detector.start_session("one")
+        detector.start_session("two")
+        assert trigger.started == ["one", "two"]
+        assert trigger.ended == ["one"]
+        detector.end_session("two")
+        assert trigger.ended == ["one", "two"]
+    finally:
+        detector.close()
+
+    failed_tracker = SnapshotTracker()
+    failed_trigger = FakeTrigger()
+    failed_detector = DetectorService(model_factory=lambda: _detections, tracker=failed_tracker, parking_trigger=failed_trigger)
+    monkeypatch.setattr("app.services.video_service.cv2.VideoCapture", lambda *_args, **_kwargs: FakeCapture(opened=False))
+    failed_video = VideoService(detector=failed_detector)
+    try:
+        assert failed_video.start_webcam()
+        assert failed_trigger.ended == failed_trigger.started
+    finally:
+        failed_video.stop()
+        failed_detector.close()
 
 
 def test_stale_post_stop_and_wrong_session_results_are_not_sent_to_tracker() -> None:
@@ -195,7 +380,7 @@ def test_session_replacement_ends_old_tracker_before_starting_new() -> None:
         detector.close()
 
 
-def test_runtime_shutdown_closes_detector_before_tracker() -> None:
+def test_runtime_shutdown_closes_detector_before_trigger_and_tracker() -> None:
     from app.services.runtime import shutdown_services
 
     calls: list[str] = []
@@ -210,5 +395,5 @@ def test_runtime_shutdown_closes_detector_before_tracker() -> None:
         def close(self) -> None:
             calls.append(f"{self.name}.close")
 
-    shutdown_services(Service("video"), Service("scene"), Service("detector"), Service("tracker"))
-    assert calls == ["video.stop", "scene.close", "detector.close", "tracker.close"]
+    shutdown_services(Service("video"), Service("scene"), Service("detector"), Service("trigger"), Service("tracker"))
+    assert calls == ["video.stop", "scene.close", "detector.close", "trigger.close", "tracker.close"]

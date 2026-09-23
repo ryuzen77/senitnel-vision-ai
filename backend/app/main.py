@@ -9,6 +9,7 @@ from app.api import detections as detections_router
 from app.api import video as video_router
 from app.services.runtime import (
     detector_service,
+    parking_candidate_trigger,
     scene_domain_classifier,
     shutdown_services,
     tracker_service,
@@ -23,7 +24,7 @@ async def lifespan(app: FastAPI):  # noqa: ANN001
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     yield
     # ── Shutdown ─────────────────────────────────────────────────────────────
-    shutdown_services(video_service, scene_domain_classifier, detector_service, tracker_service)
+    shutdown_services(video_service, scene_domain_classifier, detector_service, parking_candidate_trigger, tracker_service)
 
 
 app = FastAPI(

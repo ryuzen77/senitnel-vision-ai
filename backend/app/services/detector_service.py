@@ -16,9 +16,9 @@ from typing import ContextManager, Protocol
 import numpy as np
 
 from app.models.detection import Detection, DetectionResult
-from app.models.tracking import TrackingDetectionInput, TrackingFrame
+from app.models.domain import DomainSnapshot
+from app.models.tracking import TrackingDetectionInput, TrackingFrame, TrackingSnapshot
 from app.models.video import FramePacket
-from app.services.domain_service import domain_service
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +42,18 @@ class TrackingConsumer(Protocol):
     def start_session(self, session_id: str) -> None: ...
 
     def observe(self, frame: TrackingFrame) -> object: ...
+
+    def end_session(self, session_id: str) -> None: ...
+
+    def close(self) -> None: ...
+
+
+class ParkingCandidateConsumer(Protocol):
+    """Receives post-tracker metadata only; it never receives image data."""
+
+    def start_session(self, session_id: str) -> None: ...
+
+    def observe(self, domain_snapshot: DomainSnapshot, tracking_snapshot: TrackingSnapshot) -> None: ...
 
     def end_session(self, session_id: str) -> None: ...
 
@@ -82,11 +94,15 @@ class DetectorService:
         model_factory: ModelFactory | None = None,
         result_consumer: DetectionResultConsumer | None = None,
         tracker: TrackingConsumer | None = None,
+        parking_trigger: ParkingCandidateConsumer | None = None,
+        domain_snapshot_provider: Callable[[], DomainSnapshot] | None = None,
         cuda_gate: ContextManager[None] | None = None,
     ) -> None:
         self._model_factory = model_factory or _default_model_factory
         self._result_consumer = result_consumer
         self._tracker = tracker
+        self._parking_trigger = parking_trigger
+        self._domain_snapshot_provider = domain_snapshot_provider
         # Production injects the application-wide gate.  This per-instance
         # fallback keeps isolated CPU-only unit tests independent.
         self._cuda_gate = cuda_gate or threading.Lock()
@@ -112,10 +128,14 @@ class DetectorService:
             self._cond.notify_all()
         if previous_session_id is not None and previous_session_id != session_id and self._tracker is not None:
             self._tracker.end_session(previous_session_id)
+        if previous_session_id is not None and previous_session_id != session_id and self._parking_trigger is not None:
+            self._parking_trigger.end_session(previous_session_id)
         if self._result_consumer is not None:
             self._result_consumer.start_session(session_id)
         if self._tracker is not None:
             self._tracker.start_session(session_id)
+        if self._parking_trigger is not None:
+            self._parking_trigger.start_session(session_id)
 
     def offer(self, frame_packet: FramePacket) -> None:
         """Offer a frame without waiting for model loading or inference."""
@@ -138,6 +158,8 @@ class DetectorService:
             self._result_consumer.end_session(session_id)
         if self._tracker is not None:
             self._tracker.end_session(session_id)
+        if self._parking_trigger is not None:
+            self._parking_trigger.end_session(session_id)
 
     def get_latest_result(self) -> DetectionResult | None:
         with self._cond:
@@ -158,6 +180,8 @@ class DetectorService:
             self._result_consumer.end_session(session_id)
         if session_id is not None and self._tracker is not None:
             self._tracker.end_session(session_id)
+        if session_id is not None and self._parking_trigger is not None:
+            self._parking_trigger.end_session(session_id)
         self._worker.join(timeout=3.0)
 
     def _run(self) -> None:
@@ -221,10 +245,35 @@ class DetectorService:
                             for detection in result.detections
                         ),
                     )
-                    self._tracker.observe(tracking_frame)
+                    tracked = self._tracker.observe(tracking_frame)
                 except Exception:
                     # Tracking is optional; keep published detection/domain/video alive.
                     logger.exception("Tracker observe failed for frame %s", packet.seq)
+                    continue
+                if self._parking_trigger is not None and self._domain_snapshot_provider is not None:
+                    try:
+                        # This runs after DomainService.observe(result) and tracker
+                        # association, outside both detector and CUDA locks.
+                        domain_snapshot = self._domain_snapshot_provider()
+                    except Exception:
+                        logger.exception("Domain snapshot provider failed for frame %s", packet.seq)
+                    else:
+                        try:
+                            self._parking_trigger.observe(
+                                domain_snapshot,
+                                TrackingSnapshot(
+                                    source_session_id=result.source_session_id,
+                                    source_frame_seq=result.source_frame_seq,
+                                    source_timestamp=result.source_timestamp,
+                                    frame_width=frame_width,
+                                    frame_height=frame_height,
+                                    tracks=tuple(tracked),
+                                ),
+                            )
+                        except Exception:
+                            # Candidate selection is optional and cannot impact
+                            # detection, tracking, domain state, or video capture.
+                            logger.exception("Parking candidate trigger failed for frame %s", packet.seq)
 
 
 def __getattr__(name: str):  # noqa: ANN202

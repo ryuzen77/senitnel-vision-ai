@@ -185,10 +185,12 @@ def test_fake_yolo_and_clip_gpu_operations_share_gate_without_overlap() -> None:
 
 
 def test_production_composition_is_lazy_and_uses_one_gate() -> None:
-    from app.services.runtime import detector_service, scene_domain_classifier, shared_cuda_gate, tracker_service, video_service
+    from app.services.runtime import detector_service, parking_candidate_trigger, scene_domain_classifier, shared_cuda_gate, tracker_service, video_service
 
     assert video_service._detector is detector_service  # noqa: SLF001
     assert video_service._scene_classifier is scene_domain_classifier  # noqa: SLF001
     assert detector_service._cuda_gate is shared_cuda_gate  # noqa: SLF001
     assert detector_service._tracker is tracker_service  # noqa: SLF001
+    assert detector_service._parking_trigger is parking_candidate_trigger  # noqa: SLF001
+    assert detector_service._domain_snapshot_provider is not None  # noqa: SLF001
     assert scene_domain_classifier._runner is None  # noqa: SLF001
