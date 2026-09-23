@@ -12,6 +12,7 @@ from app.services.clip_scene_runner import (
 )
 from app.services.detector_service import DetectorService
 from app.services.domain_service import domain_service
+from app.services.event_frame_buffer import EventFrameBuffer
 from app.services.scene_domain_classifier import SceneDomainClassifier
 from app.services.parking_candidate_trigger import ParkingCandidateTrigger
 from app.services.tracker_service import TrackerService
@@ -36,13 +37,20 @@ scene_domain_classifier = SceneDomainClassifier(
     clock=time.monotonic,
     scene_model=f"{DEFAULT_MODEL_ID}@{DEFAULT_MODEL_REVISION}",
 )
-video_service = VideoService(detector=detector_service, scene_classifier=scene_domain_classifier)
+event_frame_buffer = EventFrameBuffer()
+video_service = VideoService(
+    detector=detector_service,
+    scene_classifier=scene_domain_classifier,
+    event_frame_buffer=event_frame_buffer,
+)
 
 
-def shutdown_services(video, scene, detector, parking_trigger, tracker) -> None:  # noqa: ANN001
+def shutdown_services(video, scene, detector, parking_trigger, tracker, frame_buffer=None) -> None:  # noqa: ANN001
     """Shutdown order that prevents tracker observations after closure."""
     video.stop()
     scene.close()
     detector.close()
     parking_trigger.close()
     tracker.close()
+    if frame_buffer is not None:
+        frame_buffer.close()

@@ -53,6 +53,8 @@ from typing import TYPE_CHECKING, Protocol
 import cv2
 
 from app.models.video import FramePacket, VideoStartResponse, VideoState, VideoStatusResponse
+from app.models.event_frame import BufferedFrame
+from app.services.event_frame_buffer import EventFrameBuffer
 
 if TYPE_CHECKING:
     from app.services.detector_service import DetectorService
@@ -96,10 +98,12 @@ class VideoService:
         self,
         detector: DetectorService | None = None,
         scene_classifier: FramePacketConsumer | None = None,
+        event_frame_buffer: EventFrameBuffer | None = None,
     ) -> None:
         self._lock = threading.Lock()
         self._detector = detector
         self._scene_classifier = scene_classifier
+        self._event_frame_buffer = event_frame_buffer
 
         # State fields — all guarded by _lock
         self._state: VideoState = VideoState.IDLE
@@ -142,6 +146,11 @@ class VideoService:
             self._state = VideoState.STARTING
             self._stop_event.clear()
             self._released = False
+        if self._event_frame_buffer is not None:
+            try:
+                self._event_frame_buffer.start_session(session_id)
+            except Exception:
+                logger.exception("Unable to start event frame buffer session")
         # This only switches a small in-memory slot; model work remains in its
         # worker and capture never waits for it.
         if self._detector is not None:
@@ -210,12 +219,39 @@ class VideoService:
                 self._scene_classifier.end_session(session_id)
             except Exception:
                 logger.exception("Unable to end scene classifier session")
+        if session_id is not None and self._event_frame_buffer is not None:
+            try:
+                self._event_frame_buffer.end_session(session_id)
+            except Exception:
+                logger.exception("Unable to end event frame buffer session")
+
+    def _packet_is_active(self, packet: FramePacket) -> bool:
+        with self._lock:
+            return (self._session_id == packet.session_id
+                    and self._state is VideoState.RUNNING and not self._stop_event.is_set())
 
     def _offer_consumers(self, packet: FramePacket) -> None:
         """Keep capture alive if either optional asynchronous consumer fails."""
+        if not self._packet_is_active(packet):
+            return
+        if self._event_frame_buffer is not None:
+            try:
+                height, width = packet.frame.shape[:2]
+                self._event_frame_buffer.offer(BufferedFrame(
+                    source_session_id=packet.session_id,
+                    source_frame_seq=packet.seq,
+                    source_timestamp=packet.ts,
+                    frame_width=width,
+                    frame_height=height,
+                    jpeg=packet.jpeg,
+                ))
+            except Exception:
+                logger.exception("Unable to offer packet to event frame buffer")
         for label, consumer in (("detector", self._detector), ("scene classifier", self._scene_classifier)):
             if consumer is None:
                 continue
+            if not self._packet_is_active(packet):
+                return
             try:
                 consumer.offer(packet)
             except Exception:
@@ -437,6 +473,8 @@ class VideoService:
                 seq += 1
 
                 with self._packet_cond:
+                    if self._stop_event.is_set() or self._session_id != packet.session_id:
+                        continue
                     self._packet = packet
                     self._packet_cond.notify_all()
                 self._offer_consumers(packet)
@@ -507,6 +545,8 @@ class VideoService:
                 seq += 1
 
                 with self._packet_cond:
+                    if self._stop_event.is_set() or self._session_id != packet.session_id:
+                        continue
                     self._packet = packet
                     self._packet_cond.notify_all()
                 self._offer_consumers(packet)
