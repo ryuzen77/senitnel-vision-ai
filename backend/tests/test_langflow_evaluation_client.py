@@ -73,9 +73,10 @@ def test_webhook_payload_has_exact_top_level_correlation_and_five_images() -> No
     assert [item["source_frame_seq"] for item in metadata["frames"]] == [1, 2, 3, 4, 5]
     assert "event_id" not in metadata and "source_session_id" not in metadata
     for item in body["input"][1:]:
-        assert set(item) == {"type", "data"}
-        assert item["data"].startswith("data:image/jpeg;base64,")
-        assert base64.b64decode(item["data"].split(",", 1)[1]) == JPEG
+        assert set(item) == {"type", "data", "mime_type"}
+        assert item["type"] == "image" and item["mime_type"] == "image/jpeg"
+        assert not item["data"].startswith("data:")
+        assert base64.b64decode(item["data"], validate=True) == JPEG
     assert sent.content == json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     assert "synthetic-key" not in repr(client) and "synthetic" not in repr(_request())
 
@@ -103,6 +104,10 @@ def test_raw_body_survives_langflow_desktop_webhook_parsing_with_flat_keys() -> 
     assert set(output) == {"event_id", "source_session_id", "model", "input"}
     assert (output["event_id"], output["source_session_id"]) == ("event-1", "session-1")
     assert isinstance(output["input"], list) and len(output["input"]) == 6
+    for item in output["input"][1:]:
+        assert set(item) == {"type", "data", "mime_type"}
+        assert item["mime_type"] == "image/jpeg"
+        assert base64.b64decode(item["data"], validate=True) == JPEG
 
 
 @pytest.mark.parametrize("response", [

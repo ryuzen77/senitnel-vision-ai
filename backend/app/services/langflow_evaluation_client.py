@@ -160,8 +160,8 @@ class LangflowEvaluationClient:
                 "input": [
                     {"type": "text", "text": prompt},
                     *(
-                        {"type": "image", "data": "data:image/jpeg;base64,"
-                         + base64.b64encode(frame.jpeg).decode("ascii")}
+                        {"type": "image", "data": base64.b64encode(frame.jpeg).decode("ascii"),
+                         "mime_type": "image/jpeg"}
                         for frame in bundle.frames
                     ),
                 ],
