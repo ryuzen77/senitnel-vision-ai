@@ -11,6 +11,9 @@ from app.api import video as video_router
 from app.services.runtime import (
     detector_service,
     event_frame_buffer,
+    evaluation_budget,
+    evaluation_worker,
+    langflow_client,
     parking_candidate_trigger,
     scene_domain_classifier,
     shutdown_services,
@@ -24,11 +27,15 @@ from app.services.video_service import UPLOAD_DIR
 async def lifespan(app: FastAPI):  # noqa: ANN001
     # ── Startup ──────────────────────────────────────────────────────────────
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    evaluation_worker.start()
     yield
     # ── Shutdown ─────────────────────────────────────────────────────────────
     shutdown_services(
         video_service, scene_domain_classifier, detector_service,
         parking_candidate_trigger, tracker_service, event_frame_buffer,
+        evaluation_worker=evaluation_worker,
+        langflow_client=langflow_client,
+        evaluation_budget=evaluation_budget,
     )
 
 

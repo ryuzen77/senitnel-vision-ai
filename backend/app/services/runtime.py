@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import logging
+import os
 import threading
 import time
 
+from app.models.evaluation import EvaluationRequest
 from app.services.clip_scene_runner import (
     DEFAULT_MODEL_ID,
     DEFAULT_MODEL_REVISION,
@@ -12,11 +15,45 @@ from app.services.clip_scene_runner import (
 )
 from app.services.detector_service import DetectorService
 from app.services.domain_service import domain_service
+from app.services.evaluation_budget import EvaluationBudget
+from app.services.evaluation_worker import EvaluationWorker
 from app.services.event_frame_buffer import EventFrameBuffer
+from app.services.langflow_evaluation_client import LangflowDispatchRejected, LangflowEvaluationClient
 from app.services.scene_domain_classifier import SceneDomainClassifier
 from app.services.parking_candidate_trigger import ParkingCandidateTrigger
 from app.services.tracker_service import TrackerService
 from app.services.video_service import VideoService
+
+logger = logging.getLogger(__name__)
+
+
+class _UnavailableDispatcher:
+    """Never called: the disabled worker does not claim candidates or budget."""
+
+    name = "evaluation-disabled"
+
+    def dispatch(self, request: EvaluationRequest) -> None:
+        raise RuntimeError("External evaluation is disabled")
+
+
+def _create_langflow_client() -> LangflowEvaluationClient | None:
+    if not os.getenv("SENTINEL_LANGFLOW_URL", "").strip():
+        return None
+    try:
+        return LangflowEvaluationClient()
+    except LangflowDispatchRejected:
+        logger.warning("Langflow evaluation disabled: invalid transport configuration")
+        return None
+
+
+def _external_evaluation_enabled(client: LangflowEvaluationClient | None) -> bool:
+    url_configured = bool(os.getenv("SENTINEL_LANGFLOW_URL", "").strip())
+    token_configured = bool(os.getenv("SENTINEL_CALLBACK_TOKEN", "").strip())
+    if url_configured and not token_configured:
+        logger.warning("External evaluation disabled: callback token is missing")
+    elif token_configured and not url_configured:
+        logger.warning("External evaluation disabled: Langflow URL is missing")
+    return client is not None and token_configured
 
 # This is the one shared production GPU gate.  It is injected, never looked up
 # by worker modules, so capture/MJPEG paths cannot acquire it accidentally.
@@ -38,19 +75,38 @@ scene_domain_classifier = SceneDomainClassifier(
     scene_model=f"{DEFAULT_MODEL_ID}@{DEFAULT_MODEL_REVISION}",
 )
 event_frame_buffer = EventFrameBuffer()
+evaluation_budget = EvaluationBudget()
+langflow_client = _create_langflow_client()
+# A callback token is required before spending an external evaluation request.
+evaluation_enabled = _external_evaluation_enabled(langflow_client)
+evaluation_worker = EvaluationWorker(
+    parking_candidate_trigger, evaluation_budget, event_frame_buffer,
+    langflow_client if langflow_client is not None else _UnavailableDispatcher(),
+    enabled=evaluation_enabled,
+)
 video_service = VideoService(
     detector=detector_service,
     scene_classifier=scene_domain_classifier,
     event_frame_buffer=event_frame_buffer,
+    evaluation_worker=evaluation_worker,
 )
 
 
-def shutdown_services(video, scene, detector, parking_trigger, tracker, frame_buffer=None) -> None:  # noqa: ANN001
-    """Shutdown order that prevents tracker observations after closure."""
+def shutdown_services(
+    video, scene, detector, parking_trigger, tracker, frame_buffer=None,
+    *, evaluation_worker=None, langflow_client=None, evaluation_budget=None,
+) -> None:  # noqa: ANN001
+    """Stop the worker before its client; in-flight request errors stay isolated."""
     video.stop()
+    if evaluation_worker is not None:
+        evaluation_worker.close()
+    if langflow_client is not None:
+        langflow_client.close()
     scene.close()
     detector.close()
     parking_trigger.close()
     tracker.close()
     if frame_buffer is not None:
         frame_buffer.close()
+    if evaluation_budget is not None:
+        evaluation_budget.close()

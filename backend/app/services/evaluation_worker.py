@@ -64,6 +64,7 @@ class EvaluationWorker:
         strategies: Mapping[DomainName, FrameSelectionPlanFactory] | None = None,
         bundle_timeout_seconds: float = 2.0,
         callback_timeout_seconds: float = 20.0,
+        enabled: bool = True,
     ) -> None:
         if not math.isfinite(bundle_timeout_seconds) or bundle_timeout_seconds < 0:
             raise ValueError("bundle_timeout_seconds must be finite and non-negative")
@@ -75,6 +76,7 @@ class EvaluationWorker:
         self._budget = budget
         self._buffer = frame_buffer
         self._client = client
+        self.enabled = enabled
         self._clock = clock
         self._strategies = dict(strategies) if strategies is not None else {
             DomainName.PARKING_MOTORCYCLE: make_parking_frame_selection_plan,
@@ -108,6 +110,9 @@ class EvaluationWorker:
     def _run(self) -> None:
         while not self._stop.is_set():
             try:
+                if not self.enabled:
+                    self._stop.wait(0.5)
+                    continue
                 self.sweep(self._clock())
                 with self._state_lock:
                     pending = self._pending
@@ -228,6 +233,8 @@ class EvaluationWorker:
 
     def process_one(self, now: float | None = None) -> bool:
         """Claim and dispatch one event; a 2xx ACK leaves budget/trigger pending."""
+        if not self.enabled:
+            return False
         if not self._processing_lock.acquire(blocking=False):
             return False
         event: ParkingCandidateEvent | None = None

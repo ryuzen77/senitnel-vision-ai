@@ -8,12 +8,25 @@ so that any call to cv2.VideoCapture returns a FakeCapture instance.
 
 from __future__ import annotations
 
+import os
 import threading
 from typing import Generator
 from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
+
+# Production singletons are imported during test collection. Never let a
+# developer's Langflow credentials activate external evaluation in pytest.
+for _config_key in (
+    "SENTINEL_LANGFLOW_URL",
+    "SENTINEL_LANGFLOW_API_KEY",
+    "SENTINEL_LANGFLOW_TIMEOUT_SECONDS",
+    "SENTINEL_LANGFLOW_MODEL",
+    "SENTINEL_LANGFLOW_COMPONENT_ID",
+    "SENTINEL_CALLBACK_TOKEN",
+):
+    os.environ.pop(_config_key, None)
 
 from app.services.video_service import VideoService
 

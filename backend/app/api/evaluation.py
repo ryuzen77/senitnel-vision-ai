@@ -1,4 +1,4 @@
-"""Authenticated callback boundary; coordinator wiring is a later phase."""
+"""Authenticated callback boundary for the process-local evaluation worker."""
 
 from __future__ import annotations
 
@@ -35,8 +35,10 @@ class CallbackReceipt(BaseModel):
 
 
 def get_callback_consumer() -> CallbackConsumer | None:
-    """No production consumer exists yet; tests inject a fake via Depends."""
-    return None
+    """Return the one process-local worker only while evaluation is enabled."""
+    from app.services.runtime import evaluation_enabled, evaluation_worker
+
+    return evaluation_worker if evaluation_enabled else None
 
 
 def get_callback_token() -> str:

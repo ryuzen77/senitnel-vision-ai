@@ -69,6 +69,14 @@ class FramePacketConsumer(Protocol):
 
     def end_session(self, session_id: str) -> None: ...
 
+
+class SessionLifecycleConsumer(Protocol):
+    """Session-only consumer; never receives capture frames."""
+
+    def start_session(self, session_id: str) -> None: ...
+
+    def end_session(self, session_id: str) -> None: ...
+
 # ---------------------------------------------------------------------------
 # Module-level constants
 # ---------------------------------------------------------------------------
@@ -99,11 +107,13 @@ class VideoService:
         detector: DetectorService | None = None,
         scene_classifier: FramePacketConsumer | None = None,
         event_frame_buffer: EventFrameBuffer | None = None,
+        evaluation_worker: SessionLifecycleConsumer | None = None,
     ) -> None:
         self._lock = threading.Lock()
         self._detector = detector
         self._scene_classifier = scene_classifier
         self._event_frame_buffer = event_frame_buffer
+        self._evaluation_worker = evaluation_worker
 
         # State fields — all guarded by _lock
         self._state: VideoState = VideoState.IDLE
@@ -164,6 +174,17 @@ class VideoService:
             except Exception:
                 # Scene sampling is optional and must not make video start fail.
                 logger.exception("Unable to start scene classifier session")
+        if self._evaluation_worker is not None:
+            try:
+                self._evaluation_worker.start_session(session_id)
+                # stop() can race the out-of-lock reservation fan-out. Do not
+                # revive a worker session after its cleanup has already run.
+                with self._lock:
+                    still_active = self._session_id == session_id and not self._released
+                if not still_active:
+                    self._evaluation_worker.end_session(session_id)
+            except Exception:
+                logger.exception("Unable to start evaluation worker session")
         return token
 
     def _release_resources(self) -> None:
@@ -208,6 +229,13 @@ class VideoService:
             self._packet = None
             self._packet_cond.notify_all()
 
+        # Cancel evaluation while the parking trigger still has its pending
+        # event; detector.end_session() subsequently clears that trigger.
+        if session_id is not None and self._evaluation_worker is not None:
+            try:
+                self._evaluation_worker.end_session(session_id)
+            except Exception:
+                logger.exception("Unable to end evaluation worker session")
         if session_id is not None and self._detector is not None:
             try:
                 self._detector.end_session(session_id)
