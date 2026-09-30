@@ -80,6 +80,31 @@ def test_webhook_payload_has_exact_top_level_correlation_and_five_images() -> No
     assert "synthetic-key" not in repr(client) and "synthetic" not in repr(_request())
 
 
+def _langflow_1_12_2_webhook_output(raw_body: bytes) -> dict:
+    """Offline copy of Langflow Desktop 1.12.2's Webhook path; no Langflow import.
+
+    langflow/api/v1/endpoints.py webhook_run_flow passes the whole raw body as
+    tweaks[<Webhook id>] = {"data": data.decode()}; lfx WebhookComponent.build_data
+    then applies exactly one json.loads and returns Data(data=body).
+    """
+    webhook_data = raw_body.decode() if isinstance(raw_body, bytes) else raw_body
+    parsed = json.loads(webhook_data.replace('"\n"', '"\\n"') or "{}")
+    assert isinstance(parsed, dict)
+    return parsed
+
+
+def test_raw_body_survives_langflow_desktop_webhook_parsing_with_flat_keys() -> None:
+    sent = []
+    def handler(request):
+        sent.append(request)
+        return httpx.Response(202, json={"message": "Task started in the background", "status": "in progress"})
+    LangflowEvaluationClient(url=URL, http_client=_mock_client(handler)).dispatch(_request())
+    output = _langflow_1_12_2_webhook_output(sent[0].content)
+    assert set(output) == {"event_id", "source_session_id", "model", "input"}
+    assert (output["event_id"], output["source_session_id"]) == ("event-1", "session-1")
+    assert isinstance(output["input"], list) and len(output["input"]) == 6
+
+
 @pytest.mark.parametrize("response", [
     httpx.Response(200, content=b""),
     httpx.Response(202, content=b"not-json"),
@@ -212,7 +237,9 @@ def test_transport_errors_are_uncertain_and_sanitized(exception, kind) -> None:
         client.dispatch(_request())
     assert error.value.kind is kind and len(calls) == 1
     message = str(error.value)
-    assert all(secret not in message for secret in ("private", URL, "data:image", "synthetic"))
+    assert all(secret not in message for secret in (
+        "private", URL, "data:image", base64.b64encode(JPEG).decode("ascii"), "synthetic",
+    ))
 
 
 def test_default_five_second_ack_timeout_keeps_twenty_second_callback_window(monkeypatch) -> None:
