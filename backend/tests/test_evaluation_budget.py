@@ -23,7 +23,7 @@ def test_first_request_and_pending_slot_and_complete() -> None:
     first = _reserve(budget, "a", 0)
     assert first.granted and first.reason is BudgetReason.GRANTED and first.reservation_id
     blocked = _reserve(budget, "b", 1)
-    assert blocked.reason is BudgetReason.REQUEST_PENDING and blocked.retry_after_seconds == 29
+    assert blocked.reason is BudgetReason.REQUEST_PENDING and blocked.retry_after_seconds == 59
     assert budget.complete(first.reservation_id, 2)
     assert not budget.complete(first.reservation_id, 2)
     assert _reserve(budget, "b", 9).reason is BudgetReason.MINIMUM_INTERVAL
@@ -65,7 +65,7 @@ def test_failure_spends_budget_and_does_not_retry_storm() -> None:
 
 
 def test_pending_timeout_opens_slot_but_late_completion_is_rejected() -> None:
-    budget = EvaluationBudget()
+    budget = EvaluationBudget(pending_timeout_seconds=30)
     first = _reserve(budget, "a", 0)
     snap = budget.get_snapshot(30)
     assert snap.pending_reservation_id is None and snap.total_expired == 1

@@ -247,7 +247,7 @@ def test_transport_errors_are_uncertain_and_sanitized(exception, kind) -> None:
     ))
 
 
-def test_default_five_second_ack_timeout_keeps_twenty_second_callback_window(monkeypatch) -> None:
+def test_default_five_second_ack_timeout_keeps_forty_five_second_callback_window(monkeypatch) -> None:
     monkeypatch.delenv("SENTINEL_LANGFLOW_TIMEOUT_SECONDS", raising=False)
     calls = []
     def handler(request):
@@ -264,7 +264,7 @@ def test_default_five_second_ack_timeout_keeps_twenty_second_callback_window(mon
     trigger.queue(_event("e1", 10))
     assert worker.process_one(10) and len(calls) == 1
     assert worker.get_snapshot().state is EvaluationWorkerState.WAITING_CALLBACK
-    assert worker.get_snapshot().callback_deadline == 30.0
+    assert worker.get_snapshot().callback_deadline == 55.0
     assert trigger.pending == "e1" and budget.get_snapshot(10).pending_event_id == "e1"
     assert _accept(worker, now=11) is CallbackDisposition.ACCEPTED
     assert budget.get_snapshot(11).total_completed == 1
@@ -314,8 +314,8 @@ def test_worker_classifies_mock_transport_result(status, exception, waiting) -> 
         assert worker.get_snapshot().last_failure is EvaluationFailure.DISPATCH_UNCERTAIN
         assert trigger.pending == "e1" and snapshot.pending_event_id == "e1"
         assert snapshot.total_failed == 0
-        assert worker.sweep(30)
-        assert budget.get_snapshot(30).total_failed == 1 and trigger.failed == ["e1"]
+        assert worker.sweep(55)
+        assert budget.get_snapshot(55).total_failed == 1 and trigger.failed == ["e1"]
     else:
         assert worker.get_snapshot().state is EvaluationWorkerState.FAILED
         assert worker.get_snapshot().last_failure is EvaluationFailure.CLIENT_ERROR

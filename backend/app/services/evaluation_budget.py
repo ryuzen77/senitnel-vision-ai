@@ -35,7 +35,7 @@ class EvaluationBudget:
         max_requests_per_window: int = 2,
         rolling_window_seconds: float = 60.0,
         candidate_max_age_seconds: float = 8.0,
-        pending_timeout_seconds: float = 30.0,
+        pending_timeout_seconds: float = 60.0,
         processed_event_cache_size: int = 256,
     ) -> None:
         if max_pending_requests != 1:

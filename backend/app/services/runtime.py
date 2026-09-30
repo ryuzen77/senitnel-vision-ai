@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import threading
 import time
@@ -55,6 +56,18 @@ def _external_evaluation_enabled(client: LangflowEvaluationClient | None) -> boo
         logger.warning("External evaluation disabled: Langflow URL is missing")
     return client is not None and token_configured
 
+
+def _evaluation_callback_timeout_seconds() -> float | None:
+    raw = os.getenv("SENTINEL_EVALUATION_CALLBACK_TIMEOUT_SECONDS", "45")
+    try:
+        timeout = float(raw)
+    except (TypeError, ValueError):
+        timeout = None
+    if timeout is None or not math.isfinite(timeout) or not 0 < timeout <= 60:
+        logger.warning("External evaluation disabled: invalid callback timeout configuration")
+        return None
+    return timeout
+
 # This is the one shared production GPU gate.  It is injected, never looked up
 # by worker modules, so capture/MJPEG paths cannot acquire it accidentally.
 shared_cuda_gate = threading.Lock()
@@ -75,13 +88,19 @@ scene_domain_classifier = SceneDomainClassifier(
     scene_model=f"{DEFAULT_MODEL_ID}@{DEFAULT_MODEL_REVISION}",
 )
 event_frame_buffer = EventFrameBuffer()
-evaluation_budget = EvaluationBudget()
+evaluation_callback_timeout_seconds = _evaluation_callback_timeout_seconds()
+effective_callback_timeout_seconds = evaluation_callback_timeout_seconds or 45.0
+evaluation_budget = EvaluationBudget(
+    pending_timeout_seconds=effective_callback_timeout_seconds + 15,
+)
 langflow_client = _create_langflow_client()
 # A callback token is required before spending an external evaluation request.
-evaluation_enabled = _external_evaluation_enabled(langflow_client)
+evaluation_enabled = (_external_evaluation_enabled(langflow_client)
+                      and evaluation_callback_timeout_seconds is not None)
 evaluation_worker = EvaluationWorker(
     parking_candidate_trigger, evaluation_budget, event_frame_buffer,
     langflow_client if langflow_client is not None else _UnavailableDispatcher(),
+    callback_timeout_seconds=effective_callback_timeout_seconds,
     enabled=evaluation_enabled,
 )
 video_service = VideoService(

@@ -25,6 +25,7 @@ for _config_key in (
     "SENTINEL_LANGFLOW_MODEL",
     "SENTINEL_LANGFLOW_COMPONENT_ID",
     "SENTINEL_CALLBACK_TOKEN",
+    "SENTINEL_EVALUATION_CALLBACK_TIMEOUT_SECONDS",
 ):
     os.environ.pop(_config_key, None)
 

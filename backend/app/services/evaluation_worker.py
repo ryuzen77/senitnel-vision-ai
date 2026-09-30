@@ -63,13 +63,13 @@ class EvaluationWorker:
         *, clock: Callable[[], float] = time.monotonic,
         strategies: Mapping[DomainName, FrameSelectionPlanFactory] | None = None,
         bundle_timeout_seconds: float = 2.0,
-        callback_timeout_seconds: float = 20.0,
+        callback_timeout_seconds: float = 45.0,
         enabled: bool = True,
     ) -> None:
         if not math.isfinite(bundle_timeout_seconds) or bundle_timeout_seconds < 0:
             raise ValueError("bundle_timeout_seconds must be finite and non-negative")
-        if not math.isfinite(callback_timeout_seconds) or not 0 < callback_timeout_seconds <= 20:
-            raise ValueError("callback_timeout_seconds must be finite and at most 20")
+        if not math.isfinite(callback_timeout_seconds) or not 0 < callback_timeout_seconds <= 60:
+            raise ValueError("callback_timeout_seconds must be finite and at most 60")
         if not callable(getattr(client, "dispatch", None)):
             raise TypeError("client must implement asynchronous Webhook dispatch")
         self._trigger = trigger

@@ -4,9 +4,13 @@ from __future__ import annotations
 
 import logging
 import os
+from pathlib import Path
+import subprocess
+import sys
 import time
 
 from fastapi.testclient import TestClient
+import pytest
 
 from app.api.evaluation import get_callback_consumer
 from app.main import app
@@ -52,6 +56,9 @@ def test_runtime_owns_one_budget_worker_and_optional_client(monkeypatch) -> None
     assert isinstance(runtime.evaluation_worker, EvaluationWorker)
     assert runtime.video_service._evaluation_worker is runtime.evaluation_worker
     assert runtime.evaluation_worker._budget is runtime.evaluation_budget
+    assert runtime.evaluation_callback_timeout_seconds == 45.0
+    assert runtime.evaluation_worker._callback_timeout == 45.0
+    assert runtime.evaluation_budget._pending_timeout == 60.0
     assert runtime.evaluation_worker._trigger is runtime.parking_candidate_trigger
     assert runtime.evaluation_worker._buffer is runtime.event_frame_buffer
     if runtime.langflow_client is not None:
@@ -61,6 +68,86 @@ def test_runtime_owns_one_budget_worker_and_optional_client(monkeypatch) -> None
     monkeypatch.setattr(runtime, "LangflowEvaluationClient", lambda: constructed.append(object()) or constructed[-1])
     assert runtime._create_langflow_client() is constructed[0]
     assert len(constructed) == 1
+
+
+@pytest.mark.parametrize("configured", ["0", "-1", "60.01", "nan", "inf", "invalid"])
+def test_callback_timeout_configuration_rejects_invalid_values(monkeypatch, configured) -> None:
+    monkeypatch.setenv("SENTINEL_EVALUATION_CALLBACK_TIMEOUT_SECONDS", configured)
+    assert runtime._evaluation_callback_timeout_seconds() is None
+
+
+def test_callback_timeout_configuration_accepts_upper_bound(monkeypatch) -> None:
+    monkeypatch.setenv("SENTINEL_EVALUATION_CALLBACK_TIMEOUT_SECONDS", "60")
+    assert runtime._evaluation_callback_timeout_seconds() == 60.0
+
+
+@pytest.mark.parametrize("configured", ["0", "-1", "61", "nan", "inf", "invalid-private-value"])
+def test_invalid_timeout_keeps_app_running_but_disables_external_evaluation(configured) -> None:
+    environment = os.environ.copy()
+    environment["SENTINEL_EVALUATION_CALLBACK_TIMEOUT_SECONDS"] = configured
+    environment["SENTINEL_LANGFLOW_URL"] = "https://example.invalid/api/v1/webhook/flow"
+    environment["SENTINEL_CALLBACK_TOKEN"] = "synthetic-token"
+    program = """
+from fastapi.testclient import TestClient
+from app.main import app
+from app.services import runtime
+assert runtime.evaluation_callback_timeout_seconds is None
+assert not runtime.evaluation_enabled and not runtime.evaluation_worker.enabled
+assert runtime.evaluation_budget._pending_timeout == 60.0
+assert runtime.video_service._detector is runtime.detector_service
+assert runtime.video_service._scene_classifier is runtime.scene_domain_classifier
+assert runtime.detector_service._tracker is runtime.tracker_service
+assert runtime.detector_service._parking_trigger is runtime.parking_candidate_trigger
+with TestClient(app) as client:
+    assert client.get('/api/health').status_code == 200
+    assert client.get('/api/video/status').json()['state'] == 'IDLE'
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", program], cwd=Path(__file__).resolve().parents[1],
+        env=environment, capture_output=True, text=True, timeout=20, check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert "External evaluation disabled: invalid callback timeout configuration" in completed.stderr
+    if configured == "invalid-private-value":
+        assert configured not in completed.stderr
+
+
+def test_callback_after_28_seconds_completes_before_budget_expiry() -> None:
+    trigger = FakeTrigger("one")
+    budget = EvaluationBudget(pending_timeout_seconds=60)
+    worker = EvaluationWorker(
+        trigger, budget, FakeBuffer("one"), FakeClient(), clock=FakeClock(10),
+        callback_timeout_seconds=45,
+    )
+    trigger.queue(_event("e1", 10))
+    assert worker.process_one(10)
+    assert worker.get_snapshot().callback_deadline == 55
+    assert budget.get_snapshot(38).pending_event_id == "e1"
+    assert worker.accept_callback(
+        EvaluationCallback("e1", "one", _assessment()), 38,
+    ) is CallbackDisposition.ACCEPTED
+    assert budget.get_snapshot(38).total_completed == 1
+    assert budget.get_snapshot(38).total_expired == 0
+
+
+def test_callback_after_45_seconds_is_rejected_before_budget_expires() -> None:
+    trigger = FakeTrigger("one")
+    budget = EvaluationBudget(pending_timeout_seconds=60)
+    worker = EvaluationWorker(
+        trigger, budget, FakeBuffer("one"), FakeClient(), clock=FakeClock(10),
+        callback_timeout_seconds=45,
+    )
+    trigger.queue(_event("e1", 10))
+    assert worker.process_one(10)
+    assert budget.get_snapshot(55).pending_event_id == "e1"
+    assert worker.accept_callback(
+        EvaluationCallback("e1", "one", _assessment()), 55.001,
+    ) is CallbackDisposition.REJECTED
+    snapshot = budget.get_snapshot(55.001)
+    assert snapshot.pending_event_id is None
+    assert snapshot.total_failed == 1 and snapshot.total_expired == 0
+    assert trigger.failed == ["e1"]
+    assert worker.get_latest_result() is None
 
 
 def test_partial_external_configuration_warns_without_values(monkeypatch, caplog) -> None:

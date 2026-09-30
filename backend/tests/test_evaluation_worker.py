@@ -319,8 +319,8 @@ def test_client_exception_and_timeout_do_not_publish(exception) -> None:
     assert worker.get_snapshot().last_failure is EvaluationFailure.DISPATCH_UNCERTAIN
     assert worker.get_snapshot().state is EvaluationWorkerState.WAITING_CALLBACK
     assert trigger.pending == "e1" and budget.get_snapshot(10).pending_event_id == "e1"
-    assert worker.sweep(30)
-    assert trigger.failed == ["e1"] and budget.get_snapshot(30).total_failed == 1
+    assert worker.sweep(55)
+    assert trigger.failed == ["e1"] and budget.get_snapshot(55).total_failed == 1
 
 
 @pytest.mark.parametrize("invalid", [
@@ -466,11 +466,11 @@ def test_callback_deadline_is_exact_and_late_callback_cleans_pending() -> None:
     worker, trigger, budget, _, _, _ = _worker()
     trigger.queue(_event())
     assert worker.process_one(10)
-    assert worker.get_snapshot().callback_deadline == 30
-    assert _accept(worker, now=30) is CallbackDisposition.REJECTED
+    assert worker.get_snapshot().callback_deadline == 55
+    assert _accept(worker, now=55) is CallbackDisposition.REJECTED
     assert worker.get_snapshot().state is EvaluationWorkerState.TIMED_OUT
     assert worker.get_snapshot().last_failure is EvaluationFailure.CALLBACK_TIMEOUT
-    assert trigger.failed == ["e1"] and budget.get_snapshot(30).total_failed == 1
+    assert trigger.failed == ["e1"] and budget.get_snapshot(55).total_failed == 1
     assert worker.get_latest_result() is None
 
 
@@ -478,11 +478,11 @@ def test_sweep_times_out_without_callback_and_does_not_retry() -> None:
     worker, trigger, budget, _, client, _ = _worker()
     trigger.queue(_event())
     assert worker.process_one(10)
-    assert not worker.sweep(29.999)
-    assert worker.sweep(30)
-    assert not worker.sweep(31)
+    assert not worker.sweep(54.999)
+    assert worker.sweep(55)
+    assert not worker.sweep(56)
     assert len(client.requests) == 1 and trigger.failed == ["e1"]
-    assert budget.get_snapshot(31).total_failed == 1
+    assert budget.get_snapshot(56).total_failed == 1
 
 
 def test_uncertain_dispatch_can_still_complete_from_callback() -> None:
@@ -540,7 +540,7 @@ def test_ended_session_cannot_dispatch_again_before_trigger_cleanup() -> None:
     assert client.requests == [] and budget.get_snapshot(10).total_granted == 0
 
 
-@pytest.mark.parametrize("timeout", [0, 20.01, float("nan")])
+@pytest.mark.parametrize("timeout", [0, 60.01, float("nan")])
 def test_callback_timeout_configuration_is_bounded(timeout) -> None:
     with pytest.raises(ValueError):
         EvaluationWorker(FakeTrigger(), EvaluationBudget(), FakeBuffer(), FakeClient(),
