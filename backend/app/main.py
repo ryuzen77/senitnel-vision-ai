@@ -4,6 +4,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api import health
+from app.api import evaluation as evaluation_router
 from app.api import domain as domain_router
 from app.api import detections as detections_router
 from app.api import video as video_router
@@ -54,3 +55,4 @@ app.include_router(health.router, prefix="/api")
 app.include_router(domain_router.router, prefix="/api")
 app.include_router(detections_router.router, prefix="/api")
 app.include_router(video_router.router, prefix="/api")
+app.include_router(evaluation_router.router, prefix="/api")
