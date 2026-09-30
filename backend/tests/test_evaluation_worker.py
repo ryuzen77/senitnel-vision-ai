@@ -12,7 +12,8 @@ import pytest
 
 from app.models.domain import DomainName
 from app.models.evaluation import (
-    EvaluationFailure, EvaluationRequest, SubjectProfile, ThreatAssessment, ThreatStatus,
+    CallbackDisposition, EvaluationCallback, EvaluationFailure, EvaluationRequest,
+    EvaluationWorkerState, SubjectProfile, ThreatAssessment, ThreatStatus,
 )
 from app.models.event_frame import (
     BundleDecision, BundleStatus, EventFrameBundle, FrameSelectionPlan, SelectedFrame,
@@ -139,14 +140,13 @@ class FakeBuffer:
 class FakeClient:
     name = "fake-langflow"
 
-    def __init__(self, result=None, exception: Exception | None = None) -> None:
-        self.result = result if result is not None else _assessment()
+    def __init__(self, exception: Exception | None = None) -> None:
         self.exception = exception
         self.requests: list[EvaluationRequest] = []
         self.trigger: FakeTrigger | None = None
         self.budget: EvaluationBudget | None = None
 
-    def evaluate(self, request: EvaluationRequest):
+    def dispatch(self, request: EvaluationRequest) -> None:
         self.requests.append(request)
         if self.trigger is not None:
             assert self.trigger._condition.acquire(blocking=False)
@@ -156,7 +156,13 @@ class FakeClient:
             self.budget._lock.release()
         if self.exception is not None:
             raise self.exception
-        return self.result
+
+
+def _accept(worker: EvaluationWorker, assessment: ThreatAssessment | None = None,
+            event_id: str = "e1", session: str = "one", now: float = 11) -> CallbackDisposition:
+    return worker.accept_callback(
+        EvaluationCallback(event_id, session, assessment or _assessment()), now,
+    )
 
 
 def _assessment(score: int = 10, status: ThreatStatus = ThreatStatus.NORMAL) -> ThreatAssessment:
@@ -189,7 +195,7 @@ def _worker(*, client=None, buffer=None, trigger=None, budget=None, clock=None, 
     (65, ThreatStatus.CRITICAL), (100, ThreatStatus.CRITICAL),
 ])
 def test_success_claim_budget_bundle_client_complete_and_publish(score, status) -> None:
-    worker, trigger, budget, buffer, client, clock = _worker(client=FakeClient(_assessment(score, status)))
+    worker, trigger, budget, buffer, client, clock = _worker()
     client.trigger = trigger; client.budget = budget
     trigger.queue(_event())
     assert worker.process_one(10)
@@ -199,9 +205,14 @@ def test_success_claim_budget_bundle_client_complete_and_publish(score, status) 
     assert len(request.frame_bundle.frames) == 5
     assert len(set(frame.source_frame_seq for frame in request.frame_bundle.frames)) == 5
     assert "jpeg" not in repr(request).lower()
+    assert worker.get_latest_result() is None
+    assert worker.get_snapshot().state is EvaluationWorkerState.WAITING_CALLBACK
+    assert trigger.pending == "e1" and budget.get_snapshot(10).pending_event_id == "e1"
+    assert not hasattr(worker._pending, "frame_bundle")
+    assert _accept(worker, _assessment(score, status)) is CallbackDisposition.ACCEPTED
     assert trigger.completed == ["e1"] and trigger.failed == []
-    assert budget.get_snapshot(10).total_completed == 1
-    assert budget.get_snapshot(10).pending_event_id is None
+    assert budget.get_snapshot(11).total_completed == 1
+    assert budget.get_snapshot(11).pending_event_id is None
     record = worker.get_latest_result()
     assert record is not None and record.evaluation_seq == 1
     assert record.assessment.threat_score == score and record.client_name == "fake-langflow"
@@ -229,6 +240,7 @@ def test_explicit_retail_strategy_is_used_without_parking_fallback() -> None:
     trigger.queue(_event(domain=DomainName.RETAIL_STORE))
     assert worker.process_one(10)
     assert buffer.calls[0].domain is DomainName.RETAIL_STORE
+    assert _accept(worker) is CallbackDisposition.ACCEPTED
     assert worker.get_latest_result().domain is DomainName.RETAIL_STORE
 
 
@@ -304,8 +316,11 @@ def test_client_exception_and_timeout_do_not_publish(exception) -> None:
     trigger.queue(_event())
     assert worker.process_one(10)
     assert worker.get_latest_result() is None
-    assert worker.get_snapshot().last_failure is EvaluationFailure.CLIENT_ERROR
-    assert trigger.failed == ["e1"] and budget.get_snapshot(10).total_failed == 1
+    assert worker.get_snapshot().last_failure is EvaluationFailure.DISPATCH_UNCERTAIN
+    assert worker.get_snapshot().state is EvaluationWorkerState.WAITING_CALLBACK
+    assert trigger.pending == "e1" and budget.get_snapshot(10).pending_event_id == "e1"
+    assert worker.sweep(30)
+    assert trigger.failed == ["e1"] and budget.get_snapshot(30).total_failed == 1
 
 
 @pytest.mark.parametrize("invalid", [
@@ -315,34 +330,36 @@ def test_client_exception_and_timeout_do_not_publish(exception) -> None:
     replace(_assessment(), subject_profile=SubjectProfile(True, "x", "y", ["bad"], ())),
     {"threat_score": 10},
 ])
-def test_invalid_response_is_rejected_and_cleans_pending(invalid) -> None:
-    worker, trigger, budget, buffer, client, _ = _worker(client=FakeClient(result=invalid))
+def test_invalid_callback_is_rejected_without_publishing(invalid) -> None:
+    worker, trigger, budget, buffer, client, _ = _worker()
     trigger.queue(_event())
     assert worker.process_one(10)
+    assert _accept(worker, invalid) is CallbackDisposition.REJECTED
     assert worker.get_latest_result() is None
-    assert worker.get_snapshot().last_failure is EvaluationFailure.INVALID_RESPONSE
-    assert trigger.failed == ["e1"] and budget.get_snapshot(10).total_failed == 1
+    assert trigger.pending == "e1" and budget.get_snapshot(10).pending_event_id == "e1"
 
 
 def test_session_replacement_during_client_call_discards_stale_result() -> None:
     entered = threading.Event(); release = threading.Event()
     class BlockingClient(FakeClient):
-        def evaluate(self, request):
+        def dispatch(self, request):
             entered.set()
             assert release.wait(1)
-            return super().evaluate(request)
+            return super().dispatch(request)
     worker, trigger, budget, buffer, client, _ = _worker(client=BlockingClient())
     trigger.queue(_event())
     worker.start(); worker.start()
     try:
         assert entered.wait(1)
+        worker.end_session("one")
         trigger.end_session(); trigger.session = "new"; buffer.session = "new"
+        worker.start_session("new")
         release.set()
         deadline = time.monotonic() + 1
         while worker.get_snapshot().active_event_id is not None and time.monotonic() < deadline:
             release.wait(.001)
         assert worker.get_latest_result() is None
-        assert worker.get_snapshot().discarded_stale_count == 1
+        assert _accept(worker) is CallbackDisposition.REJECTED
         assert budget.get_snapshot(10).pending_event_id is None
     finally:
         release.set(); worker.close()
@@ -351,10 +368,10 @@ def test_session_replacement_during_client_call_discards_stale_result() -> None:
 def test_two_candidates_are_never_evaluated_in_parallel() -> None:
     entered = threading.Event(); release = threading.Event()
     class BlockingClient(FakeClient):
-        def evaluate(self, request):
+        def dispatch(self, request):
             entered.set()
             assert release.wait(1)
-            return super().evaluate(request)
+            return super().dispatch(request)
     worker, trigger, budget, buffer, client, _ = _worker(client=BlockingClient())
     trigger.queue(_event("a")); trigger.queue(_event("b", 20))
     worker.start()
@@ -367,6 +384,7 @@ def test_two_candidates_are_never_evaluated_in_parallel() -> None:
         while not client.requests and time.monotonic() < deadline:
             time.sleep(.001)
         assert len(client.requests) == 1
+        assert not worker.process_one(20)
     finally:
         release.set(); worker.close()
 
@@ -394,9 +412,11 @@ def test_policy_timelines_limit_fake_calls_and_do_not_queue_denials(timeline, ex
         clock.now = timestamp
         trigger.queue(_event(f"event-{index}", timestamp))
         assert worker.process_one(timestamp)
+        if index < expected_calls:
+            assert _accept(worker, event_id=f"event-{index}", now=timestamp + 1) is CallbackDisposition.ACCEPTED
         assert trigger.pending is None
     assert len(client.requests) == expected_calls
-    assert budget.get_snapshot(timeline[-1]).total_granted == expected_calls
+    assert budget.get_snapshot(timeline[-1] + 1).total_granted == expected_calls
     assert len(set(request.event_id for request in client.requests)) == expected_calls
 
 
@@ -405,11 +425,126 @@ def test_same_event_id_cannot_call_client_twice() -> None:
     worker, trigger, budget, buffer, client, _ = _worker(clock=clock)
     trigger.queue(_event("same", 10)); clock.now = 10
     assert worker.process_one(10)
+    assert _accept(worker, event_id="same", now=11) is CallbackDisposition.ACCEPTED
     trigger.queue(_event("same", 20)); clock.now = 20
     assert worker.process_one(20)
     assert len(client.requests) == 1
     assert trigger.failed == ["same"]
     assert worker.get_snapshot().last_budget_denial_reason == "DUPLICATE_EVENT"
+
+
+def test_duplicate_conflict_and_mismatch_never_complete_twice() -> None:
+    worker, trigger, budget, _, client, _ = _worker()
+    trigger.queue(_event())
+    assert worker.process_one(10)
+    assert _accept(worker, event_id="other") is CallbackDisposition.REJECTED
+    assert _accept(worker, session="other") is CallbackDisposition.REJECTED
+    assert trigger.pending == "e1" and not trigger.completed
+    callback = EvaluationCallback("e1", "one", _assessment())
+    assert worker.accept_callback(callback, 11) is CallbackDisposition.ACCEPTED
+    assert worker.accept_callback(callback, 12) is CallbackDisposition.DUPLICATE
+    assert _accept(worker, _assessment(75, ThreatStatus.CRITICAL), now=12) is CallbackDisposition.REJECTED
+    assert trigger.completed == ["e1"]
+    assert budget.get_snapshot(12).total_completed == 1
+    assert worker.get_latest_result().assessment.threat_score == 10
+
+
+def test_callback_without_pending_and_after_session_end_is_rejected() -> None:
+    worker, trigger, budget, _, _, _ = _worker()
+    assert _accept(worker) is CallbackDisposition.REJECTED
+    trigger.queue(_event())
+    assert worker.process_one(10)
+    worker.end_session("one")
+    trigger.end_session()
+    assert _accept(worker) is CallbackDisposition.REJECTED
+    assert budget.get_snapshot(11).total_failed == 1
+    assert trigger.failed == ["e1"] and worker.get_latest_result() is None
+    assert worker.get_snapshot().state is EvaluationWorkerState.CANCELLED
+
+
+def test_callback_deadline_is_exact_and_late_callback_cleans_pending() -> None:
+    worker, trigger, budget, _, _, _ = _worker()
+    trigger.queue(_event())
+    assert worker.process_one(10)
+    assert worker.get_snapshot().callback_deadline == 30
+    assert _accept(worker, now=30) is CallbackDisposition.REJECTED
+    assert worker.get_snapshot().state is EvaluationWorkerState.TIMED_OUT
+    assert worker.get_snapshot().last_failure is EvaluationFailure.CALLBACK_TIMEOUT
+    assert trigger.failed == ["e1"] and budget.get_snapshot(30).total_failed == 1
+    assert worker.get_latest_result() is None
+
+
+def test_sweep_times_out_without_callback_and_does_not_retry() -> None:
+    worker, trigger, budget, _, client, _ = _worker()
+    trigger.queue(_event())
+    assert worker.process_one(10)
+    assert not worker.sweep(29.999)
+    assert worker.sweep(30)
+    assert not worker.sweep(31)
+    assert len(client.requests) == 1 and trigger.failed == ["e1"]
+    assert budget.get_snapshot(31).total_failed == 1
+
+
+def test_uncertain_dispatch_can_still_complete_from_callback() -> None:
+    worker, trigger, budget, _, client, _ = _worker(client=FakeClient(exception=TimeoutError()))
+    trigger.queue(_event())
+    assert worker.process_one(10)
+    assert worker.get_snapshot().state is EvaluationWorkerState.WAITING_CALLBACK
+    assert _accept(worker) is CallbackDisposition.ACCEPTED
+    assert trigger.completed == ["e1"] and trigger.failed == []
+    assert budget.get_snapshot(11).total_completed == 1
+    assert len(client.requests) == 1
+
+
+def test_callback_racing_dispatch_completes_once() -> None:
+    entered = threading.Event(); release = threading.Event()
+    class BlockingDispatcher(FakeClient):
+        def dispatch(self, request):
+            entered.set()
+            assert release.wait(1)
+            return super().dispatch(request)
+    worker, trigger, budget, _, client, _ = _worker(client=BlockingDispatcher())
+    trigger.queue(_event())
+    thread = threading.Thread(target=lambda: worker.process_one(10))
+    thread.start()
+    try:
+        assert entered.wait(1)
+        assert worker.get_snapshot().state is EvaluationWorkerState.DISPATCHING
+        assert _accept(worker) is CallbackDisposition.ACCEPTED
+        release.set(); thread.join(1)
+        assert not thread.is_alive()
+        assert worker.get_snapshot().state is EvaluationWorkerState.COMPLETED
+        assert trigger.completed == ["e1"]
+        assert budget.get_snapshot(11).total_completed == 1
+    finally:
+        release.set(); thread.join(1)
+
+
+def test_session_replacement_cancels_pending_and_rejects_old_callback() -> None:
+    worker, trigger, budget, buffer, _, _ = _worker()
+    trigger.queue(_event())
+    assert worker.process_one(10)
+    worker.start_session("two")
+    trigger.end_session(); trigger.session = "two"; buffer.session = "two"
+    assert _accept(worker) is CallbackDisposition.REJECTED
+    assert budget.get_snapshot(10).total_failed == 1
+    assert trigger.failed == ["e1"] and worker.get_latest_result() is None
+
+
+def test_ended_session_cannot_dispatch_again_before_trigger_cleanup() -> None:
+    worker, trigger, budget, _, client, _ = _worker()
+    worker.start_session("one")
+    worker.end_session("one")
+    trigger.queue(_event())
+    assert worker.process_one(10)
+    assert client.requests == [] and budget.get_snapshot(10).total_granted == 0
+
+
+@pytest.mark.parametrize("timeout", [0, 20.01, float("nan")])
+def test_callback_timeout_configuration_is_bounded(timeout) -> None:
+    with pytest.raises(ValueError):
+        EvaluationWorker(FakeTrigger(), EvaluationBudget(), FakeBuffer(), FakeClient(),
+                         callback_timeout_seconds=timeout)
 
 
 def test_real_trigger_wait_notifies_on_candidate_without_claiming() -> None:
@@ -455,9 +590,9 @@ def test_worker_waits_for_future_bundle_without_client_overlap() -> None:
         assert client.requests == []
         release.set()
         deadline = time.monotonic() + 1
-        while worker.get_latest_result() is None and time.monotonic() < deadline:
+        while worker.get_snapshot().state is not EvaluationWorkerState.WAITING_CALLBACK and time.monotonic() < deadline:
             time.sleep(.001)
-        assert worker.get_latest_result() is not None
+        assert worker.get_latest_result() is None
         assert len(client.requests) == 1
     finally:
         release.set(); worker.close()
@@ -466,10 +601,10 @@ def test_worker_waits_for_future_bundle_without_client_overlap() -> None:
 def test_close_during_client_call_discards_result_and_clears_budget() -> None:
     entered = threading.Event(); release = threading.Event()
     class BlockingClient(FakeClient):
-        def evaluate(self, request):
+        def dispatch(self, request):
             entered.set()
             assert release.wait(1)
-            return super().evaluate(request)
+            return super().dispatch(request)
     worker, trigger, budget, buffer, client, _ = _worker(client=BlockingClient())
     trigger.queue(_event())
     worker.start()

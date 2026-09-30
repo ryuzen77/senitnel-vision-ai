@@ -9,14 +9,14 @@ import httpx
 import pytest
 
 from app.models.domain import DomainName
-from app.models.evaluation import EvaluationFailure, EvaluationRequest, ThreatStatus
+from app.models.evaluation import EvaluationRequest, ThreatStatus
 from app.models.event_frame import EventFrameBundle, SelectedFrame
 from app.models.parking_candidate import ParkingCandidateEvidence
 from app.services.evaluation_budget import EvaluationBudget
 from app.services.langflow_evaluation_client import (
     LangflowErrorKind, LangflowEvaluationClient, LangflowEvaluationError,
 )
-from tests.test_evaluation_worker import FakeBuffer, FakeClock, FakeTrigger, _event, _worker
+from tests.test_evaluation_worker import FakeBuffer, FakeClock, FakeTrigger, _worker
 
 
 URL = "https://langflow.example/api/v1/run/flow-id"
@@ -292,18 +292,14 @@ def test_invalid_bundle_is_rejected_before_transport() -> None:
     assert error.value.kind is LangflowErrorKind.INVALID_REQUEST and not calls
 
 
-def test_evaluation_worker_fails_pending_on_http_client_error() -> None:
+def test_legacy_synchronous_client_is_not_treated_as_callback_result() -> None:
     client = LangflowEvaluationClient(url=URL, http_client=_mock_client(
         lambda _: httpx.Response(500, text="never log me")))
     trigger = FakeTrigger("one")
     buffer = FakeBuffer("one")
     budget = EvaluationBudget()
     clock = FakeClock(10)
-    worker, *_ = _worker(client=client, trigger=trigger, buffer=buffer, budget=budget, clock=clock)
-    trigger.queue(_event("e1", 10))
-    assert worker.process_one(10)
-    assert worker.get_latest_result() is None
-    assert worker.get_snapshot().last_failure is EvaluationFailure.CLIENT_ERROR
-    assert trigger.pending is None and trigger.failed == ["e1"]
-    assert budget.get_snapshot(10).pending_reservation_id is None
-    assert budget.get_snapshot(10).total_failed == 1
+    with pytest.raises(TypeError, match="Webhook dispatch"):
+        _worker(client=client, trigger=trigger, buffer=buffer, budget=budget, clock=clock)
+    assert budget.get_snapshot(10).total_granted == 0
+    assert trigger.pending is None
