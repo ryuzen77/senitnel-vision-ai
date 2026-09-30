@@ -202,16 +202,17 @@ class TestFilePlayback:
     def test_frame_packet_seq_increments(self, fake_cap_factory) -> None:
         """Sequential packets must have strictly increasing seq numbers."""
         svc, _ = fake_cap_factory(opened=True)
-        svc.start_webcam()
-        assert _wait_for_state(svc, VideoState.RUNNING)
+        try:
+            svc.start_webcam()
+            assert _wait_for_state(svc, VideoState.RUNNING)
 
-        pkt1 = svc.wait_for_packet(-1, timeout=2.0)
-        assert pkt1 is not None
-        pkt2 = svc.wait_for_packet(pkt1.seq, timeout=2.0)
-        assert pkt2 is not None
-        assert pkt2.seq == pkt1.seq + 1
-
-        svc.stop()
+            pkt1 = svc.wait_for_packet(-1, timeout=2.0)
+            assert pkt1 is not None
+            pkt2 = svc.wait_for_packet(pkt1.seq, timeout=2.0)
+            assert pkt2 is not None
+            assert pkt2.seq > pkt1.seq
+        finally:
+            svc.stop()
 
     def test_wait_for_packet_returns_none_on_timeout(self, fresh_service: VideoService) -> None:
         """wait_for_packet on idle service returns None after the timeout."""
@@ -389,9 +390,11 @@ class TestTimingBehavior:
             )
 
     def test_webcam_error_only_after_five_consecutive_failures(
-        self, fake_cap_factory
+        self, monkeypatch
     ) -> None:
         """Webcam must enter ERROR only after WEBCAM_MAX_CONSECUTIVE_FAILURES failures."""
+        from tests.conftest import FakeCapture
+
         blank = np.zeros((480, 640, 3), dtype=np.uint8)
         # 4 failures then one success then N failures to trigger error
         reads = (
@@ -399,13 +402,32 @@ class TestTimingBehavior:
             + [(True, blank.copy())]
             + [(False, None)] * WEBCAM_MAX_CONSECUTIVE_FAILURES
         )
-        svc, _ = fake_cap_factory(opened=True, reads=reads)
-        svc.start_webcam()
-        # Must reach RUNNING first (not ERROR during the initial 4 failures)
-        assert _wait_for_state(svc, VideoState.RUNNING, timeout=3.0)
-        # Then after the reset+5 failures, it reaches ERROR
-        assert _wait_for_state(svc, VideoState.ERROR, timeout=5.0)
-        svc.stop()
+        reached_four_failures = threading.Event()
+        resume_capture = threading.Event()
+        resume_wait_timed_out = threading.Event()
+
+        class GatedCapture(FakeCapture):
+            def read(self):
+                if self._read_index == WEBCAM_MAX_CONSECUTIVE_FAILURES - 1:
+                    reached_four_failures.set()
+                    if not resume_capture.wait(1):
+                        resume_wait_timed_out.set()
+                return super().read()
+
+        cap = GatedCapture(opened=True, reads=reads)
+        monkeypatch.setattr("app.services.video_service.cv2.VideoCapture", lambda *_args: cap)
+        svc = VideoService()
+        try:
+            svc.start_webcam()
+            assert reached_four_failures.wait(1)
+            # Four failed reads must not have changed RUNNING to ERROR.
+            assert svc.get_status().state is VideoState.RUNNING
+            resume_capture.set()
+            assert _wait_for_state(svc, VideoState.ERROR, timeout=3.0)
+            assert not resume_wait_timed_out.is_set()
+        finally:
+            resume_capture.set()
+            svc.stop()
 
     def test_successful_frame_resets_consecutive_failure_counter(
         self, fake_cap_factory

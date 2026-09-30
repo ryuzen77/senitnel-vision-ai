@@ -26,6 +26,7 @@ for _config_key in (
     "SENTINEL_LANGFLOW_COMPONENT_ID",
     "SENTINEL_CALLBACK_TOKEN",
     "SENTINEL_EVALUATION_CALLBACK_TIMEOUT_SECONDS",
+    "SENTINEL_VIDEO_STARTUP_TIMING_ENABLED",
 ):
     os.environ.pop(_config_key, None)
 
@@ -129,6 +130,7 @@ def fake_cap_factory(monkeypatch: pytest.MonkeyPatch):
         svc, cap = fake_cap_factory(opened=False)
     """
     created: list[FakeCapture] = []
+    services: list[VideoService] = []
 
     def factory(
         *,
@@ -142,9 +144,12 @@ def fake_cap_factory(monkeypatch: pytest.MonkeyPatch):
 
         monkeypatch.setattr("app.services.video_service.cv2.VideoCapture", make_cap)
         svc = VideoService()
+        services.append(svc)
         return svc, created
 
-    yield factory
-
-    # Cleanup: stop any running services
-    # (tests own their service objects, but belt-and-suspenders)
+    try:
+        yield factory
+    finally:
+        # stop() is idempotent; teardown also runs when a test assertion fails.
+        for service in services:
+            service.stop()

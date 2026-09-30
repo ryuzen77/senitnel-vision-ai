@@ -44,6 +44,8 @@ Design constraints (Rev 4 — Corrective patch):
 from __future__ import annotations
 
 import logging
+import math
+import os
 import threading
 import time
 import uuid
@@ -89,6 +91,54 @@ UPLOAD_DIR: Path = Path(__file__).resolve().parent.parent / "storage" / "uploads
 
 logger = logging.getLogger(__name__)
 
+_STARTUP_MILESTONES = frozenset({
+    "upload_handler_entered", "upload_copy_completed", "first_opencv_probe_completed",
+    "state_running", "first_packet_published", "first_mjpeg_packet_yielded",
+})
+
+
+def _startup_timing_enabled() -> bool:
+    configured = os.getenv("SENTINEL_VIDEO_STARTUP_TIMING_ENABLED", "false")
+    if configured == "true":
+        return True
+    if configured != "false":
+        try:
+            logger.warning("Video startup timing disabled: invalid configuration")
+        except Exception:
+            pass
+    return False
+
+
+class _StartupTimingRecorder:
+    """One upload session's metadata-only milestones; no frame or path references."""
+
+    def __init__(self, session_id: str, token: str) -> None:
+        self.session_id = session_id
+        self.token = token
+        self._lock = threading.Lock()
+        self._origin: float | None = None
+        self._seen: set[str] = set()
+        self._closed = False
+
+    def record(self, milestone: str, at: float) -> float | None:
+        if milestone not in _STARTUP_MILESTONES or not math.isfinite(at):
+            return None
+        with self._lock:
+            if self._closed or milestone in self._seen:
+                return None
+            if self._origin is None:
+                if milestone != "upload_handler_entered":
+                    return None
+                self._origin = at
+            elapsed_ms = max(0.0, (at - self._origin) * 1000.0)
+            self._seen.add(milestone)
+            return elapsed_ms
+
+    def close(self) -> None:
+        with self._lock:
+            self._closed = True
+            self._seen.clear()
+
 
 # ---------------------------------------------------------------------------
 # VideoService
@@ -108,12 +158,16 @@ class VideoService:
         scene_classifier: FramePacketConsumer | None = None,
         event_frame_buffer: EventFrameBuffer | None = None,
         evaluation_worker: SessionLifecycleConsumer | None = None,
+        startup_timing_enabled: bool | None = None,
     ) -> None:
         self._lock = threading.Lock()
         self._detector = detector
         self._scene_classifier = scene_classifier
         self._event_frame_buffer = event_frame_buffer
         self._evaluation_worker = evaluation_worker
+        self._startup_timing_enabled = (_startup_timing_enabled() if startup_timing_enabled is None
+                                        else startup_timing_enabled)
+        self._startup_timing: _StartupTimingRecorder | None = None
 
         # State fields — all guarded by _lock
         self._state: VideoState = VideoState.IDLE
@@ -156,6 +210,11 @@ class VideoService:
             self._state = VideoState.STARTING
             self._stop_event.clear()
             self._released = False
+            if self._startup_timing_enabled:
+                try:
+                    self._startup_timing = _StartupTimingRecorder(session_id, token)
+                except Exception:
+                    self._startup_timing = None
         if self._event_frame_buffer is not None:
             try:
                 self._event_frame_buffer.start_session(session_id)
@@ -187,6 +246,46 @@ class VideoService:
                 logger.exception("Unable to start evaluation worker session")
         return token
 
+    def _prepare_startup_milestone(
+        self, milestone: str, *, token: str | None = None,
+        session_id: str | None = None, at: float | None = None,
+    ) -> tuple[str, str, float] | None:
+        try:
+            recorder = self._startup_timing
+            if recorder is None or ((token is None) == (session_id is None)):
+                return None
+            if token is not None and recorder.token != token:
+                return None
+            if session_id is not None and recorder.session_id != session_id:
+                return None
+            elapsed_ms = recorder.record(milestone, time.monotonic() if at is None else at)
+            if elapsed_ms is not None:
+                return recorder.session_id[:8], milestone, elapsed_ms
+        except Exception:
+            # Observability must never alter upload, capture, or MJPEG behavior.
+            pass
+        return None
+
+    @staticmethod
+    def _emit_startup_milestone(entry: tuple[str, str, float] | None) -> None:
+        if entry is None:
+            return
+        try:
+            logger.info(
+                "video_startup_timing session=%s milestone=%s elapsed_ms=%.3f", *entry,
+            )
+        except Exception:
+            pass
+
+    def record_startup_milestone(
+        self, milestone: str, *, token: str | None = None,
+        session_id: str | None = None, at: float | None = None,
+    ) -> None:
+        """Best-effort timing only; logging never runs under video or packet locks."""
+        self._emit_startup_milestone(self._prepare_startup_milestone(
+            milestone, token=token, session_id=session_id, at=at,
+        ))
+
     def _release_resources(self) -> None:
         """
         Idempotent resource-cleanup helper.
@@ -206,9 +305,17 @@ class VideoService:
             self._upload_path = None
             session_id = self._session_id
             self._session_id = None
+            timing = self._startup_timing
+            self._startup_timing = None
             # Signal the capture thread to stop (idempotent)
             self._stop_event.set()
         # --- Lock released before join to avoid deadlock ---
+
+        if timing is not None:
+            try:
+                timing.close()
+            except Exception:
+                pass
 
         # Self-join guard: if this IS the capture thread, skip join.
         current = threading.current_thread()
@@ -386,7 +493,11 @@ class VideoService:
             self._thread = t
             self._state = VideoState.RUNNING
 
+        state_running_entry = self._prepare_startup_milestone(
+            "state_running", session_id=self._session_id,
+        )
         t.start()
+        self._emit_startup_milestone(state_running_entry)
 
     # ------------------------------------------------------------------
     # Stop / reset
@@ -505,6 +616,7 @@ class VideoService:
                         continue
                     self._packet = packet
                     self._packet_cond.notify_all()
+                self.record_startup_milestone("first_packet_published", session_id=packet.session_id)
                 self._offer_consumers(packet)
 
         except Exception as exc:
@@ -577,6 +689,7 @@ class VideoService:
                         continue
                     self._packet = packet
                     self._packet_cond.notify_all()
+                self.record_startup_milestone("first_packet_published", session_id=packet.session_id)
                 self._offer_consumers(packet)
 
                 # Monotonic deadline: sleep only the time remaining after encode.

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 import uuid
 from pathlib import Path
 
@@ -66,6 +67,9 @@ async def start_webcam() -> VideoStartResponse:
 
 @router.post("/upload", response_model=VideoStartResponse)
 async def upload_video(file: UploadFile) -> VideoStartResponse:
+    # FastAPI/Starlette has already received and parsed the multipart body here;
+    # backend elapsed timing does not include the browser-to-server transfer.
+    handler_entered_at = time.monotonic()
     # ── 1. Atomic reservation BEFORE any file I/O ──────────────────────────
     token = video_service.claim_start()
     if token is None:
@@ -73,6 +77,9 @@ async def upload_video(file: UploadFile) -> VideoStartResponse:
             status_code=409,
             detail="Cannot upload: service is not IDLE",
         )
+    video_service.record_startup_milestone(
+        "upload_handler_entered", token=token, at=handler_entered_at,
+    )
 
     # From this point the service is STARTING and we are the sole owner.
     # All failure paths MUST guarantee:
@@ -124,6 +131,7 @@ async def upload_video(file: UploadFile) -> VideoStartResponse:
             raise
         except Exception as exc:
             raise HTTPException(status_code=500, detail="Upload write error") from exc
+        video_service.record_startup_milestone("upload_copy_completed", token=token)
 
         # ── 5. Probe: verify the file can be opened by OpenCV ───────────────
         probe: cv2.VideoCapture | None = None
@@ -139,6 +147,7 @@ async def upload_video(file: UploadFile) -> VideoStartResponse:
             # Always release the probe capture — even if isOpened() raises.
             if probe is not None:
                 probe.release()
+            video_service.record_startup_milestone("first_opencv_probe_completed", token=token)
 
         if not opened:
             raise HTTPException(
@@ -260,12 +269,16 @@ async def stream_video() -> StreamingResponse:
                     continue
 
                 last_seq = packet.seq
-                yield (
+                chunk = (
                     b"--frame\r\n"
                     b"Content-Type: image/jpeg\r\n\r\n"
                     + packet.jpeg
                     + b"\r\n"
                 )
+                video_service.record_startup_milestone(
+                    "first_mjpeg_packet_yielded", session_id=packet.session_id,
+                )
+                yield chunk
 
         except (GeneratorExit, asyncio.CancelledError):
             # Client disconnected — exit silently.
