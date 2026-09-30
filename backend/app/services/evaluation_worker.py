@@ -21,14 +21,17 @@ from app.models.event_frame import (
 from app.models.parking_candidate import ParkingCandidateEvent
 from app.services.evaluation_budget import EvaluationBudget
 from app.services.event_frame_buffer import EventFrameBuffer
+from app.services.langflow_evaluation_client import LangflowDispatchRejected
 from app.services.parking_candidate_trigger import ParkingCandidateTrigger
 
 
 class LangflowDispatcher(Protocol):
     """A normal return means Webhook dispatch ACK, never an assessment.
 
-    A raised exception is an uncertain dispatch: the remote flow might still
-    call back. Implementations must not automatically retry.
+    LangflowDispatchRejected means definitive rejection and immediately fails
+    the budget and candidate. Transport exceptions are uncertain because the
+    remote flow might still call back; wait until the callback deadline and
+    never retry automatically.
     """
 
     def dispatch(self, request: EvaluationRequest) -> None: ...
@@ -298,6 +301,11 @@ class EvaluationWorker:
                 handed_off = True
             try:
                 self._client.dispatch(request)
+            except LangflowDispatchRejected:
+                with self._state_lock:
+                    if self._pending is not None and self._pending.event_id == event.event_id:
+                        self._fail_pending_locked(self._clock(), EvaluationWorkerState.FAILED,
+                                                  EvaluationFailure.CLIENT_ERROR)
             except Exception:
                 # Timeout/connection failure can happen after the Webhook received
                 # the body. Never retry or release the reservation prematurely.

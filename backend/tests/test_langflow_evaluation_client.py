@@ -1,4 +1,4 @@
-"""Mock-transport tests for isolated Langflow v1 evaluation; no live network."""
+"""Mock-only tests for the Langflow Webhook ACK transport; no live network."""
 
 from __future__ import annotations
 
@@ -9,274 +9,236 @@ import httpx
 import pytest
 
 from app.models.domain import DomainName
-from app.models.evaluation import EvaluationRequest, ThreatStatus
+from app.models.evaluation import (
+    CallbackDisposition, EvaluationFailure, EvaluationRequest, EvaluationWorkerState,
+)
 from app.models.event_frame import EventFrameBundle, SelectedFrame
 from app.models.parking_candidate import ParkingCandidateEvidence
 from app.services.evaluation_budget import EvaluationBudget
 from app.services.langflow_evaluation_client import (
-    LangflowErrorKind, LangflowEvaluationClient, LangflowEvaluationError,
+    LangflowDispatchRejected, LangflowDispatchUncertain, LangflowErrorKind,
+    LangflowEvaluationClient,
 )
-from tests.test_evaluation_worker import FakeBuffer, FakeClock, FakeTrigger, _worker
+from tests.test_evaluation_worker import FakeBuffer, FakeClock, FakeTrigger, _accept, _event, _worker
 
 
-URL = "https://langflow.example/api/v1/run/flow-id"
+URL = "https://langflow.example/api/v1/webhook/flow-id"
+JPEG = b"\xff\xd8synthetic\xff\xd9"
 
 
 def _request() -> EvaluationRequest:
-    jpeg = b"\xff\xd8synthetic\xff\xd9"
     offsets = (-2.0, -1.0, -.4, 0.0, .4)
     frames = tuple(
         SelectedFrame(index + 1, 10 + offset, offset, offset, 0.0,
-                      640, 480, "image/jpeg", jpeg)
+                      640, 480, "image/jpeg", JPEG)
         for index, offset in enumerate(offsets)
     )
     bundle = EventFrameBundle("event-1", "session-1", DomainName.PARKING_MOTORCYCLE,
-                              10.0, frames, len(jpeg) * 5)
+                              10.0, frames, len(JPEG) * 5)
     evidence = ParkingCandidateEvidence(4, 2.1, .01, .02, .04, .0, .03)
     return EvaluationRequest("event-1", "session-1", DomainName.PARKING_MOTORCYCLE,
                              8.0, 10.0, 7, 5, evidence, bundle)
-
-
-def _assessment_data(score=20, status="NORMAL") -> dict:
-    return {
-        "threat_score": score, "status": status,
-        "reasoning": "Gerakan teramati, belum ada kesimpulan lain.",
-        "subject_profile": {
-            "person_detected": True, "clothing": "jaket",
-            "observed_action": "berjalan di dekat motor",
-            "visible_objects": ["motor"], "distinguishing_features": ["helm"],
-        },
-    }
-
-
-def _langflow_body(text: str) -> dict:
-    return {"outputs": [{"outputs": [{"results": {"message": {"text": text}}}]}]}
 
 
 def _mock_client(handler):
     return httpx.Client(transport=httpx.MockTransport(handler))
 
 
-def test_run_envelope_contains_one_line_prompt_and_five_images() -> None:
+def test_webhook_payload_has_exact_top_level_correlation_and_five_images() -> None:
     captured = []
     def handler(request: httpx.Request) -> httpx.Response:
         captured.append(request)
-        return httpx.Response(200, json=_langflow_body(json.dumps(_assessment_data())))
-    transport = _mock_client(handler)
+        return httpx.Response(202, content=b"")
     client = LangflowEvaluationClient(
-        url=URL, api_key="secret", timeout_seconds=4,
-        component_id="Webhook-exTZU", model="gemini-3-flash-preview", http_client=transport,
+        url=URL, api_key="synthetic-key", timeout_seconds=4,
+        model="gemini-3-flash-preview", http_client=_mock_client(handler),
     )
-    assessment = client.evaluate(_request())
-    assert assessment.status is ThreatStatus.NORMAL and assessment.threat_score == 20
+    assert client.dispatch(_request()) is None
     assert len(captured) == 1
     sent = captured[0]
     assert sent.method == "POST" and str(sent.url) == URL
-    assert sent.headers["x-api-key"] == "secret"
-    outer = json.loads(sent.content)
-    assert set(outer) == {"input_value", "input_type", "output_type", "session_id", "tweaks"}
-    assert outer["input_value"] == "cctv_event"
-    assert outer["input_type"] == "text" and outer["output_type"] == "chat"
-    assert outer["session_id"] == "event-1"
-    assert set(outer["tweaks"]) == {"Webhook-exTZU"}
-    assert set(outer["tweaks"]["Webhook-exTZU"]) == {"data"}
-    payload = outer["tweaks"]["Webhook-exTZU"]["data"]
-    assert set(payload) == {"input", "model"}
-    assert payload["model"] == "gemini-3-flash-preview"
-    assert len(payload["input"]) == 6
-    assert [item["type"] for item in payload["input"]] == ["text", "image", "image", "image", "image", "image"]
-    prompt = payload["input"][0]["text"]
+    assert sent.headers["x-api-key"] == "synthetic-key"
+    assert sent.headers["content-type"] == "application/json"
+    body = json.loads(sent.content)
+    assert set(body) == {"event_id", "source_session_id", "model", "input"}
+    assert (body["event_id"], body["source_session_id"], body["model"]) == (
+        "event-1", "session-1", "gemini-3-flash-preview",
+    )
+    assert [item["type"] for item in body["input"]] == ["text", "image", "image", "image", "image", "image"]
+    prompt = body["input"][0]["text"]
     assert "\n" not in prompt and "\r" not in prompt
     metadata = json.loads(prompt.split("Event metadata: ", 1)[1])
-    assert (metadata["event_id"], metadata["source_session_id"], metadata["domain"]) == (
-        "event-1", "session-1", "PARKING_MOTORCYCLE",
-    )
+    assert metadata["domain"] == "PARKING_MOTORCYCLE"
     assert metadata["trigger"]["person_track_id"] == 7
-    assert metadata["trigger"]["object_track_id"] == 5
-    assert metadata["trigger"]["evidence"]["proximity_observations"] == 4
-    assert [frame["source_frame_seq"] for frame in metadata["frames"]] == [1, 2, 3, 4, 5]
-    assert [frame["target_offset_seconds"] for frame in metadata["frames"]] == [-2, -1, -.4, 0, .4]
-    assert all("image" not in frame for frame in metadata["frames"])
-    for frame in payload["input"][1:]:
-        assert set(frame) == {"type", "data"}
-        assert frame["type"] == "image"
-        assert frame["data"].startswith("data:image/jpeg;base64,")
-        assert base64.b64decode(frame["data"].split(",", 1)[1]) == b"\xff\xd8synthetic\xff\xd9"
-    assert b'"endpoint"' not in sent.content
-    assert sent.content == json.dumps(outer, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    assert "synthetic" not in repr(client) and "secret" not in repr(client)
-    assert "synthetic" not in repr(_request())
+    assert [item["source_frame_seq"] for item in metadata["frames"]] == [1, 2, 3, 4, 5]
+    assert "event_id" not in metadata and "source_session_id" not in metadata
+    for item in body["input"][1:]:
+        assert set(item) == {"type", "data"}
+        assert item["data"].startswith("data:image/jpeg;base64,")
+        assert base64.b64decode(item["data"].split(",", 1)[1]) == JPEG
+    assert sent.content == json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    assert "synthetic-key" not in repr(client) and "synthetic" not in repr(_request())
 
 
-def test_component_and_model_can_be_configured_from_environment(monkeypatch) -> None:
-    monkeypatch.setenv("SENTINEL_LANGFLOW_COMPONENT_ID", "Webhook-other")
-    monkeypatch.setenv("SENTINEL_LANGFLOW_MODEL", "model-other")
-    seen = []
+@pytest.mark.parametrize("response", [
+    httpx.Response(200, content=b""),
+    httpx.Response(202, content=b"not-json"),
+    httpx.Response(204),
+    httpx.Response(200, json={"threatScore": 100, "status": "CRITICAL"}),
+])
+def test_any_2xx_is_ack_without_response_parsing(response) -> None:
+    calls = []
     def handler(request):
-        seen.append(request)
-        return httpx.Response(200, json=_langflow_body(json.dumps(_assessment_data())))
+        calls.append(request)
+        return response
     client = LangflowEvaluationClient(url=URL, http_client=_mock_client(handler))
-    client.evaluate(_request())
-    envelope = json.loads(seen[0].content)
-    assert set(envelope["tweaks"]) == {"Webhook-other"}
-    assert envelope["tweaks"]["Webhook-other"]["data"]["model"] == "model-other"
-    assert "endpoint" not in envelope["tweaks"]["Webhook-other"]
+    assert client.dispatch(_request()) is None
+    assert len(calls) == 1
 
 
-def test_unicode_metadata_uses_utf8_not_ascii_escapes() -> None:
+def test_environment_model_and_optional_api_key(monkeypatch) -> None:
+    monkeypatch.setenv("SENTINEL_LANGFLOW_URL", URL)
+    monkeypatch.setenv("SENTINEL_LANGFLOW_TIMEOUT_SECONDS", "7.5")
+    monkeypatch.setenv("SENTINEL_LANGFLOW_MODEL", "model-other")
+    monkeypatch.delenv("SENTINEL_LANGFLOW_API_KEY", raising=False)
+    monkeypatch.setenv("SENTINEL_LANGFLOW_COMPONENT_ID", "ignored-component")
     seen = []
     def handler(request):
         seen.append(request)
-        return httpx.Response(200, json=_langflow_body(json.dumps(_assessment_data())))
+        return httpx.Response(200)
+    client = LangflowEvaluationClient(http_client=_mock_client(handler))
+    client.dispatch(_request())
+    assert client._timeout == 7.5
+    assert "x-api-key" not in seen[0].headers
+    body = json.loads(seen[0].content)
+    assert body["model"] == "model-other"
+    assert "tweaks" not in body and "ignored-component" not in seen[0].content.decode("utf-8")
+
+
+def test_unicode_metadata_is_utf8_and_prompt_has_no_newline() -> None:
+    seen = []
+    def handler(request):
+        seen.append(request)
+        return httpx.Response(200)
     request = _request()
     request = EvaluationRequest(
         request.event_id, request.source_session_id, request.domain, request.started_at,
         request.triggered_at, request.person_track_id, request.object_track_id,
-        {"lokasi": "parkiran mésjid"}, request.frame_bundle,
+        {"lokasi": "parkiran m\u00e9sjid\nsekitar"}, request.frame_bundle,
     )
-    client = LangflowEvaluationClient(url=URL, http_client=_mock_client(handler))
-    client.evaluate(request)
-    assert "parkiran mésjid".encode("utf-8") in seen[0].content
-    assert b"\\u00e9" not in seen[0].content
-
-
-def test_env_config_and_optional_key(monkeypatch) -> None:
-    monkeypatch.setenv("SENTINEL_LANGFLOW_URL", URL)
-    monkeypatch.delenv("SENTINEL_LANGFLOW_API_KEY", raising=False)
-    monkeypatch.setenv("SENTINEL_LANGFLOW_TIMEOUT_SECONDS", "7.5")
-    monkeypatch.delenv("SENTINEL_LANGFLOW_COMPONENT_ID", raising=False)
-    monkeypatch.delenv("SENTINEL_LANGFLOW_MODEL", raising=False)
-    seen = []
-    def handler(request):
-        seen.append(request)
-        return httpx.Response(200, json=_langflow_body(json.dumps(_assessment_data())))
-    client = LangflowEvaluationClient(http_client=_mock_client(handler))
-    client.evaluate(_request())
-    assert client._timeout == 7.5
-    assert "x-api-key" not in seen[0].headers
+    LangflowEvaluationClient(url=URL, http_client=_mock_client(handler)).dispatch(request)
+    assert "m\u00e9sjid".encode("utf-8") in seen[0].content
+    prompt = json.loads(seen[0].content)["input"][0]["text"]
+    assert "\n" not in prompt and "\r" not in prompt
 
 
 @pytest.mark.parametrize("url,timeout", [
-    ("", 2), ("not-a-url", 2), ("ftp://example.com/run", 2),
-    ("https://user:pass@example.com/api/v1/run/flow-id", 2),
-    ("https://langflow.example/api/v1/run", 2),
-    ("https://langflow.example/api/v1/run/flow-id?x=1", 2),
+    ("", 2), ("not-a-url", 2), ("ftp://example.com/webhook", 2),
+    ("https://user:pass@example.com/api/v1/webhook/flow-id", 2),
+    ("https://langflow.example/api/v1/run/flow-id", 2),
+    ("https://langflow.example/api/v1/webhook", 2),
+    ("https://langflow.example/api/v1/webhook/flow-id?x=1", 2),
     (URL, 0), (URL, float("nan")),
 ])
-def test_invalid_config_fails_before_network(url, timeout) -> None:
-    with pytest.raises(LangflowEvaluationError) as error:
+def test_invalid_config_is_definitive_before_network(url, timeout) -> None:
+    with pytest.raises(LangflowDispatchRejected) as error:
         LangflowEvaluationClient(url=url, timeout_seconds=timeout, http_client=_mock_client(lambda _: None))
     assert error.value.kind is LangflowErrorKind.INVALID_CONFIG
 
 
-@pytest.mark.parametrize("component,model", [("", "model"), ("component", "")])
-def test_invalid_component_or_model_is_rejected(component, model) -> None:
-    with pytest.raises(LangflowEvaluationError) as error:
-        LangflowEvaluationClient(
-            url=URL, component_id=component, model=model, http_client=_mock_client(lambda _: None),
-        )
+def test_invalid_model_is_rejected() -> None:
+    with pytest.raises(LangflowDispatchRejected) as error:
+        LangflowEvaluationClient(url=URL, model="", http_client=_mock_client(lambda _: None))
     assert error.value.kind is LangflowErrorKind.INVALID_CONFIG
 
 
-@pytest.mark.parametrize("status", [301, 400, 401, 429, 500])
-def test_http_status_is_safe_and_not_retried(status) -> None:
+@pytest.mark.parametrize("configured_timeout", ["0", "-1", "10.01"])
+def test_environment_ack_timeout_must_be_positive_and_at_most_ten(
+    monkeypatch, configured_timeout,
+) -> None:
+    monkeypatch.setenv("SENTINEL_LANGFLOW_TIMEOUT_SECONDS", configured_timeout)
+    with pytest.raises(LangflowDispatchRejected) as error:
+        LangflowEvaluationClient(url=URL, http_client=_mock_client(lambda _: None))
+    assert error.value.kind is LangflowErrorKind.INVALID_CONFIG
+
+
+def test_ten_second_ack_timeout_is_accepted() -> None:
+    client = LangflowEvaluationClient(
+        url=URL, timeout_seconds=10, http_client=_mock_client(lambda _: httpx.Response(204)),
+    )
+    assert client._timeout == 10
+    assert client.dispatch(_request()) is None
+
+
+@pytest.mark.parametrize("status", [301, 400, 401, 408, 429, 499])
+def test_redirect_and_4xx_are_definitive_without_retry(status) -> None:
     calls = []
     def handler(request):
         calls.append(request)
-        return httpx.Response(status, text="SECRET-BODY")
+        return httpx.Response(status, text="private response body", headers={"location": "https://elsewhere.example"})
     client = LangflowEvaluationClient(url=URL, http_client=_mock_client(handler))
-    with pytest.raises(LangflowEvaluationError) as error:
-        client.evaluate(_request())
+    with pytest.raises(LangflowDispatchRejected) as error:
+        client.dispatch(_request())
     assert error.value.kind is LangflowErrorKind.HTTP_STATUS
     assert error.value.status_code == status and len(calls) == 1
-    assert "SECRET-BODY" not in str(error.value)
+    assert "private" not in str(error.value) and "elsewhere" not in str(error.value)
+
+
+@pytest.mark.parametrize("status", [500, 502, 503, 599])
+def test_5xx_is_uncertain_without_retry(status) -> None:
+    calls = []
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(status, text="private response body")
+    client = LangflowEvaluationClient(url=URL, http_client=_mock_client(handler))
+    with pytest.raises(LangflowDispatchUncertain) as error:
+        client.dispatch(_request())
+    assert error.value.kind is LangflowErrorKind.HTTP_STATUS
+    assert error.value.status_code == status and len(calls) == 1
+    assert "private" not in str(error.value)
 
 
 @pytest.mark.parametrize("exception,kind", [
-    (httpx.ConnectError("secret host detail"), LangflowErrorKind.CONNECTION_ERROR),
-    (httpx.ReadTimeout("secret timeout detail"), LangflowErrorKind.TIMEOUT),
+    (httpx.ConnectError("private host detail"), LangflowErrorKind.CONNECTION_ERROR),
+    (httpx.ReadTimeout("private timeout detail"), LangflowErrorKind.TIMEOUT),
 ])
-def test_transport_errors_are_safe_and_not_retried(exception, kind) -> None:
+def test_transport_errors_are_uncertain_and_sanitized(exception, kind) -> None:
     calls = []
     def handler(request):
         calls.append(request)
         raise exception
-    client = LangflowEvaluationClient(url=URL, http_client=_mock_client(handler))
-    with pytest.raises(LangflowEvaluationError) as error:
-        client.evaluate(_request())
+    client = LangflowEvaluationClient(url=URL, api_key="private-key", http_client=_mock_client(handler))
+    with pytest.raises(LangflowDispatchUncertain) as error:
+        client.dispatch(_request())
     assert error.value.kind is kind and len(calls) == 1
-    assert "secret" not in str(error.value)
+    message = str(error.value)
+    assert all(secret not in message for secret in ("private", URL, "data:image", "synthetic"))
 
 
-@pytest.mark.parametrize("response,kind", [
-    (httpx.Response(200, content=b""), LangflowErrorKind.EMPTY_RESPONSE),
-    (httpx.Response(200, content=b"not-json"), LangflowErrorKind.MALFORMED_JSON),
-    (httpx.Response(200, json={"outputs": []}), LangflowErrorKind.EMPTY_RESPONSE),
-    (httpx.Response(200, json=_langflow_body(" ")), LangflowErrorKind.EMPTY_RESPONSE),
-    (httpx.Response(200, json=_langflow_body("not-json")), LangflowErrorKind.MALFORMED_JSON),
-])
-def test_empty_or_malformed_langflow_response(response, kind) -> None:
-    client = LangflowEvaluationClient(url=URL, http_client=_mock_client(lambda _: response))
-    with pytest.raises(LangflowEvaluationError) as error:
-        client.evaluate(_request())
-    assert error.value.kind is kind
+def test_default_five_second_ack_timeout_keeps_twenty_second_callback_window(monkeypatch) -> None:
+    monkeypatch.delenv("SENTINEL_LANGFLOW_TIMEOUT_SECONDS", raising=False)
+    calls = []
+    def handler(request):
+        calls.append(request)
+        raise httpx.ReadTimeout("private timeout detail")
+    client = LangflowEvaluationClient(url=URL, http_client=_mock_client(handler))
+    assert client._timeout == 5.0
+    trigger = FakeTrigger("one")
+    budget = EvaluationBudget()
+    worker, *_ = _worker(
+        client=client, trigger=trigger, buffer=FakeBuffer("one"),
+        budget=budget, clock=FakeClock(10),
+    )
+    trigger.queue(_event("e1", 10))
+    assert worker.process_one(10) and len(calls) == 1
+    assert worker.get_snapshot().state is EvaluationWorkerState.WAITING_CALLBACK
+    assert worker.get_snapshot().callback_deadline == 30.0
+    assert trigger.pending == "e1" and budget.get_snapshot(10).pending_event_id == "e1"
+    assert _accept(worker, now=11) is CallbackDisposition.ACCEPTED
+    assert budget.get_snapshot(11).total_completed == 1
 
 
-@pytest.mark.parametrize("score,status", [(0, "NORMAL"), (34, "NORMAL"),
-                                           (35, "WARNING"), (64, "WARNING"),
-                                           (65, "CRITICAL"), (100, "CRITICAL")])
-def test_valid_score_status_ranges(score, status) -> None:
-    text = json.dumps(_assessment_data(score, status))
-    client = LangflowEvaluationClient(url=URL, http_client=_mock_client(
-        lambda _: httpx.Response(200, json=_langflow_body(text))))
-    assert client.evaluate(_request()).threat_score == score
-
-
-@pytest.mark.parametrize("mutation", [
-    {"threat_score": -1}, {"threat_score": 101}, {"threat_score": True},
-    {"threat_score": 50, "status": "CRITICAL"}, {"reasoning": " "},
-    {"subject_profile": {}},
-])
-def test_invalid_assessment_is_rejected(mutation) -> None:
-    body = _assessment_data(); body.update(mutation)
-    client = LangflowEvaluationClient(url=URL, http_client=_mock_client(
-        lambda _: httpx.Response(200, json=_langflow_body(json.dumps(body)))))
-    with pytest.raises(LangflowEvaluationError) as error:
-        client.evaluate(_request())
-    assert error.value.kind is LangflowErrorKind.INVALID_RESPONSE
-
-
-def test_camel_case_aliases_and_json_fence() -> None:
-    body = _assessment_data()
-    profile = body.pop("subject_profile")
-    body["threatScore"] = body.pop("threat_score")
-    body["suspectProfile"] = {
-        "personDetected": profile["person_detected"], "clothing": profile["clothing"],
-        "observedAction": profile["observed_action"],
-        "visibleObjects": profile["visible_objects"],
-        "distinguishingFeatures": profile["distinguishing_features"],
-    }
-    fenced = "```json\n" + json.dumps(body) + "\n```"
-    client = LangflowEvaluationClient(url=URL, http_client=_mock_client(
-        lambda _: httpx.Response(200, json=_langflow_body(fenced))))
-    assert client.evaluate(_request()).subject_profile.visible_objects == ("motor",)
-
-
-@pytest.mark.parametrize("inner_factory", [
-    lambda text: {"results": {"message": text}},
-    lambda text: {"results": {"text": text}},
-    lambda text: {"message": {"text": text}},
-    lambda text: {"results": {"message": {"data": {"text": text}}}},
-])
-def test_synchronous_run_text_variants(inner_factory) -> None:
-    text = json.dumps(_assessment_data())
-    body = {"outputs": [{"outputs": [inner_factory(text)]}]}
-    client = LangflowEvaluationClient(url=URL, http_client=_mock_client(
-        lambda _: httpx.Response(200, json=body)))
-    assert client.evaluate(_request()).threat_score == 20
-
-
-def test_invalid_bundle_is_rejected_before_transport() -> None:
+def test_invalid_bundle_never_sends_request_or_leaks_jpeg() -> None:
     calls = []
     client = LangflowEvaluationClient(url=URL, http_client=_mock_client(lambda request: calls.append(request)))
     request = _request()
@@ -285,21 +247,46 @@ def test_invalid_bundle_is_rejected_before_transport() -> None:
         request.triggered_at, request.person_track_id, request.object_track_id,
         request.evidence,
         EventFrameBundle(request.event_id, request.source_session_id, request.domain,
-                         request.triggered_at, request.frame_bundle.frames[:4], 1),
+                         request.triggered_at, request.frame_bundle.frames[:4], len(JPEG) * 4),
     )
-    with pytest.raises(LangflowEvaluationError) as error:
-        client.evaluate(invalid)
+    with pytest.raises(LangflowDispatchRejected) as error:
+        client.dispatch(invalid)
     assert error.value.kind is LangflowErrorKind.INVALID_REQUEST and not calls
+    assert "synthetic" not in str(error.value)
 
 
-def test_legacy_synchronous_client_is_not_treated_as_callback_result() -> None:
-    client = LangflowEvaluationClient(url=URL, http_client=_mock_client(
-        lambda _: httpx.Response(500, text="never log me")))
+@pytest.mark.parametrize("status,exception,waiting", [
+    (400, None, False), (429, None, False),
+    (500, None, True),
+    (None, httpx.ReadTimeout("private"), True),
+    (None, httpx.ConnectError("private"), True),
+])
+def test_worker_classifies_mock_transport_result(status, exception, waiting) -> None:
+    calls = []
+    def handler(request):
+        calls.append(request)
+        if exception is not None:
+            raise exception
+        return httpx.Response(status, text="private body")
+    client = LangflowEvaluationClient(url=URL, http_client=_mock_client(handler))
     trigger = FakeTrigger("one")
     buffer = FakeBuffer("one")
     budget = EvaluationBudget()
     clock = FakeClock(10)
-    with pytest.raises(TypeError, match="Webhook dispatch"):
-        _worker(client=client, trigger=trigger, buffer=buffer, budget=budget, clock=clock)
-    assert budget.get_snapshot(10).total_granted == 0
-    assert trigger.pending is None
+    worker, *_ = _worker(client=client, trigger=trigger, buffer=buffer, budget=budget, clock=clock)
+    trigger.queue(_event("e1", 10))
+    assert worker.process_one(10) and len(calls) == 1
+    snapshot = budget.get_snapshot(10)
+    if waiting:
+        assert worker.get_snapshot().state is EvaluationWorkerState.WAITING_CALLBACK
+        assert worker.get_snapshot().last_failure is EvaluationFailure.DISPATCH_UNCERTAIN
+        assert trigger.pending == "e1" and snapshot.pending_event_id == "e1"
+        assert snapshot.total_failed == 0
+        assert worker.sweep(30)
+        assert budget.get_snapshot(30).total_failed == 1 and trigger.failed == ["e1"]
+    else:
+        assert worker.get_snapshot().state is EvaluationWorkerState.FAILED
+        assert worker.get_snapshot().last_failure is EvaluationFailure.CLIENT_ERROR
+        assert trigger.pending is None and trigger.failed == ["e1"]
+        assert snapshot.pending_event_id is None and snapshot.total_failed == 1
+    assert worker.get_latest_result() is None
