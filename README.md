@@ -1,14 +1,19 @@
 # Sentinel Vision AI
 
-Full-stack foundation for the Sentinel Vision AI platform — Phase 1: Video Input Foundation.
+Local CCTV analytics prototype: video input → YOLO detection → anonymous tracking →
+scene-domain classification (YOLO + CLIP) → parking review candidates → (planned)
+Langflow LLM evaluation.
 
-| Layer     | Technology                          |
-|-----------|-------------------------------------|
-| Frontend  | React 18 · TypeScript · Vite 5      |
-| Backend   | Python FastAPI · Uvicorn            |
-| Database  | SQLite (planned)                    |
-| Real-time | WebSocket (planned)                 |
-| Video     | OpenCV · MJPEG stream               |
+> Coding agents: see [`AGENTS.md`](AGENTS.md) for architecture, invariants, and roadmap.
+
+| Layer     | Technology                                   |
+|-----------|----------------------------------------------|
+| Frontend  | React 18 · TypeScript · Vite 5               |
+| Backend   | Python FastAPI · Uvicorn (single worker)     |
+| Vision    | OpenCV · ultralytics YOLO · transformers CLIP |
+| LLM eval  | Langflow run API via httpx (not wired yet)   |
+| Database  | SQLite (planned)                             |
+| Real-time | REST polling; WebSocket (planned)            |
 
 ---
 
@@ -16,49 +21,38 @@ Full-stack foundation for the Sentinel Vision AI platform — Phase 1: Video Inp
 
 ```
 sentinel-vision-ai/
+├── AGENTS.md                      # Handoff guide for coding agents
 ├── README.md
-├── phase1-video-input-plan.md
+├── phase1-video-input-plan.md     # Historical Phase 1 plan
 ├── backend/
 │   ├── requirements.txt
+│   ├── .env.example               # SENTINEL_* configuration
+│   ├── yolo26s.pt                 # YOLO weights (git-ignored, place manually)
 │   ├── app/
-│   │   ├── __init__.py
-│   │   ├── main.py                        # FastAPI app + CORS + lifespan
-│   │   ├── api/
-│   │   │   ├── __init__.py
-│   │   │   ├── health.py                  # GET /api/health
-│   │   │   └── video.py                   # GET+POST /api/video/*
-│   │   ├── models/
-│   │   │   ├── __init__.py
-│   │   │   └── video.py                   # VideoState, FramePacket, schemas
+│   │   ├── main.py                # FastAPI app, CORS, lifespan, routers
+│   │   ├── api/                   # health, video, detections, domain
+│   │   ├── models/                # Frozen dataclass contracts + Pydantic responses
 │   │   ├── services/
-│   │   │   ├── __init__.py
-│   │   │   └── video_service.py           # State machine + capture threads
-│   │   └── storage/
-│   │       ├── __init__.py
-│   │       └── uploads/                   # Temp upload files (auto-created)
-│   └── tests/
-│       ├── __init__.py
-│       ├── conftest.py                    # FakeCapture + fixtures
-│       ├── test_video_service.py          # Unit tests (26 tests)
-│       └── test_video_api.py              # Integration tests (22 tests)
+│   │   │   ├── runtime.py         # Composition root (singletons, CUDA gate, shutdown)
+│   │   │   ├── video_service.py   # Capture state machine + MJPEG
+│   │   │   ├── detector_service.py            # YOLO worker
+│   │   │   ├── tracker_service.py             # Anonymous CPU tracker
+│   │   │   ├── domain_service.py              # Session domain lock
+│   │   │   ├── scene_domain_classifier.py     # CLIP sampling
+│   │   │   ├── clip_scene_runner.py           # CLIP model runner
+│   │   │   ├── parking_candidate_trigger.py   # Parking review candidates
+│   │   │   ├── event_frame_buffer.py          # Bounded JPEG ring buffer
+│   │   │   ├── evaluation_budget.py           # Global LLM request budget
+│   │   │   ├── evaluation_worker.py           # Candidate → LLM orchestration
+│   │   │   └── langflow_evaluation_client.py  # Langflow HTTP client
+│   │   └── storage/uploads/       # Temp upload files
+│   └── tests/                     # pytest suite (no GPU/webcam/network needed)
 └── frontend/
-    ├── index.html
-    ├── package.json
-    ├── tsconfig.json
-    ├── tsconfig.node.json
-    ├── vite.config.ts
     └── src/
-        ├── main.tsx
         ├── App.tsx
-        ├── index.css
-        ├── api/
-        │   └── videoApi.ts                # Typed fetch wrappers
-        ├── components/
-        │   ├── VideoPreview.tsx           # MJPEG preview (stable URL)
-        │   ├── VideoSourceSelector.tsx    # Webcam/Upload tab control
-        │   └── VideoStatusBadge.tsx       # State pill badge
-        └── hooks/
-            └── useVideoStatus.ts          # Status polling hook
+        ├── api/videoApi.ts        # Typed fetch wrappers
+        ├── components/            # VideoPreview, VideoSourceSelector, DetectionPanel, badges
+        └── hooks/                 # useVideoStatus, useLatestDetection, useCurrentDomain
 ```
 
 ---
@@ -123,7 +117,7 @@ cd backend
 pytest tests/ -v
 ```
 
-No physical webcam or video file required — all tests use `FakeCapture`.
+No webcam, GPU, network, or model weights required — tests use fakes (`FakeCapture`, fake model/runner factories, fake HTTP clients).
 
 ---
 
@@ -137,6 +131,8 @@ No physical webcam or video file required — all tests use `FakeCapture`.
 | POST   | /api/video/stop             | Stop capture / reset error     |
 | GET    | /api/video/status           | Current video state            |
 | GET    | /api/video/stream           | Live MJPEG stream              |
+| GET    | /api/detections/latest      | Latest YOLO result (204 if none) |
+| GET    | /api/domain/current         | Current scene-domain snapshot  |
 
 ### Health response
 
