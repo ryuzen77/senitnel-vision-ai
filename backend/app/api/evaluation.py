@@ -11,7 +11,11 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, ValidationError
 from starlette.concurrency import run_in_threadpool
 
-from app.models.evaluation import CallbackDisposition, EvaluationCallback, EvaluationCallbackPayload
+from app.models.evaluation import (
+    CallbackDisposition, CallbackSubjectProfile, EvaluationAssessmentResponse,
+    EvaluationCallback, EvaluationCallbackPayload, EvaluationCurrentResponse,
+    EvaluationCurrentView, EvaluationLatestResultResponse,
+)
 
 
 MAX_CALLBACK_BODY_BYTES = 16 * 1024
@@ -30,6 +34,10 @@ class CallbackConsumer(Protocol):
     def accept_callback(self, callback: EvaluationCallback, now: float) -> CallbackDisposition: ...
 
 
+class CurrentEvaluationReader(Protocol):
+    def get_current_view(self) -> EvaluationCurrentView: ...
+
+
 class CallbackReceipt(BaseModel):
     status: Literal["accepted", "duplicate"]
 
@@ -43,6 +51,56 @@ def get_callback_consumer() -> CallbackConsumer | None:
 
 def get_callback_token() -> str:
     return os.getenv("SENTINEL_CALLBACK_TOKEN", "")
+
+
+def get_current_evaluation_reader() -> CurrentEvaluationReader | None:
+    """Use the callback worker singleton, including when dispatch is disabled."""
+    try:
+        from app.services.runtime import evaluation_worker
+    except Exception:
+        return None
+    return evaluation_worker
+
+
+@router.get("/current", response_model=EvaluationCurrentResponse)
+async def get_current_evaluation(
+    reader: CurrentEvaluationReader | None = Depends(get_current_evaluation_reader),
+) -> EvaluationCurrentResponse:
+    if reader is None:
+        raise HTTPException(status_code=503, detail="Evaluation status unavailable")
+    try:
+        view = await run_in_threadpool(reader.get_current_view)
+        latest = None
+        if view.latest_result is not None:
+            record = view.latest_result
+            assessment = record.assessment
+            assessment.validate()
+            profile = assessment.subject_profile
+            latest = EvaluationLatestResultResponse(
+                event_id=record.event_id,
+                source_session_id=record.source_session_id,
+                assessment=EvaluationAssessmentResponse(
+                    threatScore=assessment.threat_score,
+                    status=assessment.status,
+                    reasoning=assessment.reasoning,
+                    suspectProfile=CallbackSubjectProfile(
+                        personDetected=profile.person_detected,
+                        clothing=profile.clothing,
+                        observedAction=profile.observed_action,
+                        visibleObjects=profile.visible_objects,
+                        distinguishingFeatures=profile.distinguishing_features,
+                    ),
+                ),
+            )
+        return EvaluationCurrentResponse(
+            enabled=view.enabled,
+            source_session_id=view.source_session_id,
+            process_state=view.process_state,
+            active_event_id=view.active_event_id,
+            latest_result=latest,
+        )
+    except Exception:
+        raise HTTPException(status_code=503, detail="Evaluation status unavailable") from None
 
 
 @router.post("/callback", response_model=CallbackReceipt)

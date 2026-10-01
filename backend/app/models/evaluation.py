@@ -182,3 +182,56 @@ class WorkerSnapshot:
     last_budget_denial_reason: str | None
     state: EvaluationWorkerState = EvaluationWorkerState.IDLE
     callback_deadline: float | None = None
+
+
+@dataclasses.dataclass(frozen=True)
+class EvaluationLatestView:
+    event_id: str
+    source_session_id: str
+    assessment: ThreatAssessment
+
+
+@dataclasses.dataclass(frozen=True)
+class EvaluationCurrentView:
+    """Detached single-lock view; no session is publicly IDLE.
+
+    Within an active session, process_state may retain the last terminal state
+    until the next evaluation. active_event_id identifies only pending work;
+    latest_result carries its own event identity and may belong to an earlier
+    evaluation in the same session.
+    """
+
+    enabled: bool
+    source_session_id: str | None
+    process_state: EvaluationWorkerState
+    active_event_id: str | None
+    latest_result: EvaluationLatestView | None
+
+
+class EvaluationAssessmentResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    threatScore: StrictInt
+    status: ThreatStatus
+    reasoning: StrictStr
+    suspectProfile: CallbackSubjectProfile
+
+
+class EvaluationLatestResultResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    event_id: StrictStr
+    source_session_id: StrictStr
+    assessment: EvaluationAssessmentResponse
+
+
+class EvaluationCurrentResponse(BaseModel):
+    """Dashboard view with process state separate from assessment status."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    enabled: StrictBool
+    source_session_id: StrictStr | None
+    process_state: EvaluationWorkerState
+    active_event_id: StrictStr | None
+    latest_result: EvaluationLatestResultResponse | None

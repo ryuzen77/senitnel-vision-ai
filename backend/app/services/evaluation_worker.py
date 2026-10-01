@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import Counter
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
 import threading
 import time
@@ -12,8 +12,9 @@ from typing import Protocol
 
 from app.models.domain import DomainName
 from app.models.evaluation import (
-    CallbackDisposition, EvaluationCallback, EvaluationFailure, EvaluationRecord,
-    EvaluationRequest, EvaluationWorkerState, ThreatAssessment, WorkerSnapshot,
+    CallbackDisposition, EvaluationCallback, EvaluationCurrentView, EvaluationFailure,
+    EvaluationLatestView, EvaluationRecord, EvaluationRequest, EvaluationWorkerState,
+    ThreatAssessment, WorkerSnapshot,
 )
 from app.models.event_frame import (
     BundleStatus, EventFrameBundle, FrameSelectionPlan, make_parking_frame_selection_plan,
@@ -397,6 +398,30 @@ class EvaluationWorker:
         session = self._trigger.get_snapshot().source_session_id
         with self._state_lock:
             return self._latest if self._latest is not None and self._latest.source_session_id == session else None
+
+    def get_current_view(self) -> EvaluationCurrentView:
+        """Read session, pending event and latest result under one worker lock.
+
+        Unlike the diagnostic getters, this does not consult another service or
+        expose deadline, frame sequence, client name, or internal failure data.
+        """
+        with self._state_lock:
+            session = self._session_id
+            record = self._latest
+            latest = None
+            if session is not None and record is not None and record.source_session_id == session:
+                assessment = replace(
+                    record.assessment,
+                    subject_profile=replace(record.assessment.subject_profile),
+                )
+                latest = EvaluationLatestView(record.event_id, record.source_session_id, assessment)
+            pending = self._pending
+            return EvaluationCurrentView(
+                self.enabled, session,
+                self._state if session is not None else EvaluationWorkerState.IDLE,
+                pending.event_id if pending is not None and pending.source_session_id == session else None,
+                latest,
+            )
 
     def get_snapshot(self) -> WorkerSnapshot:
         session = self._trigger.get_snapshot().source_session_id

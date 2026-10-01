@@ -189,6 +189,122 @@ def _worker(*, client=None, buffer=None, trigger=None, budget=None, clock=None, 
     return worker, trigger, budget, buffer, client, clock
 
 
+def test_current_view_idle_disabled_and_active_session() -> None:
+    worker, trigger, budget, buffer, client, clock = _worker()
+    idle = worker.get_current_view()
+    assert (idle.enabled, idle.source_session_id, idle.process_state,
+            idle.active_event_id, idle.latest_result) == (True, None, EvaluationWorkerState.IDLE, None, None)
+    worker.start_session("one")
+    assert worker.get_current_view().source_session_id == "one"
+    assert worker.get_current_view().process_state is EvaluationWorkerState.IDLE
+    disabled = EvaluationWorker(trigger, budget, buffer, client, clock=clock, enabled=False)
+    disabled.start_session("one")
+    assert not disabled.get_current_view().enabled
+    assert disabled.get_current_view().source_session_id == "one"
+    assert disabled.get_current_view().latest_result is None
+
+
+@pytest.mark.parametrize("score,status", [
+    (10, ThreatStatus.NORMAL), (50, ThreatStatus.WARNING), (90, ThreatStatus.CRITICAL),
+])
+def test_current_view_waiting_completed_and_next_event_identity(score, status) -> None:
+    worker, trigger, budget, buffer, client, clock = _worker()
+    worker.start_session("one")
+    trigger.queue(_event())
+    assert worker.process_one(10)
+    waiting = worker.get_current_view()
+    assert waiting.process_state is EvaluationWorkerState.WAITING_CALLBACK
+    assert waiting.active_event_id == "e1" and waiting.latest_result is None
+    assert _accept(worker, _assessment(score, status)) is CallbackDisposition.ACCEPTED
+    completed = worker.get_current_view()
+    assert completed.process_state is EvaluationWorkerState.COMPLETED
+    assert completed.active_event_id is None
+    assert completed.latest_result is not None
+    assert completed.latest_result.event_id == "e1"
+    assert completed.latest_result.assessment.status is status
+    assert completed.latest_result.assessment is not worker._latest.assessment
+    assert completed.latest_result.assessment.subject_profile is not worker._latest.assessment.subject_profile
+    trigger.queue(_event("e2", at=22))
+    clock.now = 22
+    assert worker.process_one(22)
+    next_view = worker.get_current_view()
+    assert next_view.active_event_id == "e2"
+    assert next_view.latest_result is not None and next_view.latest_result.event_id == "e1"
+    assert next_view.latest_result.source_session_id == next_view.source_session_id == "one"
+
+
+def test_current_view_timeout_failure_and_lifecycle_reset() -> None:
+    worker, trigger, budget, buffer, client, clock = _worker()
+    worker.start_session("one")
+    trigger.queue(_event())
+    assert worker.process_one(10)
+    assert worker.sweep(56)
+    timed_out = worker.get_current_view()
+    assert timed_out.process_state is EvaluationWorkerState.TIMED_OUT
+    assert timed_out.active_event_id is None and timed_out.latest_result is None
+    worker.end_session("one")
+    stopped = worker.get_current_view()
+    assert stopped.source_session_id is None and stopped.latest_result is None
+    assert stopped.process_state is EvaluationWorkerState.IDLE
+    assert worker.get_snapshot().state is EvaluationWorkerState.CANCELLED
+    worker.start_session("two")
+    restarted = worker.get_current_view()
+    assert restarted.source_session_id == "two" and restarted.process_state is EvaluationWorkerState.IDLE
+    assert restarted.active_event_id is None and restarted.latest_result is None
+    trigger.session = "two"; buffer.session = "two"
+    client.exception = RuntimeError("private dispatch failure")
+    trigger.queue(_event("e2", at=70, session="two"))
+    clock.now = 70
+    assert worker.process_one(70)
+    # Generic dispatch errors are uncertain and wait for a callback, not FAILED.
+    assert worker.get_current_view().process_state is EvaluationWorkerState.WAITING_CALLBACK
+
+
+@pytest.mark.parametrize("phase", ["without_evaluation", "pending", "completed"])
+def test_current_view_after_stop_is_idle_without_changing_internal_state(phase) -> None:
+    worker, trigger, budget, buffer, client, clock = _worker()
+    worker.start_session("one")
+    if phase != "without_evaluation":
+        trigger.queue(_event())
+        assert worker.process_one(10)
+    if phase == "completed":
+        assert _accept(worker) is CallbackDisposition.ACCEPTED
+        assert worker.get_current_view().latest_result is not None
+    worker.end_session("one")
+    assert worker.get_current_view().source_session_id is None
+    assert worker.get_current_view().process_state is EvaluationWorkerState.IDLE
+    assert worker.get_current_view().active_event_id is None
+    assert worker.get_current_view().latest_result is None
+    assert worker.get_snapshot().state is EvaluationWorkerState.CANCELLED
+    assert _accept(worker) is CallbackDisposition.REJECTED
+    assert worker.get_current_view().latest_result is None
+    if phase == "pending":
+        assert trigger.failed == ["e1"]
+        assert budget.get_snapshot(11).pending_event_id is None
+
+
+def test_current_view_atomic_across_callback_and_session_change() -> None:
+    worker, trigger, budget, buffer, client, clock = _worker()
+    worker.start_session("one")
+    trigger.queue(_event())
+    assert worker.process_one(10)
+    seen = []
+    entered = threading.Event()
+    with worker._state_lock:
+        thread = threading.Thread(target=lambda: (entered.set(), seen.append(worker.get_current_view())))
+        thread.start()
+        assert entered.wait(1)
+        assert _accept(worker) is CallbackDisposition.ACCEPTED
+        worker.end_session("one")
+        worker.start_session("two")
+    thread.join(1)
+    assert not thread.is_alive()
+    assert len(seen) == 1
+    assert seen[0].source_session_id == "two"
+    assert seen[0].active_event_id is None and seen[0].latest_result is None
+    assert seen[0].process_state is EvaluationWorkerState.IDLE
+
+
 @pytest.mark.parametrize("score,status", [
     (0, ThreatStatus.NORMAL), (34, ThreatStatus.NORMAL),
     (35, ThreatStatus.WARNING), (64, ThreatStatus.WARNING),
