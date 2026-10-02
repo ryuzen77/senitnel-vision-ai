@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 import {
   startWebcam,
   stopVideo,
@@ -8,31 +8,23 @@ import {
 } from '../api/videoApi'
 
 interface Props {
+  /** Last backend status read in the current lifecycle (IDLE while unknown). */
   state: VideoState
-  /** Called whenever pendingState changes so App can derive effectiveState. */
+  /** Optimistic state owned by App; cleared by App on the first fresh status read. */
+  pendingState: VideoState | null
+  /** Reports the optimistic state of an action (STARTING/STOPPING, then its response). */
   onPendingStateChange: (pending: VideoState | null) => void
+  /** Called once an action's request settles, successfully or not. */
+  onActionSettled: () => void
 }
 
 type Tab = 'webcam' | 'upload'
 
-export function VideoSourceSelector({ state, onPendingStateChange }: Props) {
+export function VideoSourceSelector({ state, pendingState, onPendingStateChange, onActionSettled }: Props) {
   const [activeTab, setActiveTab] = useState<Tab>('webcam')
   const [actionError, setActionError] = useState<string | null>(null)
   const [isActing, setIsActing] = useState(false)
-  const [pendingState, setPendingStateRaw] = useState<VideoState | null>(null)
-
-  // Keep parent in sync whenever pendingState changes.
-  function setPendingState(next: VideoState | null) {
-    setPendingStateRaw(next)
-    onPendingStateChange(next)
-  }
-
-  // Clear pendingState once the polled backend state confirms it.
-  useEffect(() => {
-    if (pendingState !== null && state === pendingState) {
-      setPendingState(null)
-    }
-  }, [state, pendingState]) // eslint-disable-line react-hooks/exhaustive-deps
+  const setPendingState = onPendingStateChange
 
   const effectiveState = pendingState ?? state
   const isTransitioning =
@@ -40,29 +32,22 @@ export function VideoSourceSelector({ state, onPendingStateChange }: Props) {
   const sourceControlsDisabled =
     isTransitioning || isActing || effectiveState === VideoState.RUNNING || effectiveState === VideoState.ERROR
 
+  // On failure the transitional pending state is kept: App replaces it with the
+  // first status read after the action settles, never with a pre-action status.
   async function handleWebcamClick() {
     setActionError(null)
     setIsActing(true)
-    if (effectiveState === VideoState.RUNNING || effectiveState === VideoState.ERROR) {
-      setPendingState(VideoState.STOPPING)
-      try {
-        const res = await stopVideo()
-        setPendingState(res.state)
-      } catch (err: unknown) {
-        setPendingState(null)
-        setActionError(err instanceof Error ? err.message : String(err))
-      }
-    } else {
-      setPendingState(VideoState.STARTING)
-      try {
-        const res = await startWebcam()
-        setPendingState(res.state)
-      } catch (err: unknown) {
-        setPendingState(null)
-        setActionError(err instanceof Error ? err.message : String(err))
-      }
+    const stopping = effectiveState === VideoState.RUNNING || effectiveState === VideoState.ERROR
+    setPendingState(stopping ? VideoState.STOPPING : VideoState.STARTING)
+    try {
+      const res = await (stopping ? stopVideo() : startWebcam())
+      setPendingState(res.state)
+    } catch (err: unknown) {
+      setActionError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setIsActing(false)
+      onActionSettled()
     }
-    setIsActing(false)
   }
 
   async function handleFileChange(e: React.ChangeEvent<HTMLInputElement>) {
@@ -77,14 +62,15 @@ export function VideoSourceSelector({ state, onPendingStateChange }: Props) {
       const res = await uploadVideo(file)
       setPendingState(res.state)
     } catch (err: unknown) {
-      setPendingState(null)
       if (err instanceof VideoValidationError) {
         setActionError(err.message)
       } else {
         setActionError(err instanceof Error ? err.message : String(err))
       }
+    } finally {
+      setIsActing(false)
+      onActionSettled()
     }
-    setIsActing(false)
   }
 
   const webcamLabel =

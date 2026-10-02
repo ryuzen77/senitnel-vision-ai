@@ -61,6 +61,49 @@ export interface DomainSnapshot {
   scene_consistency: number | null
 }
 
+/** Mirrors backend EvaluationWorkerState; this is process state, not a threat level. */
+export type EvaluationProcessState =
+  | 'IDLE'
+  | 'DISPATCHING'
+  | 'WAITING_CALLBACK'
+  | 'COMPLETED'
+  | 'FAILED'
+  | 'TIMED_OUT'
+  | 'CANCELLED'
+
+/** Mirrors backend ThreatStatus of a validated AI assessment. */
+export type ThreatStatus = 'NORMAL' | 'WARNING' | 'CRITICAL'
+
+export interface EvaluationSubjectProfile {
+  personDetected: boolean
+  clothing: string
+  observedAction: string
+  visibleObjects: string[]
+  distinguishingFeatures: string[]
+}
+
+export interface EvaluationAssessment {
+  threatScore: number
+  status: ThreatStatus
+  reasoning: string
+  suspectProfile: EvaluationSubjectProfile
+}
+
+export interface EvaluationLatestResult {
+  event_id: string
+  source_session_id: string
+  assessment: EvaluationAssessment
+}
+
+/** GET /api/evaluation/current — process-local, session-scoped view. */
+export interface EvaluationCurrent {
+  enabled: boolean
+  source_session_id: string | null
+  process_state: EvaluationProcessState
+  active_event_id: string | null
+  latest_result: EvaluationLatestResult | null
+}
+
 /** Thrown for client-side validation failures before any request is sent. */
 export class VideoValidationError extends Error {
   constructor(message: string) {
@@ -124,8 +167,8 @@ export async function stopVideo(): Promise<VideoStatusResponse> {
   return res.json() as Promise<VideoStatusResponse>
 }
 
-export async function getVideoStatus(): Promise<VideoStatusResponse> {
-  const res = await fetch('/api/video/status')
+export async function getVideoStatus(signal?: AbortSignal): Promise<VideoStatusResponse> {
+  const res = await fetch('/api/video/status', { signal })
   if (!res.ok) {
     throw new Error(`HTTP ${res.status}`)
   }
@@ -143,6 +186,15 @@ export async function getLatestDetection(signal?: AbortSignal): Promise<Detectio
     throw new Error(body?.detail ?? `HTTP ${res.status}`)
   }
   return res.json() as Promise<DetectionResult>
+}
+
+/** Returns the read-only evaluation view; any non-2xx is a frontend fetch error. */
+export async function getCurrentEvaluation(signal?: AbortSignal): Promise<EvaluationCurrent> {
+  const res = await fetch('/api/evaluation/current', { signal })
+  if (!res.ok) {
+    throw new Error(`HTTP ${res.status}`)
+  }
+  return res.json() as Promise<EvaluationCurrent>
 }
 
 /** Returns the current read-only, session-scoped domain snapshot. */

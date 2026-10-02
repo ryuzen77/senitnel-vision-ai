@@ -1,12 +1,14 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import { VideoPreview } from './components/VideoPreview'
 import { DetectionPanel } from './components/DetectionPanel'
+import { EvaluationPanel, getEvaluationUiState } from './components/EvaluationPanel'
 import { VideoSourceSelector } from './components/VideoSourceSelector'
 import { VideoStatusBadge } from './components/VideoStatusBadge'
 import { VideoState } from './api/videoApi'
 import { useVideoStatus } from './hooks/useVideoStatus'
 import { useLatestDetection } from './hooks/useLatestDetection'
 import { useCurrentDomain } from './hooks/useCurrentDomain'
+import { startsNewLifecycle, useCurrentEvaluation } from './hooks/useCurrentEvaluation'
 import { DomainStatusBadge, getDomainUiState } from './components/DomainStatusBadge'
 
 interface HealthResponse {
@@ -16,8 +18,36 @@ interface HealthResponse {
 
 function App() {
   const [health, setHealth] = useState<HealthResponse | null>(null)
-  const { status, fetchError } = useVideoStatus()
   const [pendingState, setPendingState] = useState<VideoState | null>(null)
+  // Bumped when a Start/Stop action begins and again when it settles. Status and
+  // evaluation polling restart on every bump, so a response requested before or
+  // during an action can never update the state that follows it, and a quick
+  // Stop→Start cannot be hidden by React batching or a slow status poll.
+  const [lifecycleEpoch, setLifecycleEpoch] = useState(0)
+  // True after an action settled until the first status read of the new epoch.
+  const [awaitingFreshStatus, setAwaitingFreshStatus] = useState(false)
+  const { status, fetchError } = useVideoStatus(lifecycleEpoch)
+  const handlePendingStateChange = useCallback((next: VideoState | null) => {
+    if (startsNewLifecycle(next)) {
+      setLifecycleEpoch((epoch) => epoch + 1)
+      setAwaitingFreshStatus(false)
+    }
+    setPendingState(next)
+  }, [])
+  const handleActionSettled = useCallback(() => {
+    setLifecycleEpoch((epoch) => epoch + 1)
+    setAwaitingFreshStatus(true)
+  }, [])
+
+  // The first status read after an action settles is authoritative whatever its
+  // value (e.g. IDLE after EOF, RUNNING after a failed Stop), replacing the
+  // optimistic or transitional pending state.
+  useEffect(() => {
+    if (awaitingFreshStatus && status !== null) {
+      setAwaitingFreshStatus(false)
+      setPendingState(null)
+    }
+  }, [awaitingFreshStatus, status])
 
   useEffect(() => {
     fetch('/api/health')
@@ -26,9 +56,9 @@ function App() {
       .catch(() => setHealth({ status: 'unreachable', service: '—' }))
   }, [])
 
+  // IDLE while the current epoch has no status yet (initial load included).
   const videoState = status?.state ?? VideoState.IDLE
-  // Use the optimistic pending state from VideoSourceSelector until
-  // the backend poll confirms it, then fall back to the polled state.
+  // The optimistic/transitional state of an action wins until a fresh status read.
   const effectiveState = pendingState ?? videoState
   const { result: latestDetection, fetchError: detectionError } = useLatestDetection(
     videoState === VideoState.RUNNING,
@@ -37,6 +67,8 @@ function App() {
     effectiveState === VideoState.RUNNING,
   )
   const domainUi = getDomainUiState(effectiveState, domainSnapshot, domainError)
+  const evaluation = useCurrentEvaluation(effectiveState === VideoState.RUNNING, lifecycleEpoch)
+  const evaluationUi = getEvaluationUiState(effectiveState === VideoState.RUNNING, evaluation)
   const sourceLabel = status?.source
     ? status.source === 'webcam' ? 'Webcam' : 'Uploaded Video'
     : 'Tidak ada'
@@ -53,7 +85,7 @@ function App() {
           <PipelineStep label="Video Feed" detail={videoState === VideoState.RUNNING ? 'Aktif' : 'Menunggu'} active={videoState === VideoState.RUNNING} />
           <PipelineStep label="Object Detection" detail={latestDetection ? 'Aktif' : 'Menunggu'} active={latestDetection !== null} />
           <PipelineStep label="Domain Analysis" detail={domainUi.stage} active={domainUi.active} tone={domainUi.tone} />
-          <PipelineStep label="Response System" detail="Belum aktif" active={false} />
+          <PipelineStep label="Response System" detail={evaluationUi.label} active={evaluationUi.pipelineActive} />
         </ol>
       </section>
       <section className="monitoring-section">
@@ -71,7 +103,12 @@ function App() {
           <div className="video-column">
             <VideoPreview state={effectiveState} />
             <div className="video-status-strip" aria-label="Status video dan AI"><span><small>Sumber aktif</small><strong>{sourceLabel}</strong></span><span><small>Status AI detector</small><strong>{detectorStatus(videoState, latestDetection, detectionError)}</strong></span><span><small>Status domain</small><strong><DomainStatusBadge value={domainUi} /></strong>{domainUi.detail && <small className="domain-detail">{domainUi.detail}</small>}</span></div>
-            <VideoSourceSelector state={videoState} onPendingStateChange={setPendingState} />
+            <VideoSourceSelector
+              state={videoState}
+              pendingState={pendingState}
+              onPendingStateChange={handlePendingStateChange}
+              onActionSettled={handleActionSettled}
+            />
           </div>
           <DetectionPanel
             state={videoState}
@@ -79,6 +116,7 @@ function App() {
             fetchError={detectionError}
           />
         </div>
+        <EvaluationPanel ui={evaluationUi} />
       </section>
     </main>
   )
