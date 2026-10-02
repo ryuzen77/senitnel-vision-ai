@@ -112,6 +112,81 @@ with TestClient(app) as client:
         assert configured not in completed.stderr
 
 
+def test_max_dispatches_unset_means_unlimited(monkeypatch) -> None:
+    monkeypatch.delenv("SENTINEL_EVALUATION_MAX_DISPATCHES", raising=False)
+    assert runtime._evaluation_max_dispatches() == (True, None)
+    # The production singleton in this test process was built without a cap.
+    assert runtime.evaluation_max_dispatches is None
+    assert runtime.evaluation_worker.get_snapshot().max_dispatches is None
+
+
+@pytest.mark.parametrize("configured,expected", [("1", 1), ("7", 7), ("1000", 1000), ("0001", 1)])
+def test_max_dispatches_accepts_decimal_integers_in_range(monkeypatch, configured, expected) -> None:
+    monkeypatch.setenv("SENTINEL_EVALUATION_MAX_DISPATCHES", configured)
+    assert runtime._evaluation_max_dispatches() == (True, expected)
+
+
+@pytest.mark.parametrize("configured", [
+    "", " ", "\t", "0", "-1", "+1", "1.0", "1e3", "abc", "1001", "9999", " 1", "1 ",
+    "٣", "1" + "0" * 5000, "invalid-private-value",
+])
+def test_max_dispatches_rejects_invalid_values_without_logging_them(monkeypatch, caplog, configured) -> None:
+    monkeypatch.setenv("SENTINEL_EVALUATION_MAX_DISPATCHES", configured)
+    with caplog.at_level(logging.WARNING, logger=runtime.__name__):
+        assert runtime._evaluation_max_dispatches() == (False, None)
+    assert "External evaluation disabled: invalid dispatch limit configuration" in caplog.text
+    if configured.strip():
+        assert configured.strip() not in caplog.text
+
+
+@pytest.mark.parametrize("configured", ["", "0", "1001", "invalid-private-value"])
+def test_invalid_max_dispatches_keeps_app_running_but_disables_external_evaluation(configured) -> None:
+    environment = os.environ.copy()
+    environment["SENTINEL_EVALUATION_MAX_DISPATCHES"] = configured
+    environment["SENTINEL_LANGFLOW_URL"] = "https://example.invalid/api/v1/webhook/flow"
+    environment["SENTINEL_CALLBACK_TOKEN"] = "synthetic-token"
+    program = """
+from fastapi.testclient import TestClient
+from app.main import app
+from app.services import runtime
+assert runtime.evaluation_max_dispatches_valid is False
+assert not runtime.evaluation_enabled and not runtime.evaluation_worker.enabled
+with TestClient(app) as client:
+    assert client.get('/api/health').status_code == 200
+    assert client.get('/api/video/status').json()['state'] == 'IDLE'
+    assert client.get('/api/evaluation/current').json()['enabled'] is False
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", program], cwd=Path(__file__).resolve().parents[1],
+        env=environment, capture_output=True, text=True, timeout=20, check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert "External evaluation disabled: invalid dispatch limit configuration" in completed.stderr
+    if configured == "invalid-private-value":
+        assert configured not in completed.stderr
+
+
+def test_valid_max_dispatches_is_passed_to_the_production_worker() -> None:
+    environment = os.environ.copy()
+    environment["SENTINEL_EVALUATION_MAX_DISPATCHES"] = "1"
+    environment["SENTINEL_LANGFLOW_URL"] = "https://example.invalid/api/v1/webhook/flow"
+    environment["SENTINEL_CALLBACK_TOKEN"] = "synthetic-token"
+    # Import only: no lifespan, so the worker thread never starts and nothing is dispatched.
+    program = """
+from app.services import runtime
+assert runtime.evaluation_enabled is True
+assert runtime.evaluation_max_dispatches == 1
+snapshot = runtime.evaluation_worker.get_snapshot()
+assert (snapshot.dispatch_attempts, snapshot.max_dispatches) == (0, 1)
+assert snapshot.running is False
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", program], cwd=Path(__file__).resolve().parents[1],
+        env=environment, capture_output=True, text=True, timeout=20, check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
 def test_callback_after_28_seconds_completes_before_budget_expiry() -> None:
     trigger = FakeTrigger("one")
     budget = EvaluationBudget(pending_timeout_seconds=60)

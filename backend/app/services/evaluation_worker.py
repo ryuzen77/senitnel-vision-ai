@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import Counter
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
+import logging
 import math
 import threading
 import time
@@ -25,6 +26,9 @@ from app.services.event_frame_buffer import EventFrameBuffer
 from app.services.langflow_evaluation_client import LangflowDispatchRejected
 from app.services.parking_candidate_trigger import ParkingCandidateTrigger
 
+logger = logging.getLogger(__name__)
+
+MAX_DISPATCHES_LIMIT = 1000
 
 class LangflowDispatcher(Protocol):
     """A normal return means Webhook dispatch ACK, never an assessment.
@@ -66,7 +70,11 @@ class EvaluationWorker:
         bundle_timeout_seconds: float = 2.0,
         callback_timeout_seconds: float = 45.0,
         enabled: bool = True,
+        max_dispatches: int | None = None,
     ) -> None:
+        if max_dispatches is not None and (
+                type(max_dispatches) is not int or not 1 <= max_dispatches <= MAX_DISPATCHES_LIMIT):
+            raise ValueError(f"max_dispatches must be None or an integer from 1 to {MAX_DISPATCHES_LIMIT}")
         if not math.isfinite(bundle_timeout_seconds) or bundle_timeout_seconds < 0:
             raise ValueError("bundle_timeout_seconds must be finite and non-negative")
         if not math.isfinite(callback_timeout_seconds) or not 0 < callback_timeout_seconds <= 60:
@@ -100,6 +108,13 @@ class EvaluationWorker:
         self._failures: Counter[EvaluationFailure] = Counter()
         self._last_failure: EvaluationFailure | None = None
         self._last_budget_denial_reason: str | None = None
+        # Process-lifetime quota of external dispatch attempts (None = unlimited).
+        # Only the handoff in process_one increments it; nothing ever gives it back.
+        self._max_dispatches = max_dispatches
+        self._dispatch_attempts = 0
+
+    def _dispatch_quota_exhausted_locked(self) -> bool:
+        return self._max_dispatches is not None and self._dispatch_attempts >= self._max_dispatches
 
     def start(self) -> None:
         with self._state_lock:
@@ -119,6 +134,12 @@ class EvaluationWorker:
                     pending = self._pending
                 if pending is not None:
                     self._stop.wait(min(max(pending.deadline - self._clock(), 0.0), 0.25))
+                    continue
+                with self._state_lock:
+                    exhausted = self._dispatch_quota_exhausted_locked()
+                if exhausted:
+                    # The last attempt has been swept or completed; never claim again.
+                    self._stop.wait(0.5)
                     continue
                 ready = self._trigger.wait_for_candidate(0.5)
                 if ready and not self._stop.is_set() and not self.process_one(self._clock()):
@@ -248,6 +269,10 @@ class EvaluationWorker:
                     return False
                 if self._pending is not None:
                     return False
+                # Early check: an exhausted quota must not claim a candidate or
+                # spend a budget grant.
+                if self._dispatch_quota_exhausted_locked():
+                    return False
             claim_at = self._clock() if now is None else now
             event = self._trigger.claim_next_candidate(claim_at)
             if event is None:
@@ -299,6 +324,13 @@ class EvaluationWorker:
                 if not self._current(event):
                     self._record_failure(EvaluationFailure.STALE_SESSION)
                     return True
+                # Authoritative check and increment, atomic with the handoff. The
+                # attempt is spent before dispatch() is called, so it is counted
+                # even if the dispatcher fails before any HTTP request is sent.
+                if self._dispatch_quota_exhausted_locked():
+                    return True  # finally releases the budget grant and the trigger claim
+                self._dispatch_attempts += 1
+                attempt = self._dispatch_attempts
                 self._pending = _PendingEvaluation(
                     event.event_id, event.source_session_id, event.domain,
                     reservation_id, requested_at, requested_at + self._callback_timeout,
@@ -307,6 +339,14 @@ class EvaluationWorker:
                 )
                 self._state = EvaluationWorkerState.DISPATCHING
                 handed_off = True
+            try:
+                logger.info(
+                    "evaluation dispatch attempt %d/%s event=%s session=%s", attempt,
+                    self._max_dispatches if self._max_dispatches is not None else "unlimited",
+                    event.event_id[:8], event.source_session_id[:8],
+                )
+            except Exception:
+                pass  # Observability must never change dispatch behavior.
             try:
                 self._client.dispatch(request)
             except LangflowDispatchRejected:
@@ -435,6 +475,7 @@ class EvaluationWorker:
                 tuple((kind, self._failures[kind]) for kind in EvaluationFailure),
                 self._last_failure, self._last_budget_denial_reason, self._state,
                 self._pending.deadline if self._pending is not None else None,
+                self._dispatch_attempts, self._max_dispatches,
             )
 
     def close(self, timeout_seconds: float = 2.0) -> None:

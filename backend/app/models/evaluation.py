@@ -182,6 +182,8 @@ class WorkerSnapshot:
     last_budget_denial_reason: str | None
     state: EvaluationWorkerState = EvaluationWorkerState.IDLE
     callback_deadline: float | None = None
+    dispatch_attempts: int = 0
+    max_dispatches: int | None = None
 
 
 @dataclasses.dataclass(frozen=True)

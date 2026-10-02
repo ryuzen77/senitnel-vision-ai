@@ -732,3 +732,250 @@ def test_close_during_client_call_discards_result_and_clears_budget() -> None:
     assert worker.get_latest_result() is None
     assert budget.get_snapshot(10).pending_event_id is None
     assert trigger.pending is None
+
+
+# ── Process-lifetime dispatch quota (SENTINEL_EVALUATION_MAX_DISPATCHES) ──────
+
+from app.services.langflow_evaluation_client import LangflowDispatchRejected, LangflowErrorKind  # noqa: E402
+
+
+class StopAfterWaits:
+    """Deterministic stand-in for the worker stop event: ends _run after N waits."""
+
+    def __init__(self, waits: int) -> None:
+        self.remaining = waits
+        self.waits: list[float] = []
+
+    def is_set(self) -> bool:
+        return self.remaining <= 0
+
+    def wait(self, timeout: float) -> bool:
+        self.waits.append(timeout)
+        self.remaining -= 1
+        return self.remaining <= 0
+
+    def set(self) -> None:
+        self.remaining = 0
+
+
+def _capped(max_dispatches: int | None = 1, *, client=None, buffer=None):
+    trigger = FakeTrigger()
+    budget = EvaluationBudget()
+    buffer = buffer or FakeBuffer()
+    client = client or FakeClient()
+    clock = FakeClock(10)
+    worker = EvaluationWorker(trigger, budget, buffer, client, clock=clock, max_dispatches=max_dispatches)
+    worker.start_session("one")
+    return worker, trigger, budget, buffer, client, clock
+
+
+@pytest.mark.parametrize("value", [0, -1, 1001, True, False, 1.0, "1"])
+def test_max_dispatches_constructor_rejects_invalid_values(value) -> None:
+    with pytest.raises(ValueError):
+        EvaluationWorker(FakeTrigger(), EvaluationBudget(), FakeBuffer(), FakeClient(), max_dispatches=value)
+
+
+@pytest.mark.parametrize("value", [None, 1, 1000])
+def test_max_dispatches_constructor_accepts_none_and_range(value) -> None:
+    worker = EvaluationWorker(FakeTrigger(), EvaluationBudget(), FakeBuffer(), FakeClient(), max_dispatches=value)
+    snapshot = worker.get_snapshot()
+    assert (snapshot.dispatch_attempts, snapshot.max_dispatches) == (0, value)
+
+
+def test_default_without_limit_keeps_dispatching() -> None:
+    worker, trigger, budget, buffer, client, clock = _capped(None)
+    trigger.queue(_event("e1", 10))
+    assert worker.process_one(10)
+    assert _accept(worker, event_id="e1", now=11) is CallbackDisposition.ACCEPTED
+    clock.now = 22
+    trigger.queue(_event("e2", 22))
+    assert worker.process_one(22)
+    assert [request.event_id for request in client.requests] == ["e1", "e2"]
+    assert worker.get_snapshot().dispatch_attempts == 2
+    assert worker.get_snapshot().max_dispatches is None
+
+
+def test_cap_one_still_accepts_first_callback_then_never_claims_again() -> None:
+    worker, trigger, budget, buffer, client, clock = _capped(1)
+    trigger.queue(_event("e1", 10))
+    assert worker.process_one(10)
+    trigger.queue(_event("e2", 12))
+    # The quota is exhausted while the only attempt is pending; its callback still wins.
+    assert _accept(worker, event_id="e1", now=11) is CallbackDisposition.ACCEPTED
+    assert worker.get_latest_result().event_id == "e1"
+    clock.now = 30
+    assert not worker.process_one(30)
+    assert len(client.requests) == 1
+    assert trigger.claimed == ["e1"]
+    assert budget.get_snapshot(30).total_granted == 1
+    snapshot = worker.get_snapshot()
+    assert (snapshot.dispatch_attempts, snapshot.max_dispatches) == (1, 1)
+
+
+@pytest.mark.parametrize("outcome", ["rejected-4xx", "uncertain-then-timeout", "timeout", "new-session"])
+def test_cap_one_is_never_returned_by_failure_timeout_or_session_change(outcome) -> None:
+    client = FakeClient()
+    if outcome == "rejected-4xx":
+        client.exception = LangflowDispatchRejected(LangflowErrorKind.HTTP_STATUS, status_code=400)
+    elif outcome == "uncertain-then-timeout":
+        client.exception = RuntimeError("synthetic uncertain ACK")
+    worker, trigger, budget, buffer, client, clock = _capped(1, client=client)
+    trigger.queue(_event("e1", 10))
+    assert worker.process_one(10)
+    if outcome in ("uncertain-then-timeout", "timeout"):
+        assert worker.sweep(55)
+    session = "one"
+    if outcome == "new-session":
+        worker.end_session("one")
+        trigger.end_session()
+        session = "two"
+        trigger.session = buffer.session = session
+        worker.start_session(session)
+    client.exception = None
+    clock.now = 70
+    trigger.queue(_event("e2", 70, session=session))
+    assert not worker.process_one(70)
+    assert len(client.requests) == 1
+    assert trigger.claimed == ["e1"]
+    assert budget.get_snapshot(70).total_granted == 1
+    assert worker.get_snapshot().dispatch_attempts == 1
+
+
+@pytest.mark.parametrize("status", [BundleStatus.WAITING_FOR_FUTURE_FRAME, BundleStatus.INSUFFICIENT_HISTORY])
+def test_failure_before_handoff_does_not_spend_the_quota(status) -> None:
+    worker, trigger, budget, buffer, client, clock = _capped(1, buffer=FakeBuffer(status=status))
+    trigger.queue(_event("e1", 10))
+    assert worker.process_one(10)
+    assert client.requests == [] and worker.get_snapshot().dispatch_attempts == 0
+    assert trigger.failed == ["e1"] and budget.get_snapshot(10).pending_event_id is None
+    buffer.status = BundleStatus.READY
+    clock.now = 22
+    trigger.queue(_event("e2", 22))
+    assert worker.process_one(22)
+    assert [request.event_id for request in client.requests] == ["e2"]
+    assert worker.get_snapshot().dispatch_attempts == 1
+
+
+def test_handoff_check_blocks_dispatch_and_releases_claim_and_grant() -> None:
+    # Defense in depth: the early check passed, but the quota is exhausted by the
+    # time of handoff (simulated during bundle preparation).
+    class ExhaustingBuffer(FakeBuffer):
+        worker: EvaluationWorker | None = None
+
+        def wait_for_bundle(self, plan, timeout_seconds):
+            assert self.worker is not None
+            with self.worker._state_lock:
+                self.worker._dispatch_attempts = 1
+            return super().wait_for_bundle(plan, timeout_seconds)
+
+    buffer = ExhaustingBuffer()
+    worker, trigger, budget, buffer, client, clock = _capped(1, buffer=buffer)
+    buffer.worker = worker
+    trigger.queue(_event("e1", 10))
+    assert worker.process_one(10)
+    assert client.requests == []
+    assert worker.get_snapshot().dispatch_attempts == 1
+    assert worker.get_snapshot().active_event_id is None
+    assert trigger.failed == ["e1"] and trigger.pending is None
+    assert budget.get_snapshot(10).pending_event_id is None
+    assert budget.get_snapshot(10).total_failed == 1
+
+
+def test_dispatcher_error_before_http_still_spends_the_attempt() -> None:
+    client = FakeClient(LangflowDispatchRejected(LangflowErrorKind.INVALID_REQUEST))
+    worker, trigger, budget, buffer, client, clock = _capped(1, client=client)
+    trigger.queue(_event("e1", 10))
+    assert worker.process_one(10)
+    assert worker.get_snapshot().dispatch_attempts == 1
+    assert worker.get_snapshot().state is EvaluationWorkerState.FAILED
+    assert trigger.failed == ["e1"] and budget.get_snapshot(10).pending_event_id is None
+    client.exception = None
+    clock.now = 22
+    trigger.queue(_event("e2", 22))
+    assert not worker.process_one(22)
+    assert len(client.requests) == 1 and trigger.claimed == ["e1"]
+
+
+def test_concurrent_process_one_dispatches_at_most_once() -> None:
+    entered = threading.Event()
+    release = threading.Event()
+
+    class BlockingClient(FakeClient):
+        def dispatch(self, request):
+            super().dispatch(request)
+            entered.set()
+            assert release.wait(2)
+
+    worker, trigger, budget, buffer, client, clock = _capped(1, client=BlockingClient())
+    for index in range(20):
+        trigger.queue(_event(f"e{index}", 10))
+
+    def hammer(now: float) -> None:
+        start.wait(2)
+        for _ in range(50):
+            worker.process_one(now)
+
+    # Phase 1: one thread is inside dispatch() while seven others race process_one.
+    start = threading.Barrier(8)
+    threads = [threading.Thread(target=hammer, args=(10,)) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    assert entered.wait(2)
+    release.set()
+    for thread in threads:
+        thread.join(2)
+    assert all(not thread.is_alive() for thread in threads)
+    assert len(client.requests) == 1
+    # Phase 2: the attempt completes; concurrent calls still never dispatch again.
+    assert _accept(worker, event_id=client.requests[0].event_id, now=11) is CallbackDisposition.ACCEPTED
+    start = threading.Barrier(8)
+    threads = [threading.Thread(target=hammer, args=(30,)) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(2)
+    assert all(not thread.is_alive() for thread in threads)
+    assert len(client.requests) == 1
+    assert worker.get_snapshot().dispatch_attempts == 1
+    assert len(trigger.claimed) == 1
+    assert budget.get_snapshot(30).total_granted == 1
+
+
+def test_new_worker_starts_with_a_fresh_counter() -> None:
+    first, trigger, budget, buffer, client, clock = _capped(1)
+    trigger.queue(_event("e1", 10))
+    assert first.process_one(10)
+    assert first.get_snapshot().dispatch_attempts == 1
+    second, trigger2, budget2, buffer2, client2, clock2 = _capped(1)
+    assert second.get_snapshot().dispatch_attempts == 0
+    trigger2.queue(_event("e9", 10))
+    assert second.process_one(10)
+    assert second.get_snapshot().dispatch_attempts == 1
+
+
+def test_run_sweeps_last_attempt_then_idles_without_claiming() -> None:
+    worker, trigger, budget, buffer, client, clock = _capped(1)
+    trigger.queue(_event("e1", 10))
+    assert worker.process_one(10)
+    trigger.queue(_event("e2", 12))
+    candidate_waits: list[float] = []
+    trigger.wait_for_candidate = lambda timeout: candidate_waits.append(timeout) or True
+    stop = StopAfterWaits(3)
+    worker._stop = stop
+    states: list[EvaluationWorkerState] = []
+
+    def wait_then_pass_deadline(timeout: float) -> bool:
+        states.append(worker.get_snapshot().state)
+        clock.now = 56      # the next iteration's sweep expires the only attempt
+        return StopAfterWaits.wait(stop, timeout)
+
+    stop.wait = wait_then_pass_deadline
+    clock.now = 30          # pending and before the deadline: wait, no claim
+    worker._run()
+    assert states[0] is EvaluationWorkerState.WAITING_CALLBACK
+    assert stop.waits[0] == pytest.approx(0.25)
+    assert stop.waits[1:] == [0.5, 0.5]     # existing idle cadence, no busy loop
+    assert worker.get_snapshot().state is EvaluationWorkerState.TIMED_OUT
+    assert trigger.failed == ["e1"]
+    assert candidate_waits == [] and trigger.claimed == ["e1"]
+    assert len(client.requests) == 1
