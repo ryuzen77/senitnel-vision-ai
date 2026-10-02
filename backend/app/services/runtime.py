@@ -5,7 +5,9 @@ from __future__ import annotations
 import logging
 import math
 import os
+from pathlib import Path
 import re
+import sys
 import threading
 import time
 
@@ -17,6 +19,10 @@ from app.services.clip_scene_runner import (
 )
 from app.services.detector_service import DetectorService
 from app.services.domain_service import domain_service
+from app.services.audio_alert_service import (
+    DEFAULT_COOLDOWN_SECONDS, MAX_ALERT_SECONDS, MAX_COOLDOWN_SECONDS, MIN_COOLDOWN_SECONDS,
+    AudioAlertGate, WinsoundDevice, probe_wav_duration,
+)
 from app.services.evaluation_budget import EvaluationBudget
 from app.services.evaluation_worker import MAX_DISPATCHES_LIMIT, EvaluationWorker
 from app.services.event_frame_buffer import EventFrameBuffer
@@ -84,6 +90,41 @@ def _evaluation_max_dispatches() -> tuple[bool, int | None]:
         return False, None
     return True, int(raw)
 
+
+_REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
+
+
+def _create_audio_alert_gate() -> AudioAlertGate | None:
+    """Optional CRITICAL-only local alert. Any invalid setting disables audio only."""
+    enabled = os.getenv("SENTINEL_AUDIO_ALERT_ENABLED")
+    if enabled is None or enabled == "false":
+        return None
+    if enabled != "true":
+        logger.warning("Audio alert disabled: invalid enable flag configuration")
+        return None
+    if sys.platform != "win32":
+        logger.warning("Audio alert disabled: local playback is supported on Windows only")
+        return None
+    raw_cooldown = os.getenv("SENTINEL_AUDIO_ALERT_COOLDOWN_SECONDS")
+    try:
+        cooldown = DEFAULT_COOLDOWN_SECONDS if raw_cooldown is None else float(raw_cooldown)
+    except ValueError:
+        cooldown = math.nan
+    if not math.isfinite(cooldown) or not MIN_COOLDOWN_SECONDS <= cooldown <= MAX_COOLDOWN_SECONDS:
+        logger.warning("Audio alert disabled: invalid cooldown configuration")
+        return None
+    raw_path = os.getenv("SENTINEL_AUDIO_ALERT_FILE", "")
+    try:
+        path = Path(raw_path).resolve(strict=True) if raw_path.strip() else None
+    except (OSError, RuntimeError):
+        path = None
+    duration = probe_wav_duration(path) if path is not None and path.is_file() else None
+    if (path is None or path.is_relative_to(_REPOSITORY_ROOT)
+            or duration is None or duration > MAX_ALERT_SECONDS):
+        logger.warning("Audio alert disabled: invalid alert file configuration")
+        return None
+    return AudioAlertGate(WinsoundDevice(), str(path), duration, cooldown_seconds=cooldown)
+
 # This is the one shared production GPU gate.  It is injected, never looked up
 # by worker modules, so capture/MJPEG paths cannot acquire it accidentally.
 shared_cuda_gate = threading.Lock()
@@ -115,12 +156,14 @@ evaluation_max_dispatches_valid, evaluation_max_dispatches = _evaluation_max_dis
 evaluation_enabled = (_external_evaluation_enabled(langflow_client)
                       and evaluation_callback_timeout_seconds is not None
                       and evaluation_max_dispatches_valid)
+audio_alert_gate = _create_audio_alert_gate()
 evaluation_worker = EvaluationWorker(
     parking_candidate_trigger, evaluation_budget, event_frame_buffer,
     langflow_client if langflow_client is not None else _UnavailableDispatcher(),
     callback_timeout_seconds=effective_callback_timeout_seconds,
     enabled=evaluation_enabled,
     max_dispatches=evaluation_max_dispatches,
+    audio_gate=audio_alert_gate,
 )
 video_service = VideoService(
     detector=detector_service,
@@ -133,9 +176,12 @@ video_service = VideoService(
 def shutdown_services(
     video, scene, detector, parking_trigger, tracker, frame_buffer=None,
     *, evaluation_worker=None, langflow_client=None, evaluation_budget=None,
+    audio_alert=None,
 ) -> None:  # noqa: ANN001
     """Stop the worker before its client; in-flight request errors stay isolated."""
     video.stop()
+    if audio_alert is not None:
+        audio_alert.close()  # drops the slot, signals cancel; join <= 2 s outside every lock
     if evaluation_worker is not None:
         evaluation_worker.close()
     if langflow_client is not None:

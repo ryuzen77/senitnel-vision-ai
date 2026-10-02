@@ -187,6 +187,97 @@ assert snapshot.running is False
     assert completed.returncode == 0, completed.stderr
 
 
+def _alert_wav(path: Path, seconds: float) -> Path:
+    import wave
+
+    with wave.open(str(path), "wb") as clip:
+        clip.setnchannels(1)
+        clip.setsampwidth(2)
+        clip.setframerate(8000)
+        clip.writeframes(b"\x00\x00" * int(seconds * 8000))
+    return path
+
+
+def test_audio_alert_is_disabled_by_default() -> None:
+    assert runtime.audio_alert_gate is None
+    assert runtime.evaluation_worker._audio_gate is None
+    assert runtime._create_audio_alert_gate() is None
+
+
+def test_valid_audio_alert_configuration_builds_the_gate(monkeypatch, tmp_path) -> None:
+    clip = _alert_wav(tmp_path / "alert.wav", 3.0)
+    monkeypatch.setenv("SENTINEL_AUDIO_ALERT_ENABLED", "true")
+    monkeypatch.setenv("SENTINEL_AUDIO_ALERT_FILE", str(clip))
+    monkeypatch.setenv("SENTINEL_AUDIO_ALERT_COOLDOWN_SECONDS", "45")
+    monkeypatch.setattr(runtime.sys, "platform", "win32")
+    service = runtime._create_audio_alert_gate()
+    try:
+        assert service is not None
+        assert service._cooldown == 45.0 and service._duration == pytest.approx(3.0)
+        assert not service.get_snapshot().running            # started only by the lifespan
+    finally:
+        if service is not None:
+            service.close()
+
+
+@pytest.mark.parametrize("case", [
+    "flag-TRUE", "flag-1", "flag-empty", "missing-file", "empty-path", "not-wav", "too-long",
+    "cooldown-low", "cooldown-high", "cooldown-text", "cooldown-nan", "inside-repo", "not-windows",
+])
+def test_invalid_audio_configuration_disables_audio_without_leaking_values(
+        monkeypatch, tmp_path, caplog, case) -> None:
+    clip = _alert_wav(tmp_path / "alert.wav", 3.0)
+    environment = {
+        "SENTINEL_AUDIO_ALERT_ENABLED": "true",
+        "SENTINEL_AUDIO_ALERT_FILE": str(clip),
+    }
+    if case.startswith("flag-"):
+        environment["SENTINEL_AUDIO_ALERT_ENABLED"] = {"flag-TRUE": "TRUE", "flag-1": "1", "flag-empty": ""}[case]
+    elif case == "missing-file":
+        environment["SENTINEL_AUDIO_ALERT_FILE"] = str(tmp_path / "missing.wav")
+    elif case == "empty-path":
+        environment["SENTINEL_AUDIO_ALERT_FILE"] = " "
+    elif case == "not-wav":
+        (tmp_path / "fake.wav").write_text("not audio")
+        environment["SENTINEL_AUDIO_ALERT_FILE"] = str(tmp_path / "fake.wav")
+    elif case == "too-long":
+        environment["SENTINEL_AUDIO_ALERT_FILE"] = str(_alert_wav(tmp_path / "long.wav", 8.5))
+    elif case.startswith("cooldown-"):
+        environment["SENTINEL_AUDIO_ALERT_COOLDOWN_SECONDS"] = {
+            "cooldown-low": "9", "cooldown-high": "121", "cooldown-text": "soon", "cooldown-nan": "nan",
+        }[case]
+    elif case == "inside-repo":
+        environment["SENTINEL_AUDIO_ALERT_FILE"] = str(Path(runtime.__file__).resolve())
+    for key, value in environment.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setattr(runtime.sys, "platform", "linux" if case == "not-windows" else "win32")
+    with caplog.at_level(logging.WARNING, logger=runtime.__name__):
+        assert runtime._create_audio_alert_gate() is None
+    assert "Audio alert disabled" in caplog.text
+    assert str(tmp_path) not in caplog.text and "soon" not in caplog.text
+
+
+def test_shutdown_closes_audio_after_video_and_before_the_worker() -> None:
+    events: list[str] = []
+
+    class Service:
+        def __init__(self, label: str) -> None:
+            self.label = label
+
+        def stop(self) -> None:
+            events.append(f"{self.label}.stop")
+
+        def close(self) -> None:
+            events.append(f"{self.label}.close")
+
+    services = [Service(label) for label in ("video", "scene", "detector", "trigger", "tracker", "buffer")]
+    runtime.shutdown_services(
+        *services, evaluation_worker=Service("worker"), langflow_client=Service("client"),
+        evaluation_budget=Service("budget"), audio_alert=Service("audio"),
+    )
+    assert events[:3] == ["video.stop", "audio.close", "worker.close"]
+
+
 def test_callback_after_28_seconds_completes_before_budget_expiry() -> None:
     trigger = FakeTrigger("one")
     budget = EvaluationBudget(pending_timeout_seconds=60)

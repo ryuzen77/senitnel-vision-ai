@@ -9,6 +9,7 @@ from app.api import domain as domain_router
 from app.api import detections as detections_router
 from app.api import video as video_router
 from app.services.runtime import (
+    audio_alert_gate,
     detector_service,
     event_frame_buffer,
     evaluation_budget,
@@ -28,6 +29,8 @@ async def lifespan(app: FastAPI):  # noqa: ANN001
     # ── Startup ──────────────────────────────────────────────────────────────
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     evaluation_worker.start()
+    if audio_alert_gate is not None:
+        audio_alert_gate.start()
     yield
     # ── Shutdown ─────────────────────────────────────────────────────────────
     shutdown_services(
@@ -36,6 +39,7 @@ async def lifespan(app: FastAPI):  # noqa: ANN001
         evaluation_worker=evaluation_worker,
         langflow_client=langflow_client,
         evaluation_budget=evaluation_budget,
+        audio_alert=audio_alert_gate,
     )
 
 

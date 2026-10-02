@@ -979,3 +979,288 @@ def test_run_sweeps_last_attempt_then_idles_without_claiming() -> None:
     assert trigger.failed == ["e1"]
     assert candidate_waits == [] and trigger.claimed == ["e1"]
     assert len(client.requests) == 1
+
+
+# ── Audio gate hook (control plane only) ──────────────────────────────────────
+
+class RecordingGate:
+    """Records calls and whether the worker lock was held (worker -> gate order)."""
+
+    def __init__(self, error: Exception | None = None) -> None:
+        self.worker: EvaluationWorker | None = None
+        self.calls: list[tuple] = []
+        self.lock_held: list[bool] = []
+        self.error = error
+
+    def _record(self, call: tuple) -> None:
+        lock, free = self.worker._state_lock, []
+
+        def probe() -> None:              # from another thread: the lock may be reentrant
+            acquired = lock.acquire(blocking=False)
+            if acquired:
+                lock.release()
+            free.append(acquired)
+
+        thread = threading.Thread(target=probe)
+        thread.start()
+        thread.join(1)
+        self.lock_held.append(free == [False])
+        self.calls.append(call)
+        if self.error is not None:
+            raise self.error
+
+    def apply_lifecycle(self, epoch, session_id) -> None:
+        self._record(("lifecycle", epoch, session_id))
+
+    def offer(self, epoch, event_id, session_id, status) -> None:
+        self._record(("offer", epoch, event_id, session_id, status))
+
+    def fail_closed(self) -> None:
+        self._record(("fail_closed",))
+
+
+def _gated_worker(gate):
+    trigger, budget, buffer, client = FakeTrigger(), EvaluationBudget(), FakeBuffer(), FakeClient()
+    worker = EvaluationWorker(trigger, budget, buffer, client, clock=FakeClock(10), audio_gate=gate)
+    if isinstance(gate, RecordingGate):
+        gate.worker = worker
+    return worker, trigger, buffer
+
+
+def test_worker_drives_gate_epochs_and_offers_accepted_once_under_its_lock() -> None:
+    gate = RecordingGate()
+    worker, trigger, _ = _gated_worker(gate)
+    worker.start_session("one")
+    worker.start_session("one")                                # unchanged: no new epoch
+    trigger.queue(_event("e1", 10))
+    assert worker.process_one(10)
+    assert _accept(worker, _assessment(90, ThreatStatus.CRITICAL), now=11) is CallbackDisposition.ACCEPTED
+    assert _accept(worker, _assessment(90, ThreatStatus.CRITICAL), now=12) is CallbackDisposition.DUPLICATE
+    worker.get_current_view()                                  # polling never offers
+    worker.end_session("ghost")                                # not the current session: ignored
+    worker.end_session("one")
+    worker.start_session("two")
+    assert gate.calls == [
+        ("lifecycle", 1, "one"),
+        ("offer", 1, "e1", "one", ThreatStatus.CRITICAL),
+        ("lifecycle", 2, None),
+        ("lifecycle", 3, "two"),
+    ]
+    assert all(gate.lock_held)
+
+
+def test_gate_error_never_changes_the_callback_result() -> None:
+    worker, trigger, _ = _gated_worker(RecordingGate(error=RuntimeError("audio exploded")))
+    worker.start_session("one")
+    trigger.queue(_event("e1", 10))
+    assert worker.process_one(10)
+    assert _accept(worker, _assessment(90, ThreatStatus.CRITICAL), now=11) is CallbackDisposition.ACCEPTED
+    assert worker.get_latest_result().event_id == "e1"
+    assert worker.get_snapshot().state is EvaluationWorkerState.COMPLETED
+
+
+class _GateDevice:
+    def __init__(self, start_gate: threading.Event | None = None) -> None:
+        self.calls: list[str] = []
+        self.in_start = threading.Event()
+        self.start_gate = start_gate
+
+    def start(self, path) -> None:
+        self.calls.append("start")
+        self.in_start.set()
+        if self.start_gate is not None:
+            assert self.start_gate.wait(5)
+
+    def stop(self) -> None:
+        self.calls.append("stop")
+
+
+def _real_gate(device, duration: float = 0.01):
+    from app.services.audio_alert_service import AudioAlertGate
+
+    return AudioAlertGate(device, "C:/outside/alert.wav", duration, join_timeout_seconds=0.5)
+
+
+def _accepted_critical(worker, trigger, buffer, session: str, event_id: str, now: float) -> None:
+    trigger.session = buffer.session = session
+    trigger.queue(_event(event_id, now, session=session))
+    assert worker.process_one(now)
+    assert _accept(worker, _assessment(90, ThreatStatus.CRITICAL), event_id=event_id,
+                   session=session, now=now + 1) is CallbackDisposition.ACCEPTED
+
+
+def test_accepted_critical_is_granted_once_by_the_real_gate() -> None:
+    device = _GateDevice()
+    gate = _real_gate(device)
+    worker, trigger, buffer = _gated_worker(gate)
+    worker.start_session("A")
+    _accepted_critical(worker, trigger, buffer, "A", "e1", 10)
+    assert gate.run_once(0) and not gate.run_once(0)
+    assert device.calls == ["start", "stop"]
+
+
+def test_old_session_callback_after_new_session_is_never_offered() -> None:
+    device = _GateDevice()
+    gate = _real_gate(device)
+    worker, trigger, buffer = _gated_worker(gate)
+    worker.start_session("A")
+    trigger.session = buffer.session = "A"
+    trigger.queue(_event("e1", 10, session="A"))
+    assert worker.process_one(10)
+    worker.end_session("A")
+    worker.start_session("B")
+    assert _accept(worker, _assessment(90, ThreatStatus.CRITICAL), session="A",
+                   now=11) is not CallbackDisposition.ACCEPTED
+    gate.offer(1, "e1", "A", ThreatStatus.CRITICAL)             # a late offer with the old epoch
+    assert not gate.run_once(0)
+    snapshot = gate.get_snapshot()
+    assert device.calls == [] and snapshot.granted == 0
+    assert (snapshot.epoch, snapshot.session_short_id) == (3, "B")
+
+
+def test_offer_queued_then_session_end_never_reaches_the_device() -> None:
+    device = _GateDevice()
+    gate = _real_gate(device)
+    worker, trigger, buffer = _gated_worker(gate)
+    worker.start_session("A")
+    _accepted_critical(worker, trigger, buffer, "A", "e1", 10)
+    assert gate.get_snapshot().queued_event_short_id is not None
+    worker.end_session("A")                                    # invalidation before grant
+    assert not gate.run_once(0)
+    assert device.calls == [] and gate.get_snapshot().dropped_stale == 1
+
+
+def test_stalled_device_start_keeps_callback_and_lifecycle_responsive() -> None:
+    release = threading.Event()
+    device = _GateDevice(start_gate=release)
+    gate = _real_gate(device, duration=4.0)
+    gate.start()
+    worker, trigger, buffer = _gated_worker(gate)
+    try:
+        worker.start_session("A")
+        _accepted_critical(worker, trigger, buffer, "A", "e1", 10)
+        assert device.in_start.wait(2)                         # device thread is stuck in start
+        trigger.pending = None
+        worker._budget = EvaluationBudget()
+        trigger.queue(_event("e2", 30, session="A"))
+        assert worker.process_one(30)
+        dispositions: list[CallbackDisposition] = []
+        callback = threading.Thread(target=lambda: dispositions.append(_accept(
+            worker, _assessment(90, ThreatStatus.CRITICAL), event_id="e2", session="A", now=31)))
+        callback.start()
+        callback.join(1)
+        assert not callback.is_alive() and dispositions == [CallbackDisposition.ACCEPTED]
+        assert gate.get_snapshot().dropped_cooldown == 1        # offered, refused without the device
+        lifecycle = threading.Thread(target=lambda: (worker.end_session("A"), worker.start_session("B")))
+        reader = threading.Thread(target=lambda: (worker.get_current_view(), gate.get_snapshot()))
+        for thread in (lifecycle, reader):
+            thread.start()
+        for thread in (lifecycle, reader):
+            thread.join(1)
+            assert not thread.is_alive()
+        assert worker.get_current_view().source_session_id == "B"
+        assert gate.get_snapshot().attempt_state == "STARTING"
+    finally:
+        release.set()
+        gate.close()
+    assert device.calls == ["start", "stop"]                   # in-flight attempt stopped, no second grant
+
+
+# ── Lifecycle update failure: audio fails closed, evaluation continues ────────
+
+def _break_lifecycle(gate, *, partial: bool) -> None:
+    """partial=False fails before any change; partial=True after the epoch moved."""
+    if partial:
+        def broken_invalidate() -> None:
+            raise RuntimeError("invalidate exploded")
+        gate._invalidate_locked = broken_invalidate
+    else:
+        def broken_apply(epoch, session_id) -> None:
+            raise RuntimeError("lifecycle exploded")
+        gate.apply_lifecycle = broken_apply
+
+
+@pytest.mark.parametrize("partial", [False, True])
+@pytest.mark.parametrize("transition", ["end", "switch"])
+def test_failed_lifecycle_update_fails_closed_and_never_grants(partial, transition, caplog) -> None:
+    device = _GateDevice()
+    gate = _real_gate(device)
+    worker, trigger, buffer = _gated_worker(gate)
+    worker.start_session("A")
+    _accepted_critical(worker, trigger, buffer, "A", "e1", 10)
+    assert gate.get_snapshot().queued_event_short_id is not None     # old-session slot queued
+    _break_lifecycle(gate, partial=partial)
+    with caplog.at_level("WARNING"):
+        if transition == "end":
+            worker.end_session("A")
+        else:
+            worker.start_session("B")
+    assert "Audio alert disabled: lifecycle update failed" in caplog.text
+    assert "exploded" not in caplog.text
+    assert worker._audio_gate is None
+    assert worker.get_current_view().source_session_id == (None if transition == "end" else "B")
+    assert gate.get_snapshot().epoch == (2 if partial else 1)       # partial update really happened
+    assert not gate.run_once(0)                                      # no old grant
+    # Evaluation keeps working for the next session; audio stays closed.
+    if transition == "end":
+        worker.start_session("B")
+    trigger.pending = None
+    worker._budget = EvaluationBudget()
+    _accepted_critical(worker, trigger, buffer, "B", "e2", 40)
+    assert worker.get_latest_result().event_id == "e2"
+    gate.offer(99, "e3", "B", ThreatStatus.CRITICAL)                 # nothing can reopen it
+    assert not gate.run_once(0)
+    snapshot = gate.get_snapshot()
+    assert device.calls == [] and snapshot.granted == 0
+    assert snapshot.closed and snapshot.lifecycle_fault
+
+
+def _wait_until(predicate, timeout: float = 2.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.001)
+    return predicate()
+
+
+def test_failed_lifecycle_update_cancels_the_active_attempt() -> None:
+    device = _GateDevice()
+    gate = _real_gate(device, duration=5.0)
+    gate.start()
+    worker, trigger, buffer = _gated_worker(gate)
+    try:
+        worker.start_session("A")
+        _accepted_critical(worker, trigger, buffer, "A", "e1", 10)
+        assert _wait_until(lambda: gate.get_snapshot().attempt_state == "IN_FLIGHT")
+        _break_lifecycle(gate, partial=True)
+        worker.start_session("B")
+        assert _wait_until(lambda: gate.get_snapshot().attempt_state is None)   # well before 5 s
+        snapshot = gate.get_snapshot()
+        assert snapshot.stopped == 1 and snapshot.lifecycle_fault
+        assert device.calls == ["start", "stop"]
+    finally:
+        assert gate.close() is True
+
+
+def test_fail_closed_error_still_detaches_the_gate_and_keeps_callbacks_working(caplog) -> None:
+    class BrokenGate(RecordingGate):
+        def apply_lifecycle(self, epoch, session_id) -> None:
+            if epoch > 1:
+                raise RuntimeError("lifecycle exploded")
+            super().apply_lifecycle(epoch, session_id)
+
+        def fail_closed(self) -> None:
+            super().fail_closed()
+            raise RuntimeError("fail closed exploded")
+
+    gate = BrokenGate()
+    worker, trigger, buffer = _gated_worker(gate)
+    worker.start_session("A")
+    with caplog.at_level("WARNING"):
+        worker.start_session("B")
+    assert "fail-closed did not complete" in caplog.text and "exploded" not in caplog.text
+    _accepted_critical(worker, trigger, buffer, "B", "e1", 10)
+    assert worker.get_latest_result().event_id == "e1"
+    assert gate.calls == [("lifecycle", 1, "A"), ("fail_closed",)]  # no later offer reaches it
+    assert all(gate.lock_held)

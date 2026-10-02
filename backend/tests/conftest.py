@@ -27,11 +27,27 @@ for _config_key in (
     "SENTINEL_CALLBACK_TOKEN",
     "SENTINEL_EVALUATION_CALLBACK_TIMEOUT_SECONDS",
     "SENTINEL_EVALUATION_MAX_DISPATCHES",
+    "SENTINEL_AUDIO_ALERT_ENABLED",
+    "SENTINEL_AUDIO_ALERT_FILE",
+    "SENTINEL_AUDIO_ALERT_COOLDOWN_SECONDS",
     "SENTINEL_VIDEO_STARTUP_TIMING_ENABLED",
 ):
     os.environ.pop(_config_key, None)
 
 from app.services.video_service import VideoService
+
+try:  # Windows only; automated tests must never reach a real speaker.
+    import winsound as _winsound
+except ImportError:  # pragma: no cover - non-Windows
+    _winsound = None
+
+
+@pytest.fixture(autouse=True)
+def _forbid_real_audio(monkeypatch: pytest.MonkeyPatch) -> None:
+    if _winsound is not None:
+        def _refuse(*_args: object, **_kwargs: object) -> None:
+            raise AssertionError("automated tests must not play real audio")
+        monkeypatch.setattr(_winsound, "PlaySound", _refuse)
 
 
 # ---------------------------------------------------------------------------

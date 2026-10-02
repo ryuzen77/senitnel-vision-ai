@@ -45,6 +45,20 @@ class LangflowDispatcher(Protocol):
 FrameSelectionPlanFactory = Callable[[str, str, float], FrameSelectionPlan]
 
 
+class AudioGate(Protocol):
+    """Bounded internal control gate, updated INSIDE the worker state lock.
+
+    Lock order is worker._state_lock -> gate lock. Every method must be O(1) and
+    non-blocking (no I/O, no device call, no wait) and must never call the worker.
+    """
+
+    def apply_lifecycle(self, epoch: int, session_id: str | None) -> None: ...
+
+    def fail_closed(self) -> None: ...
+
+    def offer(self, epoch: int, event_id: str, session_id: str | None, status: object) -> None: ...
+
+
 @dataclass(frozen=True)
 class _PendingEvaluation:
     """Only correlation metadata is retained; no bundle, JPEG, or base64."""
@@ -71,6 +85,7 @@ class EvaluationWorker:
         callback_timeout_seconds: float = 45.0,
         enabled: bool = True,
         max_dispatches: int | None = None,
+        audio_gate: AudioGate | None = None,
     ) -> None:
         if max_dispatches is not None and (
                 type(max_dispatches) is not int or not 1 <= max_dispatches <= MAX_DISPATCHES_LIMIT):
@@ -112,6 +127,31 @@ class EvaluationWorker:
         # Only the handoff in process_one increments it; nothing ever gives it back.
         self._max_dispatches = max_dispatches
         self._dispatch_attempts = 0
+        # Optional audio gate, updated inside _state_lock in transition order.
+        # Only session lifecycle bumps the epoch; publications carry it.
+        self._audio_gate = audio_gate
+        self._lifecycle_epoch = 0
+
+    def _gate_call_locked(self, method: str, *arguments: object) -> None:
+        """Caller holds _state_lock. Gate errors never affect evaluation.
+
+        A failed lifecycle update fails closed: the gate is detached (no later
+        offer reaches it) and told to revoke grants and cancel its attempt.
+        """
+        gate = self._audio_gate
+        if gate is None:
+            return
+        try:
+            getattr(gate, method)(*arguments)
+        except Exception:
+            if method != "apply_lifecycle":
+                return
+            self._audio_gate = None
+            logger.warning("Audio alert disabled: lifecycle update failed")
+            try:
+                gate.fail_closed()
+            except Exception:
+                logger.warning("Audio alert fail-closed did not complete")
 
     def _dispatch_quota_exhausted_locked(self) -> bool:
         return self._max_dispatches is not None and self._dispatch_attempts >= self._max_dispatches
@@ -239,6 +279,8 @@ class EvaluationWorker:
             self._last_accepted = None
             self._latest = None
             self._state = EvaluationWorkerState.IDLE
+            self._lifecycle_epoch += 1
+            self._gate_call_locked("apply_lifecycle", self._lifecycle_epoch, session_id)
 
     def end_session(self, session_id: str) -> None:
         with self._state_lock:
@@ -252,6 +294,8 @@ class EvaluationWorker:
             self._last_accepted = None
             self._latest = None
             self._state = EvaluationWorkerState.CANCELLED
+            self._lifecycle_epoch += 1
+            self._gate_call_locked("apply_lifecycle", self._lifecycle_epoch, None)
 
     def process_one(self, now: float | None = None) -> bool:
         """Claim and dispatch one event; a 2xx ACK leaves budget/trigger pending."""
@@ -389,7 +433,12 @@ class EvaluationWorker:
             self._processing_lock.release()
 
     def accept_callback(self, callback: EvaluationCallback, now: float) -> CallbackDisposition:
-        """First matching callback wins; a conflicting replay is rejected."""
+        """First matching callback wins; a conflicting replay is rejected.
+
+        An ACCEPTED publication is offered to the audio gate in the same critical
+        section, tagged with the current lifecycle epoch; gate errors never change
+        the disposition.
+        """
         with self._state_lock:
             if (not isinstance(callback, EvaluationCallback)
                     or not isinstance(callback.assessment, ThreatAssessment)
@@ -432,6 +481,10 @@ class EvaluationWorker:
                 pending.frame_source_sequences, pending.client_name,
             )
             self._last_accepted = callback
+            self._gate_call_locked(
+                "offer", self._lifecycle_epoch, pending.event_id, pending.source_session_id,
+                callback.assessment.status,
+            )
             return CallbackDisposition.ACCEPTED
 
     def get_latest_result(self) -> EvaluationRecord | None:
