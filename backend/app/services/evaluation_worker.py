@@ -19,12 +19,11 @@ from app.models.evaluation import (
 )
 from app.models.event_frame import (
     BundleStatus, EventFrameBundle, FrameSelectionPlan, make_parking_frame_selection_plan,
+    make_retail_frame_selection_plan,
 )
-from app.models.parking_candidate import ParkingCandidateEvent
 from app.services.evaluation_budget import EvaluationBudget
 from app.services.event_frame_buffer import EventFrameBuffer
 from app.services.langflow_evaluation_client import LangflowDispatchRejected
-from app.services.parking_candidate_trigger import ParkingCandidateTrigger
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +42,50 @@ class LangflowDispatcher(Protocol):
 
 
 FrameSelectionPlanFactory = Callable[[str, str, float], FrameSelectionPlan]
+
+
+class CandidateEvent(Protocol):
+    """Fields the worker reads from a claimed candidate (parking or retail)."""
+
+    @property
+    def event_id(self) -> str: ...
+    @property
+    def source_session_id(self) -> str: ...
+    @property
+    def domain(self) -> DomainName: ...
+    @property
+    def started_at(self) -> float: ...
+    @property
+    def triggered_at(self) -> float: ...
+    @property
+    def person_track_id(self) -> int: ...
+    @property
+    def object_track_id(self) -> int | None: ...
+    @property
+    def evidence(self) -> object: ...
+
+
+class CandidateTriggerSnapshot(Protocol):
+    @property
+    def source_session_id(self) -> str | None: ...
+    @property
+    def pending_event_id(self) -> str | None: ...
+
+
+class CandidateTrigger(Protocol):
+    """The trigger calls the worker actually makes; no lifecycle or observe here."""
+
+    def wait_for_candidate(self, timeout_seconds: float) -> bool: ...
+
+    def wake_waiters(self) -> None: ...
+
+    def claim_next_candidate(self, now: float) -> CandidateEvent | None: ...
+
+    def complete(self, event_id: str, now: float) -> bool: ...
+
+    def fail(self, event_id: str, now: float) -> bool: ...
+
+    def get_snapshot(self) -> CandidateTriggerSnapshot: ...
 
 
 class AudioGate(Protocol):
@@ -77,7 +120,7 @@ class EvaluationWorker:
     """One process-level worker; dispatch and callback completion are separate."""
 
     def __init__(
-        self, trigger: ParkingCandidateTrigger, budget: EvaluationBudget,
+        self, trigger: CandidateTrigger, budget: EvaluationBudget,
         frame_buffer: EventFrameBuffer, client: LangflowDispatcher,
         *, clock: Callable[[], float] = time.monotonic,
         strategies: Mapping[DomainName, FrameSelectionPlanFactory] | None = None,
@@ -104,6 +147,7 @@ class EvaluationWorker:
         self._clock = clock
         self._strategies = dict(strategies) if strategies is not None else {
             DomainName.PARKING_MOTORCYCLE: make_parking_frame_selection_plan,
+            DomainName.RETAIL_STORE: make_retail_frame_selection_plan,
         }
         self._bundle_timeout = bundle_timeout_seconds
         self._callback_timeout = callback_timeout_seconds
@@ -197,7 +241,7 @@ class EvaluationWorker:
             if category is EvaluationFailure.STALE_SESSION:
                 self._discarded_stale += 1
 
-    def _current(self, event: ParkingCandidateEvent) -> bool:
+    def _current(self, event: CandidateEvent) -> bool:
         with self._state_lock:
             if (self._closed or self._ended_session_id == event.source_session_id
                     or (self._session_id is not None and self._session_id != event.source_session_id)):
@@ -298,12 +342,26 @@ class EvaluationWorker:
             self._gate_call_locked("apply_lifecycle", self._lifecycle_epoch, None)
 
     def process_one(self, now: float | None = None) -> bool:
-        """Claim and dispatch one event; a 2xx ACK leaves budget/trigger pending."""
+        """Claim and dispatch one event; a 2xx ACK leaves budget/trigger pending.
+
+        Handoff and cancellation boundary: the dispatch is committed at one atomic
+        handoff under ``_state_lock`` (session re-check, quota increment, pending
+        record). Stop or a session change that wins before the handoff means the
+        dispatcher is never called; the budget grant and trigger claim are
+        released in ``finally``. Once the handoff wins, the attempt is in flight:
+        ``dispatch()`` runs outside every worker lock and may still reach the
+        transport after the session ended. Stop never waits for it: end_session
+        cancels the pending record (budget and trigger fail) without touching the
+        dispatcher. The spent quota attempt is never returned, nothing is
+        retried, and a late ACK, error or callback for the cancelled event cannot
+        revive state, publish a result or reach the audio gate, because they all
+        require the pending record or the active session to match.
+        """
         if not self.enabled:
             return False
         if not self._processing_lock.acquire(blocking=False):
             return False
-        event: ParkingCandidateEvent | None = None
+        event: CandidateEvent | None = None
         reservation_id: str | None = None
         handed_off = False
         try:
@@ -373,6 +431,7 @@ class EvaluationWorker:
                 # even if the dispatcher fails before any HTTP request is sent.
                 if self._dispatch_quota_exhausted_locked():
                     return True  # finally releases the budget grant and the trigger claim
+                # ── Handoff: from here the attempt is committed and in flight. ──
                 self._dispatch_attempts += 1
                 attempt = self._dispatch_attempts
                 self._pending = _PendingEvaluation(
@@ -392,6 +451,7 @@ class EvaluationWorker:
             except Exception:
                 pass  # Observability must never change dispatch behavior.
             try:
+                # Outside every worker lock: Stop and callbacks never wait for it.
                 self._client.dispatch(request)
             except LangflowDispatchRejected:
                 with self._state_lock:
@@ -428,7 +488,10 @@ class EvaluationWorker:
                     except Exception:
                         self._record_failure(EvaluationFailure.CLIENT_ERROR)
                 with self._state_lock:
-                    if event is not None and self._state is EvaluationWorkerState.IDLE:
+                    # Only the event's own session may show FAILED; a stale claim
+                    # finishing after a session switch must not mark the new one.
+                    if (event is not None and self._state is EvaluationWorkerState.IDLE
+                            and self._session_id == event.source_session_id):
                         self._state = EvaluationWorkerState.FAILED
             self._processing_lock.release()
 
@@ -481,10 +544,14 @@ class EvaluationWorker:
                 pending.frame_source_sequences, pending.client_name,
             )
             self._last_accepted = callback
-            self._gate_call_locked(
-                "offer", self._lifecycle_epoch, pending.event_id, pending.source_session_id,
-                callback.assessment.status,
-            )
+            # The alert clip speaks about a motorcycle: only parking candidates may
+            # reach the audio gate. The domain is the one stored with the pending
+            # candidate at dispatch; never inferred from the assessment text.
+            if pending.domain is DomainName.PARKING_MOTORCYCLE:
+                self._gate_call_locked(
+                    "offer", self._lifecycle_epoch, pending.event_id, pending.source_session_id,
+                    callback.assessment.status,
+                )
             return CallbackDisposition.ACCEPTED
 
     def get_latest_result(self) -> EvaluationRecord | None:

@@ -322,3 +322,23 @@ def test_worker_classifies_mock_transport_result(status, exception, waiting) -> 
         assert trigger.pending is None and trigger.failed == ["e1"]
         assert snapshot.pending_event_id is None and snapshot.total_failed == 1
     assert worker.get_latest_result() is None
+
+
+def test_retail_request_without_object_track_keeps_the_webhook_schema() -> None:
+    from dataclasses import replace
+
+    captured = []
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(202)
+    parking = _request()
+    bundle = replace(parking.frame_bundle, domain=DomainName.RETAIL_STORE)
+    retail = replace(parking, domain=DomainName.RETAIL_STORE, object_track_id=None,
+                     evidence={"zone_name": "rak_kiri"}, frame_bundle=bundle)
+    LangflowEvaluationClient(url=URL, http_client=_mock_client(handler)).dispatch(retail)
+    body = json.loads(captured[0].content)
+    assert set(body) == {"event_id", "source_session_id", "model", "input"}
+    metadata = json.loads(body["input"][0]["text"].split("Event metadata: ", 1)[1])
+    assert metadata["domain"] == "RETAIL_STORE"
+    assert metadata["trigger"]["object_track_id"] is None
+    assert metadata["trigger"]["person_track_id"] == 7

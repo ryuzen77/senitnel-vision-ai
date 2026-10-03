@@ -339,7 +339,9 @@ def test_success_claim_budget_bundle_client_complete_and_publish(score, status) 
 
 @pytest.mark.parametrize("domain", [DomainName.UNKNOWN, DomainName.RETAIL_STORE])
 def test_unknown_and_unregistered_retail_never_use_parking_or_budget(domain) -> None:
-    worker, trigger, budget, buffer, client, _ = _worker()
+    # Retail is registered by default now; an explicit parking-only map keeps it unregistered.
+    worker, trigger, budget, buffer, client, _ = _worker(
+        strategies={DomainName.PARKING_MOTORCYCLE: make_parking_frame_selection_plan})
     trigger.queue(_event(domain=domain))
     assert worker.process_one(10)
     assert trigger.failed == ["e1"] and trigger.pending is None
@@ -1264,3 +1266,308 @@ def test_fail_closed_error_still_detaches_the_gate_and_keeps_callbacks_working(c
     assert worker.get_latest_result().event_id == "e1"
     assert gate.calls == [("lifecycle", 1, "A"), ("fail_closed",)]  # no later offer reaches it
     assert all(gate.lock_held)
+
+
+# ── Retail wiring W1: strategy, request contract, failed bundles, audio ──────
+
+def _retail_event(event_id: str = "r1", at: float = 10.0, *, session: str = "one"):
+    from app.models.retail_candidate import (
+        RetailCandidateEvent, RetailCandidateEvidence, RetailCandidateState,
+    )
+    evidence = RetailCandidateEvidence(
+        "episode-1", "rak_kiri", 0, 4, 4, 0, 3.0, 13, 0.25, 1.0, 1.0, 0.0, 0.0, 0.01, 0, 1)
+    return RetailCandidateEvent(event_id, session, DomainName.RETAIL_STORE, 4, at - 3.0, at, 99,
+                                evidence, tuple(range(1, 14)), RetailCandidateState.CANDIDATE)
+
+
+def _real_buffer(*timestamps: float, session: str = "one"):
+    from app.models.event_frame import BufferedFrame
+    from app.services.event_frame_buffer import EventFrameBuffer
+
+    buffer = EventFrameBuffer()
+    buffer.start_session(session)
+    for seq, ts in enumerate(timestamps):
+        assert buffer.offer(BufferedFrame(session, seq, ts, 640, 480, b"\xff\xd8frame\xff\xd9"))
+    return buffer
+
+
+def _steps(start: float, end: float, step: float = 0.1) -> tuple[float, ...]:
+    return tuple(round(start + index * step, 3) for index in range(round((end - start) / step) + 1))
+
+
+def _retail_worker(buffer, **kwargs):
+    trigger, budget, client = FakeTrigger(), EvaluationBudget(), FakeClient()
+    worker = EvaluationWorker(trigger, budget, buffer, client, clock=FakeClock(10.5),
+                              bundle_timeout_seconds=0.05, **kwargs)
+    worker.start_session("one")
+    trigger.queue(_retail_event())
+    return worker, trigger, budget, client
+
+
+def test_retail_candidate_reaches_the_request_with_its_own_plan_and_no_object_track() -> None:
+    worker, trigger, budget, client = _retail_worker(_real_buffer(*_steps(7.0, 10.5)))
+    assert worker.process_one(10.5)
+    (request,) = client.requests
+    assert request.domain is DomainName.RETAIL_STORE and request.object_track_id is None
+    assert request.person_track_id == 4 and request.evidence.zone_name == "rak_kiri"
+    frames = request.frame_bundle.frames
+    assert len(frames) == 5 and request.frame_bundle.domain is DomainName.RETAIL_STORE
+    assert tuple(frame.target_offset_seconds for frame in frames) == (-2.0, -1.0, -.4, 0.0, .4)
+    assert worker.get_snapshot().state is EvaluationWorkerState.WAITING_CALLBACK
+    assert budget.get_snapshot(10.5).pending_event_id == "r1" and trigger.pending == "r1"
+
+
+@pytest.mark.parametrize("case,failure", [
+    ("short-history", EvaluationFailure.BUNDLE_INVALID),        # oldest frame after T-2
+    ("deviation", EvaluationFailure.BUNDLE_INVALID),            # no frame within 0.3 s of T-1
+    ("future-timeout", EvaluationFailure.BUNDLE_TIMEOUT),       # T+0.4 never arrives
+])
+def test_incomplete_retail_bundle_never_dispatches_and_releases_reservations(case, failure) -> None:
+    timestamps = {
+        "short-history": _steps(9.0, 10.5),
+        "deviation": tuple(ts for ts in _steps(7.0, 10.5) if not 8.6 <= ts <= 9.4),
+        "future-timeout": _steps(7.0, 10.2),
+    }[case]
+    worker, trigger, budget, client = _retail_worker(_real_buffer(*timestamps))
+    assert worker.process_one(10.5)
+    assert client.requests == []
+    assert trigger.failed == ["r1"] and trigger.pending is None
+    snapshot = budget.get_snapshot(10.5)
+    assert snapshot.pending_event_id is None and snapshot.total_failed == 1
+    assert worker.get_snapshot().last_failure is failure
+    assert worker.get_snapshot().active_event_id is None
+
+
+@pytest.mark.parametrize("switch_point", ["during-bundle", "after-bundle"])
+def test_session_change_around_the_retail_bundle_never_dispatches(switch_point) -> None:
+    real = _real_buffer(*_steps(7.0, 10.5))
+
+    class SwitchingBuffer:
+        def __init__(self) -> None:
+            self.trigger = None
+
+        def get_snapshot(self):
+            return real.get_snapshot()
+
+        def wait_for_bundle(self, plan, timeout_seconds):
+            if switch_point == "during-bundle":
+                real.end_session("one")                       # Stop/EOF while waiting
+                return real.wait_for_bundle(plan, timeout_seconds)
+            decision = real.wait_for_bundle(plan, timeout_seconds)
+            self.trigger.session = "two"                      # new session after READY
+            return decision
+
+    buffer = SwitchingBuffer()
+    worker, trigger, budget, client = _retail_worker(buffer)
+    buffer.trigger = trigger
+    assert worker.process_one(10.5)
+    assert client.requests == []
+    snapshot = budget.get_snapshot(10.5)
+    assert snapshot.pending_event_id is None and snapshot.total_failed == 1
+    assert trigger.failed == ["r1"] and trigger.pending is None
+    expected = (EvaluationFailure.BUNDLE_INVALID if switch_point == "during-bundle"
+                else EvaluationFailure.STALE_SESSION)
+    assert worker.get_snapshot().last_failure is expected
+
+
+def test_retail_critical_completes_without_audio_while_parking_still_offers() -> None:
+    gate = RecordingGate()
+    trigger, budget, buffer, client = FakeTrigger(), EvaluationBudget(), FakeBuffer(), FakeClient()
+    worker = EvaluationWorker(trigger, budget, buffer, client, clock=FakeClock(10), audio_gate=gate)
+    gate.worker = worker
+    worker.start_session("one")
+    trigger.queue(_retail_event("r1", 10.0))
+    assert worker.process_one(10.0)
+    assert _accept(worker, _assessment(90, ThreatStatus.CRITICAL), event_id="r1",
+                   now=11) is CallbackDisposition.ACCEPTED
+    assert worker.get_snapshot().state is EvaluationWorkerState.COMPLETED
+    assert worker.get_latest_result().domain is DomainName.RETAIL_STORE
+    assert [call[0] for call in gate.calls] == ["lifecycle"]              # no offer for retail
+    trigger.queue(_event("p1", 30.0))
+    assert worker.process_one(30.0)
+    assert _accept(worker, _assessment(90, ThreatStatus.CRITICAL), event_id="p1",
+                   now=31) is CallbackDisposition.ACCEPTED
+    worker.end_session("one")
+    assert gate.calls == [
+        ("lifecycle", 1, "one"),
+        ("offer", 1, "p1", "one", ThreatStatus.CRITICAL),
+        ("lifecycle", 2, None),
+    ]
+    assert all(gate.lock_held)
+
+
+def test_worker_no_longer_depends_on_parking_types() -> None:
+    import inspect
+    from app.services import evaluation_worker
+
+    source = inspect.getsource(evaluation_worker)
+    assert "ParkingCandidateTrigger" not in source and "ParkingCandidateEvent" not in source
+    assert DomainName.RETAIL_STORE in EvaluationWorker(
+        FakeTrigger(), EvaluationBudget(), FakeBuffer(), FakeClient())._strategies
+
+
+# ── Handoff boundary: Stop before vs after the committed dispatch ────────────
+
+class _GatedBuffer(FakeBuffer):
+    """Holds wait_for_bundle until released (the pre-handoff window)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered, self.release = threading.Event(), threading.Event()
+
+    def wait_for_bundle(self, plan, timeout_seconds):
+        self.entered.set()
+        if not self.release.wait(5):
+            raise RuntimeError("test gate was never released")
+        return super().wait_for_bundle(plan, timeout_seconds)
+
+
+class _GatedClient(FakeClient):
+    """Holds dispatch() before the request reaches the (fake) transport."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered, self.release = threading.Event(), threading.Event()
+
+    def dispatch(self, request) -> None:
+        self.entered.set()
+        if not self.release.wait(5):
+            raise RuntimeError("test gate was never released")
+        super().dispatch(request)
+
+
+def _run_in_thread(target) -> tuple[threading.Thread, list]:
+    results: list = []
+    thread = threading.Thread(target=lambda: results.append(target()))
+    thread.start()
+    return thread, results
+
+
+def _join_all(*threads: threading.Thread) -> None:
+    for thread in threads:
+        thread.join(2)
+        assert not thread.is_alive()
+
+
+def _gated_audio_worker(buffer, client, **kwargs):
+    trigger, budget, gate = FakeTrigger(), EvaluationBudget(), RecordingGate()
+    worker = EvaluationWorker(trigger, budget, buffer, client, clock=FakeClock(10),
+                              audio_gate=gate, **kwargs)
+    gate.worker = worker
+    worker.start_session("one")
+    trigger.queue(_event("e1", 10))
+    return worker, trigger, budget, gate
+
+
+@pytest.mark.parametrize("transition", ["stop", "switch"])
+def test_stop_or_switch_before_handoff_never_calls_the_dispatcher(transition) -> None:
+    buffer, client = _GatedBuffer(), FakeClient()
+    worker, trigger, budget, gate = _gated_audio_worker(buffer, client)
+    processing, results = _run_in_thread(lambda: worker.process_one(10))
+    try:
+        assert buffer.entered.wait(2)                       # claimed, budget reserved, no handoff yet
+        worker.end_session("one")
+        if transition == "switch":
+            worker.start_session("two")
+        buffer.release.set()
+        _join_all(processing)
+    finally:
+        buffer.release.set()
+        processing.join(2)
+    assert results == [True] and client.requests == []
+    snapshot = worker.get_snapshot()
+    assert snapshot.dispatch_attempts == 0 and snapshot.active_event_id is None
+    assert snapshot.last_failure is EvaluationFailure.STALE_SESSION
+    assert trigger.failed == ["e1"] and trigger.pending is None
+    reservation = budget.get_snapshot(10)
+    assert reservation.pending_event_id is None and reservation.total_failed == 1
+    view = worker.get_current_view()
+    assert view.source_session_id == ("two" if transition == "switch" else None)
+    assert view.process_state is EvaluationWorkerState.IDLE and view.active_event_id is None
+    assert "offer" not in [call[0] for call in gate.calls]
+
+
+def test_stop_in_the_last_window_before_the_handoff_lock_is_caught() -> None:
+    """The in-lock re-check catches a Stop that lands after the unlocked check."""
+    class HookClock(FakeClock):
+        hook = None
+
+        def __call__(self) -> float:
+            hook, self.hook = self.hook, None
+            if hook is not None:
+                hook()
+            return self.now
+
+    clock = HookClock(10)
+    trigger, budget, client = FakeTrigger(), EvaluationBudget(), FakeClient()
+
+    def stop_from_another_thread() -> None:
+        stopper = threading.Thread(target=worker.end_session, args=("one",))
+        stopper.start()
+        _join_all(stopper)                                  # no worker lock is held here
+
+    class ArmingBuffer(FakeBuffer):
+        def wait_for_bundle(self, plan, timeout_seconds):
+            decision = super().wait_for_bundle(plan, timeout_seconds)
+            clock.hook = stop_from_another_thread           # next clock(): requested_at
+            return decision
+
+    worker = EvaluationWorker(trigger, budget, ArmingBuffer(), client, clock=clock)
+    worker.start_session("one")
+    trigger.queue(_event("e1", 10))
+    assert worker.process_one(10)
+    assert client.requests == [] and worker.get_snapshot().dispatch_attempts == 0
+    assert worker.get_snapshot().last_failure is EvaluationFailure.STALE_SESSION
+    assert trigger.failed == ["e1"] and budget.get_snapshot(10).pending_event_id is None
+
+
+@pytest.mark.parametrize("max_dispatches", [None, 1])
+def test_stop_after_handoff_never_waits_and_the_old_attempt_stays_isolated(max_dispatches) -> None:
+    buffer, client = FakeBuffer(), _GatedClient()
+    worker, trigger, budget, gate = _gated_audio_worker(buffer, client, max_dispatches=max_dispatches)
+    processing, results = _run_in_thread(lambda: worker.process_one(10))
+    lifecycle = threading.Thread(target=lambda: (worker.end_session("one"), worker.start_session("two")))
+    try:
+        assert client.entered.wait(2)                       # handoff done, request not sent yet
+        snapshot = worker.get_snapshot()
+        assert snapshot.state is EvaluationWorkerState.DISPATCHING and snapshot.dispatch_attempts == 1
+        assert worker.process_one(10) is False              # no second attempt meanwhile
+        lifecycle.start()
+        _join_all(lifecycle)                                # Stop + new session without the dispatcher
+        assert client.requests == []                        # dispatcher still held
+        view = worker.get_current_view()
+        assert (view.source_session_id, view.process_state, view.active_event_id) == (
+            "two", EvaluationWorkerState.IDLE, None)
+        assert trigger.failed == ["e1"] and budget.get_snapshot(10).pending_event_id is None
+        assert _accept(worker, _assessment(90, ThreatStatus.CRITICAL), event_id="e1", session="one",
+                       now=11) is CallbackDisposition.REJECTED
+        client.release.set()
+        _join_all(processing)
+    finally:
+        client.release.set()
+        processing.join(2)
+        if lifecycle.is_alive() or lifecycle.ident is not None:
+            lifecycle.join(2)
+    assert results == [True] and len(client.requests) == 1  # reached transport exactly once
+    snapshot = worker.get_snapshot()
+    assert snapshot.dispatch_attempts == 1 and snapshot.active_event_id is None
+    assert snapshot.state is EvaluationWorkerState.IDLE     # late ACK did not revive WAITING_CALLBACK
+    assert worker.get_current_view().latest_result is None
+    assert _accept(worker, _assessment(90, ThreatStatus.CRITICAL), event_id="e1", session="one",
+                   now=12) is CallbackDisposition.REJECTED
+    assert [call[0] for call in gate.calls] == ["lifecycle", "lifecycle", "lifecycle"]
+
+    # The new session is isolated from the old attempt; the spent quota stays spent.
+    trigger.session = buffer.session = "two"
+    trigger.queue(_event("e2", 30, session="two"))
+    if max_dispatches == 1:
+        assert worker.process_one(30) is False
+        assert len(client.requests) == 1 and trigger.claimed == ["e1"]
+        assert worker.get_snapshot().dispatch_attempts == 1
+        return
+    assert worker.process_one(30)
+    assert len(client.requests) == 2 and worker.get_snapshot().dispatch_attempts == 2
+    assert _accept(worker, _assessment(90, ThreatStatus.CRITICAL), event_id="e2", session="two",
+                   now=31) is CallbackDisposition.ACCEPTED
+    assert worker.get_current_view().latest_result.event_id == "e2"
+    assert gate.calls[-1] == ("offer", 3, "e2", "two", ThreatStatus.CRITICAL)

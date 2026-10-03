@@ -127,7 +127,7 @@ class EvaluationRequest:
     started_at: float
     triggered_at: float
     person_track_id: int
-    object_track_id: int
+    object_track_id: int | None    # parking: motorcycle track; retail: None (no object signal)
     evidence: object
     frame_bundle: EventFrameBundle = dataclasses.field(repr=False)
 

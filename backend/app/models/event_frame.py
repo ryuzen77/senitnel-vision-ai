@@ -86,8 +86,24 @@ def make_parking_frame_selection_plan(
     event_id: str, source_session_id: str, triggered_at: float,
     *, maximum_target_deviation_seconds: float = 0.30,
 ) -> FrameSelectionPlan:
-    """Parking-specific time targets; retail must have its own factory later."""
+    """Parking-specific time targets."""
     return FrameSelectionPlan(
         event_id, source_session_id, DomainName.PARKING_MOTORCYCLE, triggered_at,
+        (-2.0, -1.0, -0.4, 0.0, 0.4), maximum_target_deviation_seconds, 5,
+    )
+
+
+def make_retail_frame_selection_plan(
+    event_id: str, source_session_id: str, triggered_at: float,
+    *, maximum_target_deviation_seconds: float = 0.30,
+) -> FrameSelectionPlan:
+    """Retail display-zone targets, separate from parking.
+
+    Provisional and uncalibrated: the offsets currently equal parking's. Buffer
+    retention is not guaranteed (byte and frame caps can shorten it), so a
+    plan that cannot be filled fails as a whole; it is never sent partially.
+    """
+    return FrameSelectionPlan(
+        event_id, source_session_id, DomainName.RETAIL_STORE, triggered_at,
         (-2.0, -1.0, -0.4, 0.0, 0.4), maximum_target_deviation_seconds, 5,
     )

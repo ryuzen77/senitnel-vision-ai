@@ -10,6 +10,7 @@ import pytest
 from app.models.domain import DomainName
 from app.models.event_frame import (
     BufferedFrame, BundleStatus, FrameSelectionPlan, make_parking_frame_selection_plan,
+    make_retail_frame_selection_plan,
 )
 from app.services.event_frame_buffer import EventFrameBuffer
 
@@ -195,13 +196,31 @@ def test_unknown_and_malformed_plan_rejected_but_retail_generic_plan_allowed() -
     assert buffer.try_build_bundle(_plan(domain=DomainName.RETAIL_STORE)).status is BundleStatus.READY
 
 
-def test_parking_factory_has_exact_five_offsets_and_no_retail_factory() -> None:
-    from app.models import event_frame
+def test_parking_factory_has_exact_five_offsets() -> None:
     plan = make_parking_frame_selection_plan("event", "one", 10)
     assert plan.domain is DomainName.PARKING_MOTORCYCLE
     assert plan.target_offsets_seconds == (-2.0, -1.0, -.4, 0.0, .4)
     assert plan.required_frame_count == 5 and plan.maximum_target_deviation_seconds == .3
-    assert not hasattr(event_frame, "make_retail_frame_selection_plan")
+
+
+def test_retail_factory_is_separate_with_exact_five_offsets() -> None:
+    plan = make_retail_frame_selection_plan("event", "one", 10)
+    assert plan.domain is DomainName.RETAIL_STORE
+    assert plan.target_offsets_seconds == (-2.0, -1.0, -.4, 0.0, .4)
+    assert plan.required_frame_count == 5 and plan.maximum_target_deviation_seconds == .3
+    assert make_retail_frame_selection_plan is not make_parking_frame_selection_plan
+
+
+def test_retail_plan_selects_exactly_five_frames_when_available() -> None:
+    buffer = EventFrameBuffer(); buffer.start_session("one")
+    for seq in range(36):                                      # 7.0 .. 10.5 s at 10 fps
+        assert buffer.offer(_frame(seq, 7.0 + seq / 10))
+    decision = buffer.try_build_bundle(make_retail_frame_selection_plan("event", "one", 10.0))
+    assert decision.status is BundleStatus.READY
+    frames = decision.bundle.frames
+    assert decision.bundle.domain is DomainName.RETAIL_STORE and len(frames) == 5
+    assert tuple(frame.target_offset_seconds for frame in frames) == (-2.0, -1.0, -.4, 0.0, .4)
+    assert all(frame.deviation_seconds <= .3 for frame in frames)
 
 
 def test_concurrent_offer_and_snapshot_read_remain_consistent() -> None:
