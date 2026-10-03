@@ -25,6 +25,14 @@ bound, and any other encoding is refused. This bounds this client's body
 buffer only, not process memory or the network stack's internal buffers
 (httpx/the transport may hold one raw read before it is re-chunked).
 
+HTTP 4xx bodies are read for diagnosis only, through the same bounded reader
+capped at ``MAX_ERROR_BODY_BYTES``, and reduced to ``ProviderErrorDiagnosis``:
+allowlisted code/status/reason tokens and at most three request/schema
+parameter paths that exist in this client's own request contract. Raw body,
+message, description, metadata and unknown values are never kept or logged;
+the error kind and HTTP status stay unchanged if this best-effort read fails.
+HTTP 5xx bodies are not read.
+
 Failure classes (``GeminiEvaluationError``): ``rejected`` (local request
 error, redirect or HTTP 4xx: the provider did not run the evaluation),
 ``uncertain`` (timeout, connection/stream error, HTTP 5xx: whether the
@@ -36,6 +44,7 @@ of them because this transport has no later callback; it never retries.
 from __future__ import annotations
 
 import base64
+import dataclasses
 import enum
 import zlib
 import json
@@ -58,6 +67,7 @@ API_ROOT = "https://generativelanguage.googleapis.com/v1beta/models"
 DEFAULT_TIMEOUT_SECONDS = 30.0
 MAX_TIMEOUT_SECONDS = 55.0
 MAX_RESPONSE_BYTES = 256 * 1024
+MAX_ERROR_BODY_BYTES = 16 * 1024
 READ_CHUNK_BYTES = 16 * 1024
 MAX_BUNDLE_JPEG_BYTES = 12 * 1024 * 1024        # base64 stays well below the 20 MB request cap
 _MODEL = re.compile(r"[a-z0-9][a-z0-9.\-]{0,63}")
@@ -155,16 +165,190 @@ _OTHER_FINISH = frozenset({"RECITATION", "LANGUAGE", "OTHER", "MALFORMED_FUNCTIO
                            "MISSING_THOUGHT_SIGNATURE", "MALFORMED_RESPONSE"})
 
 
+@dataclasses.dataclass(frozen=True)
+class ProviderErrorDiagnosis:
+    """Allowlisted 4xx metadata only. '-' = absent, 'UNKNOWN' = present but not allowlisted."""
+
+    code: str
+    status: str
+    reason: str
+    fields: tuple[str, ...]
+
+
 class GeminiEvaluationError(RuntimeError):
     """Sanitized failure (no key, URL, prompt, image or body); see module docstring."""
 
-    def __init__(self, kind: GeminiErrorKind, *, status_code: int | None = None) -> None:
+    def __init__(self, kind: GeminiErrorKind, *, status_code: int | None = None,
+                 diagnosis: ProviderErrorDiagnosis | None = None) -> None:
         self.kind = kind
         self.status_code = status_code
+        self.diagnosis = diagnosis
         self.uncertain = kind in _UNCERTAIN
         self.invalid_response = kind in _INVALID_RESPONSE
         suffix = f" ({status_code})" if status_code is not None else ""
         super().__init__(f"Gemini evaluation {kind.value}{suffix}")
+
+
+# ── Bounded, allowlisted diagnosis of HTTP 4xx error bodies ──────────────────
+# Exact google.rpc detail identifiers (no suffix matching).
+_BAD_REQUEST_TYPE = "type.googleapis.com/google.rpc.BadRequest"
+_ERROR_INFO_TYPE = "type.googleapis.com/google.rpc.ErrorInfo"
+# Machine-readable codes listed in the official API errors page (snake_case).
+_KNOWN_CODE_TOKENS = frozenset({
+    "invalid_request", "failed_precondition", "out_of_range", "parameter_unknown",
+    "authentication", "permission_denied", "not_found", "rate_limit_exceeded",
+})
+# google.rpc.Code names.
+_KNOWN_STATUSES = frozenset({
+    "INVALID_ARGUMENT", "FAILED_PRECONDITION", "OUT_OF_RANGE", "UNAUTHENTICATED",
+    "PERMISSION_DENIED", "NOT_FOUND", "ALREADY_EXISTS", "ABORTED", "RESOURCE_EXHAUSTED",
+    "CANCELLED", "DEADLINE_EXCEEDED", "UNIMPLEMENTED", "INTERNAL", "UNAVAILABLE",
+    "DATA_LOSS", "UNKNOWN",
+})
+# Common googleapis ErrorInfo reasons relevant to an API-key request.
+_KNOWN_REASONS = frozenset({
+    "API_KEY_INVALID", "API_KEY_SERVICE_BLOCKED", "API_KEY_HTTP_REFERRER_BLOCKED",
+    "API_KEY_IP_ADDRESS_BLOCKED", "SERVICE_DISABLED", "BILLING_DISABLED", "CONSUMER_INVALID",
+    "RATE_LIMIT_EXCEEDED", "RESOURCE_QUOTA_EXCEEDED", "USER_PROJECT_DENIED",
+    "ACCESS_TOKEN_SCOPE_INSUFFICIENT",
+})
+_MAX_DETAILS = 8
+_MAX_VIOLATIONS = 16
+_MAX_FIELDS = 3
+_MAX_FIELD_LENGTH = 256
+_SEGMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}")
+_NUMERIC_INDEX = re.compile(r"\[\d{1,6}\]")
+_KEY_INDEX = re.compile(r"\[([A-Za-z_][A-Za-z0-9_]{0,63})\]")
+
+
+def _snake(segment: str) -> str:
+    """Explicit camelCase -> snake_case: '_' before each ASCII capital, then lower."""
+    out = []
+    for index, char in enumerate(segment):
+        if "A" <= char <= "Z":
+            if index and segment[index - 1] != "_":
+                out.append("_")
+            out.append(char.lower())
+        else:
+            out.append(char)
+    return "".join(out)
+
+
+def _schema_paths(node: object, prefix: str) -> set[str]:
+    paths = {prefix}
+    if isinstance(node, dict):
+        for key, value in node.items():
+            here = f"{prefix}.{_snake(key)}"
+            paths.add(here)
+            if key == "properties" and isinstance(value, dict):
+                for name, child in value.items():
+                    paths |= _schema_paths(child, f"{here}.{_snake(name)}")
+            elif key == "items":
+                paths |= _schema_paths(value, here)
+    return paths
+
+
+# Every parameter path this client can send (canonical snake_case, no indices).
+_KNOWN_FIELD_PATHS = frozenset({
+    "contents", "contents.role", "contents.parts", "contents.parts.text",
+    "contents.parts.inline_data", "contents.parts.inline_data.mime_type",
+    "contents.parts.inline_data.data", "generation_config", "generation_config.response_format",
+    "generation_config.response_format.text", "generation_config.response_format.text.mime_type",
+} | _schema_paths(ASSESSMENT_SCHEMA, "generation_config.response_format.text.schema"))
+
+
+def _known_field(raw: object) -> str | None:
+    """Map a provider field path to an allowlisted path (or its known parent)."""
+    if not isinstance(raw, str) or not 0 < len(raw) <= _MAX_FIELD_LENGTH:
+        return None
+    text = _KEY_INDEX.sub(lambda match: "." + match.group(1), _NUMERIC_INDEX.sub("", raw))
+    segments = text.split(".")
+    if not all(_SEGMENT.fullmatch(segment) for segment in segments):
+        return None
+    canonical = [_snake(segment) for segment in segments]
+    while canonical:
+        candidate = ".".join(canonical)
+        if candidate in _KNOWN_FIELD_PATHS:
+            return candidate
+        canonical.pop()
+    return None
+
+
+def _allowlisted(error: dict, key: str, allowed: frozenset[str]) -> str:
+    if key not in error:
+        return "-"
+    value = error[key]
+    return value if isinstance(value, str) and value in allowed else "UNKNOWN"
+
+
+class _StrictJSONError(ValueError):
+    """Duplicate key or non-finite number: the whole diagnosis is discarded."""
+
+
+def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    document: dict[str, object] = {}
+    for key, value in pairs:
+        if key in document:
+            raise _StrictJSONError
+        document[key] = value
+    return document
+
+
+def _reject_constant(_constant: str) -> object:
+    raise _StrictJSONError                     # NaN, Infinity, -Infinity
+
+
+def _finite_float(text: str) -> float:
+    value = float(text)
+    if not math.isfinite(value):               # e.g. 1e999 overflows to inf
+        raise _StrictJSONError
+    return value
+
+
+def _diagnose(raw: bytes) -> ProviderErrorDiagnosis | None:
+    try:
+        # Strict at every level, including fields that are not extracted.
+        document = json.loads(raw, object_pairs_hook=_unique_object,
+                              parse_constant=_reject_constant, parse_float=_finite_float)
+    except (ValueError, UnicodeDecodeError, RecursionError):
+        return None
+    error = document.get("error") if isinstance(document, dict) else None
+    if not isinstance(error, dict):
+        return None
+    code = error.get("code")
+    if "code" not in error:
+        code_text = "-"
+    elif type(code) is int and 100 <= code <= 599:
+        code_text = str(code)
+    elif isinstance(code, str) and code in _KNOWN_CODE_TOKENS:
+        code_text = code
+    else:
+        code_text = "UNKNOWN"
+    reason = "-"
+    fields: list[str] = []
+    unknown_field = False
+    details = error.get("details")
+    if isinstance(details, list):
+        for detail in details[:_MAX_DETAILS]:
+            if not isinstance(detail, dict):
+                continue
+            detail_type = detail.get("@type")
+            if detail_type == _ERROR_INFO_TYPE and reason == "-":
+                reason = _allowlisted(detail, "reason", _KNOWN_REASONS)
+            elif detail_type == _BAD_REQUEST_TYPE:
+                violations = detail.get("fieldViolations", detail.get("field_violations"))
+                if not isinstance(violations, list):
+                    continue
+                for violation in violations[:_MAX_VIOLATIONS]:
+                    path = _known_field(violation.get("field")) if isinstance(violation, dict) else None
+                    if path is None:
+                        unknown_field = True
+                    elif path not in fields and len(fields) < _MAX_FIELDS:
+                        fields.append(path)
+    if unknown_field and not fields:
+        fields = ["UNKNOWN"]
+    return ProviderErrorDiagnosis(code_text, _allowlisted(error, "status", _KNOWN_STATUSES),
+                                  reason, tuple(fields))
 
 
 class GeminiEvaluationClient:
@@ -209,6 +393,7 @@ class GeminiEvaluationClient:
         prepared: float | None = None
         answered: float | None = None
         status_code: int | None = None
+        diagnosis: ProviderErrorDiagnosis | None = None
         outcome = "error"
         try:
             body = self._encode(request)
@@ -220,10 +405,15 @@ class GeminiEvaluationClient:
                              "Accept-Encoding": "identity", "x-goog-api-key": self._key},
                 ) as response:
                     status_code = response.status_code
-                    if not 200 <= response.status_code < 300:   # error body is never read
+                    if not 200 <= response.status_code < 300:
                         kind = (GeminiErrorKind.HTTP_SERVER_ERROR if response.status_code >= 500
                                 else GeminiErrorKind.HTTP_REJECTED)
-                        raise GeminiEvaluationError(kind, status_code=response.status_code)
+                        # 4xx only: bounded, allowlisted diagnosis. 3xx (never followed)
+                        # and 5xx bodies are never read.
+                        if 400 <= response.status_code < 500:
+                            diagnosis = self._read_error_diagnosis(response)
+                        raise GeminiEvaluationError(kind, status_code=response.status_code,
+                                                    diagnosis=diagnosis)
                     raw = self._read_bounded(response)
             except httpx.TimeoutException:
                 raise GeminiEvaluationError(GeminiErrorKind.TIMEOUT) from None
@@ -238,11 +428,12 @@ class GeminiEvaluationClient:
             return callback
         except GeminiEvaluationError as error:
             outcome = error.kind.value
+            diagnosis = error.diagnosis
             raise
         finally:
             finished = self._timer()
             self._log_timing(
-                request, outcome, status_code,
+                request, outcome, status_code, diagnosis,
                 (prepared if prepared is not None else finished) - started,
                 answered - prepared if answered is not None and prepared is not None else 0.0,
                 finished - answered if answered is not None else 0.0,
@@ -287,11 +478,19 @@ class GeminiEvaluationClient:
     # ── response ─────────────────────────────────────────────────────────────
 
     @staticmethod
-    def _read_bounded(response: httpx.Response) -> bytes:
-        """Return the decoded body; the buffer never grows past MAX_RESPONSE_BYTES."""
+    def _read_error_diagnosis(response: httpx.Response) -> ProviderErrorDiagnosis | None:
+        """Best effort: any read/parse failure yields None and never changes the error."""
+        try:
+            return _diagnose(GeminiEvaluationClient._read_bounded(response, MAX_ERROR_BODY_BYTES))
+        except Exception:
+            return None
+
+    @staticmethod
+    def _read_bounded(response: httpx.Response, limit: int = MAX_RESPONSE_BYTES) -> bytes:
+        """Return the decoded body; the buffer never grows past ``limit``."""
         too_large = GeminiEvaluationError(GeminiErrorKind.RESPONSE_TOO_LARGE)
         declared = response.headers.get("content-length")
-        if declared is not None and declared.strip().isdigit() and int(declared) > MAX_RESPONSE_BYTES:
+        if declared is not None and declared.strip().isdigit() and int(declared) > limit:
             raise too_large                     # extra check only; the stream bound below is authoritative
         encoding = response.headers.get("content-encoding", "identity").strip().lower()
         if encoding not in ("identity", "gzip"):
@@ -300,7 +499,7 @@ class GeminiEvaluationClient:
         body = bytearray()
 
         def append(piece: bytes) -> None:
-            if len(body) + len(piece) > MAX_RESPONSE_BYTES:   # checked before growing the buffer
+            if len(body) + len(piece) > limit:   # checked before growing the buffer
                 raise too_large
             body.extend(piece)
 
@@ -309,12 +508,12 @@ class GeminiEvaluationClient:
             for chunk in response.iter_raw(chunk_size=READ_CHUNK_BYTES):
                 if decoder is not None:
                     # Decoded output per piece is capped one byte past the remaining room.
-                    chunk = decoder.decompress(chunk, MAX_RESPONSE_BYTES + 1 - len(body))
+                    chunk = decoder.decompress(chunk, limit + 1 - len(body))
                     if decoder.unconsumed_tail:
                         raise too_large
                 append(chunk)
             if decoder is not None:
-                append(decoder.flush(MAX_RESPONSE_BYTES + 1 - len(body)))
+                append(decoder.flush(limit + 1 - len(body)))
                 if not decoder.eof:
                     raise GeminiEvaluationError(GeminiErrorKind.INVALID_RESPONSE)
         except zlib.error:
@@ -368,17 +567,22 @@ class GeminiEvaluationClient:
             raise invalid from None
 
     def _log_timing(self, request: object, outcome: str, status_code: int | None,
+                    diagnosis: ProviderErrorDiagnosis | None,
                     prepare: float, provider: float, validate: float) -> None:
         try:
             event = getattr(request, "event_id", "")
             domain = getattr(getattr(request, "domain", None), "value", "-")
             succeeded = outcome in ("NORMAL", "WARNING", "CRITICAL")
+            extra = ""
+            if diagnosis is not None:          # allowlisted values only (see _diagnose)
+                extra = (f" provider_code={diagnosis.code} provider_status={diagnosis.status}"
+                         f" reason={diagnosis.reason} fields={','.join(diagnosis.fields) or '-'}")
             logger.log(
                 logging.INFO if succeeded else logging.WARNING,
                 "gemini evaluation event=%s domain=%s outcome=%s http=%s prepare_ms=%.1f provider_ms=%.1f "
-                "validate_ms=%.1f", str(event)[:8], domain, outcome,
+                "validate_ms=%.1f%s", str(event)[:8], domain, outcome,
                 status_code if status_code is not None else "-",
-                prepare * 1000, provider * 1000, validate * 1000,
+                prepare * 1000, provider * 1000, validate * 1000, extra,
             )
         except Exception:
             pass                                 # observability never changes the outcome

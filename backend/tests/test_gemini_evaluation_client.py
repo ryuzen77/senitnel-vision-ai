@@ -16,8 +16,8 @@ from app.models.evaluation import EvaluationCallback, EvaluationRequest, ThreatS
 from app.models.event_frame import EventFrameBundle, SelectedFrame
 from app.services import gemini_evaluation_client
 from app.services.gemini_evaluation_client import (
-    ASSESSMENT_SCHEMA, MAX_RESPONSE_BYTES, READ_CHUNK_BYTES, GeminiErrorKind, GeminiEvaluationClient,
-    GeminiEvaluationError,
+    ASSESSMENT_SCHEMA, MAX_ERROR_BODY_BYTES, MAX_RESPONSE_BYTES, READ_CHUNK_BYTES, GeminiErrorKind,
+    GeminiEvaluationClient, GeminiEvaluationError, ProviderErrorDiagnosis,
 )
 
 KEY = "synthetic-gemini-key-123"
@@ -375,12 +375,11 @@ def test_declared_oversize_is_refused_before_reading() -> None:
     assert stream.yielded == 0 and stream.closed
 
 
-@pytest.mark.parametrize("status", [404, 500])
-def test_error_bodies_are_never_read(status) -> None:
+def test_server_error_bodies_are_never_read() -> None:
     stream = TrackingStream(_chunks(b"x" * (MAX_RESPONSE_BYTES * 2)))
     with pytest.raises(GeminiEvaluationError) as error:
-        _client(_streaming(stream, status=status)).dispatch(_request())
-    assert error.value.status_code == status
+        _client(_streaming(stream, status=500)).dispatch(_request())
+    assert error.value.status_code == 500 and error.value.diagnosis is None
     assert stream.yielded == 0 and stream.closed
 
 
@@ -433,3 +432,182 @@ def test_unsupported_or_corrupt_encoding_is_an_invalid_response(headers, body) -
     with pytest.raises(GeminiEvaluationError) as error:
         _client(_streaming(stream, headers=headers)).dispatch(_request())
     assert error.value.kind is GeminiErrorKind.INVALID_RESPONSE and stream.closed
+
+
+
+# ── Bounded, allowlisted diagnosis of HTTP 4xx bodies ────────────────────────
+
+LEAK = "sk-live-SECRET-777 https://private.invalid/key"
+BAD_REQUEST = "type.googleapis.com/google.rpc.BadRequest"
+ERROR_INFO = "type.googleapis.com/google.rpc.ErrorInfo"
+
+
+def _error_body(**error) -> bytes:
+    return json.dumps({"error": error}).encode()
+
+
+def _rpc_error(fields=(), *, code=400, status="INVALID_ARGUMENT", reason="API_KEY_INVALID") -> bytes:
+    return _error_body(
+        code=code, status=status, message=f"bad request: {LEAK}",
+        details=[
+            {"@type": BAD_REQUEST, "fieldViolations": [
+                {"field": field, "description": f"invalid: {LEAK}"} for field in fields]},
+            {"@type": ERROR_INFO, "reason": reason, "domain": "googleapis.com",
+             "metadata": {"key": LEAK, "service": "generativelanguage.googleapis.com"}},
+        ],
+    )
+
+
+def _rejected(body: bytes, status: int = 400, headers: dict | None = None, *, fail_at: int | None = None):
+    stream = TrackingStream(_chunks(body), fail_at=fail_at)
+    with pytest.raises(GeminiEvaluationError) as error:
+        _client(_streaming(stream, status=status, headers=headers)).dispatch(_request())
+    # Diagnosis never changes the approved classification.
+    assert (error.value.kind, error.value.status_code) == (GeminiErrorKind.HTTP_REJECTED, status)
+    assert not error.value.uncertain and not error.value.invalid_response
+    assert stream.closed
+    return error.value, stream
+
+
+def _assert_no_leak(error: GeminiEvaluationError, log_text: str = "") -> None:
+    exposed = " ".join([str(error), repr(error), repr(error.diagnosis), repr(vars(error)), log_text])
+    for secret in ("sk-live", "SECRET", "private.invalid", "bad request", "invalid:",
+                   "googleapis.com", "generativelanguage"):
+        assert secret not in exposed
+
+
+def test_valid_google_rpc_error_yields_only_allowlisted_metadata(caplog) -> None:
+    body = _rpc_error(["generationConfig.responseFormat.text.mimeType", "contents[0].parts[3].inlineData"])
+    with caplog.at_level(logging.INFO, logger="app.services.gemini_evaluation_client"):
+        error, _ = _rejected(body)
+    assert error.diagnosis == ProviderErrorDiagnosis(
+        "400", "INVALID_ARGUMENT", "API_KEY_INVALID",
+        ("generation_config.response_format.text.mime_type", "contents.parts.inline_data"))
+    (record,) = caplog.records
+    message = record.getMessage()
+    assert record.levelno == logging.WARNING and "outcome=HTTP_REJECTED http=400 " in message
+    assert message.endswith(
+        " validate_ms=0.0 provider_code=400 provider_status=INVALID_ARGUMENT reason=API_KEY_INVALID"
+        " fields=generation_config.response_format.text.mime_type,contents.parts.inline_data")
+    _assert_no_leak(error, caplog.text)
+
+
+def test_interactions_style_code_token_is_allowlisted() -> None:
+    error, _ = _rejected(_error_body(code="invalid_request", message=LEAK))
+    assert error.diagnosis == ProviderErrorDiagnosis("invalid_request", "-", "-", ())
+    _assert_no_leak(error)
+
+
+@pytest.mark.parametrize("body,expected", [
+    # Tokens that look valid to a regex but are not allowlisted.
+    (_rpc_error(status="SK_LIVE_SECRET", reason="API_KEY_SECRETVALUE"),
+     ProviderErrorDiagnosis("400", "UNKNOWN", "UNKNOWN", ())),
+    (_error_body(code="sk_live_secret", status=LEAK), ProviderErrorDiagnosis("UNKNOWN", "UNKNOWN", "-", ())),
+    (_error_body(code=600), ProviderErrorDiagnosis("UNKNOWN", "-", "-", ())),
+    (_error_body(code=True), ProviderErrorDiagnosis("UNKNOWN", "-", "-", ())),
+    (_error_body(code=400.0), ProviderErrorDiagnosis("UNKNOWN", "-", "-", ())),
+    # Field paths: unknown leaves collapse to a known parent; unknown roots become UNKNOWN.
+    (_rpc_error(["contents.parts.sk_live_secret_777"]),
+     ProviderErrorDiagnosis("400", "INVALID_ARGUMENT", "API_KEY_INVALID", ("contents.parts",))),
+    (_rpc_error(["generation_config.response_format.text.schema.properties[threatScore].secretKeyword"]),
+     ProviderErrorDiagnosis("400", "INVALID_ARGUMENT", "API_KEY_INVALID",
+                            ("generation_config.response_format.text.schema.properties.threat_score",))),
+    (_rpc_error(["sk_live_secret.path", "https://private.invalid/x", "contents..parts", "a" * 300]),
+     ProviderErrorDiagnosis("400", "INVALID_ARGUMENT", "API_KEY_INVALID", ("UNKNOWN",))),
+    (_rpc_error(["contents", "contents.role", "contents.parts.text", "generation_config"]),
+     ProviderErrorDiagnosis("400", "INVALID_ARGUMENT", "API_KEY_INVALID",
+                            ("contents", "contents.role", "contents.parts.text"))),   # at most three
+])
+def test_unknown_or_regex_shaped_values_never_leak(body, expected) -> None:
+    error, _ = _rejected(body)
+    assert error.diagnosis == expected
+    _assert_no_leak(error)
+
+
+@pytest.mark.parametrize("detail_type", [
+    "type.googleapis.com/google.rpc.BadRequestEvil", "evil.example/google.rpc.BadRequest",
+    "google.rpc.BadRequest", "TYPE.GOOGLEAPIS.COM/GOOGLE.RPC.BADREQUEST",
+])
+def test_fake_detail_types_are_ignored(detail_type) -> None:
+    body = _error_body(code=400, details=[
+        {"@type": detail_type, "fieldViolations": [{"field": "generation_config"}]},
+        {"@type": detail_type.replace("BadRequest", "ErrorInfo"), "reason": "API_KEY_INVALID"},
+    ])
+    error, _ = _rejected(body)
+    assert error.diagnosis == ProviderErrorDiagnosis("400", "-", "-", ())
+
+
+@pytest.mark.parametrize("body", [b"", b"not json", b"[1, 2]", b'{"error": "flat string"}', b"{" * 5000])
+def test_unparseable_bodies_keep_the_rejection_without_diagnosis(body) -> None:
+    error, _ = _rejected(body, status=403)
+    assert error.diagnosis is None
+
+
+def test_error_body_overflow_stops_at_the_limit_and_closes(body_buffer) -> None:
+    body = _rpc_error(["generation_config"])[:-2] + b" " * (MAX_ERROR_BODY_BYTES * 3) + b"}}"
+    error, stream = _rejected(body)
+    assert error.diagnosis is None
+    assert body_buffer().largest <= MAX_ERROR_BODY_BYTES
+    consumed_raw = (MAX_ERROR_BODY_BYTES // READ_CHUNK_BYTES + 1) * READ_CHUNK_BYTES
+    assert stream.yielded == consumed_raw // CHUNK < len(stream.chunks)
+
+
+def test_declared_oversize_error_body_is_not_read() -> None:
+    error, stream = _rejected(_rpc_error(), headers={"Content-Length": str(MAX_ERROR_BODY_BYTES + 1)})
+    assert error.diagnosis is None and stream.yielded == 0
+
+
+def test_gzip_error_body_is_diagnosed_under_the_same_bound(body_buffer) -> None:
+    error, _ = _rejected(gzip.compress(_rpc_error(["generationConfig"])), headers={"Content-Encoding": "gzip"})
+    assert error.diagnosis.fields == ("generation_config",)
+    assert body_buffer().largest <= MAX_ERROR_BODY_BYTES
+
+
+def test_gzip_bomb_error_body_is_abandoned(body_buffer) -> None:
+    error, stream = _rejected(gzip.compress(b" " * (MAX_ERROR_BODY_BYTES * 512)),
+                              headers={"Content-Encoding": "gzip"})
+    assert error.diagnosis is None
+    assert body_buffer().largest <= MAX_ERROR_BODY_BYTES
+
+
+@pytest.mark.parametrize("headers", [{"Content-Encoding": "br"}, {"Content-Encoding": "gzip"}])
+def test_unsupported_or_corrupt_error_encoding_keeps_the_rejection(headers) -> None:
+    error, stream = _rejected(b"not compressed json", headers=headers)
+    assert error.diagnosis is None
+
+
+def test_stream_error_while_reading_the_error_body_keeps_the_rejection() -> None:
+    error, stream = _rejected(_rpc_error(["generation_config"]) + b" " * (CHUNK * 6), fail_at=2)
+    assert error.diagnosis is None and stream.yielded == 2
+
+
+def test_redirect_is_rejected_without_reading_its_body() -> None:
+    stream = TrackingStream(_chunks(_rpc_error(["generation_config"])))
+    with pytest.raises(GeminiEvaluationError) as error:
+        _client(_streaming(stream, status=302, headers={"Location": "https://elsewhere.invalid/next"})).dispatch(
+            _request())
+    assert (error.value.kind, error.value.status_code) == (GeminiErrorKind.HTTP_REJECTED, 302)
+    assert error.value.diagnosis is None
+    assert stream.yielded == 0 and stream.closed
+
+
+@pytest.mark.parametrize("body", [
+    # duplicate keys: top level, inside error, inside a detail
+    b'{"error": {"code": 400}, "error": {"code": 401}}',
+    b'{"error": {"code": 400, "code": 401, "status": "INVALID_ARGUMENT"}}',
+    b'{"error": {"code": 400, "details": [{"@type": "type.googleapis.com/google.rpc.ErrorInfo",'
+    b' "reason": "API_KEY_INVALID", "reason": "SERVICE_DISABLED"}]}}',
+    # non-finite numbers, including in fields that are never extracted
+    b'{"error": {"code": 400, "status": "INVALID_ARGUMENT", "unused": NaN}}',
+    b'{"error": {"code": 400, "status": "INVALID_ARGUMENT", "unused": Infinity}}',
+    b'{"error": {"code": 400, "status": "INVALID_ARGUMENT", "unused": -Infinity}}',
+    b'{"error": {"code": 400, "status": "INVALID_ARGUMENT", "unused": 1e999}}',
+])
+def test_non_strict_json_discards_the_whole_diagnosis(body) -> None:
+    error, _ = _rejected(body)
+    assert error.diagnosis is None
+
+
+def test_strict_json_still_accepts_a_clean_body() -> None:
+    error, _ = _rejected(b'{"error": {"code": 400, "status": "INVALID_ARGUMENT", "ratio": 0.5}}')
+    assert error.diagnosis == ProviderErrorDiagnosis("400", "INVALID_ARGUMENT", "-", ())
