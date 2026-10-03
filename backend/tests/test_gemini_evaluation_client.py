@@ -237,8 +237,10 @@ def test_timing_log_has_durations_and_no_sensitive_content(caplog) -> None:
     client = _client(_replying(_provider_body()), timer=lambda: next(ticks))
     with caplog.at_level(logging.INFO, logger="app.services.gemini_evaluation_client"):
         client.dispatch(_request())
-    (message,) = caplog.messages
-    assert "event=event-ab outcome=CRITICAL http=200" in message
+    (record,) = caplog.records
+    message = record.getMessage()
+    assert record.levelno == logging.INFO
+    assert "event=event-ab domain=PARKING_MOTORCYCLE outcome=CRITICAL http=200" in message
     assert "prepare_ms=2.0 provider_ms=1500.0 validate_ms=1.0" in message
     encoded = base64.b64encode(JPEG).decode()
     for secret in (KEY, encoded, REASONING, "Never infer", "session-xyz"):
@@ -249,7 +251,10 @@ def test_failed_call_still_logs_its_outcome_kind(caplog) -> None:
     with caplog.at_level(logging.INFO, logger="app.services.gemini_evaluation_client"):
         with pytest.raises(GeminiEvaluationError):
             _client(_replying(b"{}", status=429)).dispatch(_request())
-    assert "outcome=HTTP_REJECTED http=429" in caplog.messages[0] and KEY not in caplog.text
+    (record,) = caplog.records
+    assert record.levelno == logging.WARNING                    # failures are visible at WARNING
+    assert "domain=PARKING_MOTORCYCLE outcome=HTTP_REJECTED http=429" in record.getMessage()
+    assert KEY not in caplog.text
 
 
 def test_local_request_errors_are_rejections() -> None:

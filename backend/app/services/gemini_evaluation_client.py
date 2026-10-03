@@ -371,9 +371,13 @@ class GeminiEvaluationClient:
                     prepare: float, provider: float, validate: float) -> None:
         try:
             event = getattr(request, "event_id", "")
-            logger.info(
-                "gemini evaluation event=%s outcome=%s http=%s prepare_ms=%.1f provider_ms=%.1f "
-                "validate_ms=%.1f", str(event)[:8], outcome, status_code if status_code is not None else "-",
+            domain = getattr(getattr(request, "domain", None), "value", "-")
+            succeeded = outcome in ("NORMAL", "WARNING", "CRITICAL")
+            logger.log(
+                logging.INFO if succeeded else logging.WARNING,
+                "gemini evaluation event=%s domain=%s outcome=%s http=%s prepare_ms=%.1f provider_ms=%.1f "
+                "validate_ms=%.1f", str(event)[:8], domain, outcome,
+                status_code if status_code is not None else "-",
                 prepare * 1000, provider * 1000, validate * 1000,
             )
         except Exception:

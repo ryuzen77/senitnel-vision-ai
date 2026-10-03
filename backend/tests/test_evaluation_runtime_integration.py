@@ -623,3 +623,133 @@ with TestClient(app) as client:
     assert completed.returncode == 0, completed.stderr
     assert message in completed.stderr
     assert GEMINI_KEY not in completed.stderr + completed.stdout
+
+
+
+# ── Evaluation metadata logging under Uvicorn (import only, no lifespan) ─────
+
+_UVICORN_LOGGING_PROGRAM = """
+import logging, sys
+from uvicorn.config import Config
+Config("app.main:app", workers=1).configure_logging()   # what Uvicorn does before importing the app
+{prepare}
+import app.main as main
+after_import = [len(logging.getLogger(n).handlers) for n in main.EVALUATION_LOGGERS]
+main.configure_evaluation_logging()                      # second call: idempotent
+{checks}
+"""
+
+
+def test_evaluation_metadata_reaches_the_console_once_under_uvicorn() -> None:
+    completed = _runtime_program({}, _UVICORN_LOGGING_PROGRAM.format(prepare="", checks="""
+assert after_import == [1, 1]                            # configured by importing app.main
+for name in main.EVALUATION_LOGGERS:
+    logger = logging.getLogger(name)
+    assert len(logger.handlers) == 1 and logger.level == logging.INFO and logger.propagate is False
+assert logging.getLogger("httpx").getEffectiveLevel() == logging.WARNING
+assert logging.getLogger("httpcore").getEffectiveLevel() == logging.WARNING
+assert logging.getLogger().level == logging.WARNING
+logging.getLogger("app.services.evaluation_worker").info("PROBE-WORKER-INFO")
+logging.getLogger("app.services.gemini_evaluation_client").warning("PROBE-CLIENT-WARNING")
+logging.getLogger("app.services.gemini_evaluation_client").debug("PROBE-CLIENT-DEBUG")
+logging.getLogger("httpx").info("PROBE-HTTPX-INFO")
+logging.getLogger("httpcore").info("PROBE-HTTPCORE-INFO")
+logging.getLogger("app.services.runtime").info("PROBE-RUNTIME-INFO")
+logging.getLogger().info("PROBE-ROOT-INFO")
+logging.getLogger().addHandler(logging.StreamHandler(sys.stderr))   # a root handler added later
+logging.getLogger("app.services.evaluation_worker").info("PROBE-AFTER-ROOT")
+"""))
+    assert completed.returncode == 0, completed.stderr
+    output = completed.stderr
+    assert output.count("PROBE-WORKER-INFO") == 1
+    assert output.count("PROBE-CLIENT-WARNING") == 1
+    assert output.count("PROBE-AFTER-ROOT") == 1                          # no duplicate line
+    assert "INFO app.services.evaluation_worker: PROBE-WORKER-INFO" in output
+    for hidden in ("PROBE-CLIENT-DEBUG", "PROBE-HTTPX-INFO", "PROBE-HTTPCORE-INFO",
+                   "PROBE-RUNTIME-INFO", "PROBE-ROOT-INFO"):
+        assert hidden not in output
+
+
+def test_existing_logging_configuration_is_respected() -> None:
+    completed = _runtime_program({}, _UVICORN_LOGGING_PROGRAM.format(
+        prepare="""
+external = logging.StreamHandler(sys.stderr)
+logging.getLogger("app.services.evaluation_worker").addHandler(external)
+""",
+        checks="""
+worker = logging.getLogger("app.services.evaluation_worker")
+assert worker.handlers == [external] and worker.level == logging.NOTSET and worker.propagate is True
+client = logging.getLogger("app.services.gemini_evaluation_client")
+assert len(client.handlers) == 1 and client.level == logging.INFO
+"""))
+    assert completed.returncode == 0, completed.stderr
+
+
+
+_EXTERNAL_CASE_PROGRAM = """
+import logging, sys
+from uvicorn.config import Config
+Config("app.main:app", workers=1).configure_logging()
+{prepare}
+def state(name):
+    logger = logging.getLogger(name)
+    return (list(logger.handlers), logger.level, logger.propagate, logger.disabled, list(logger.filters))
+worker_before = state("app.services.evaluation_worker")
+import app.main as main
+main.configure_evaluation_logging()
+worker = logging.getLogger("app.services.evaluation_worker")
+client = logging.getLogger("app.services.gemini_evaluation_client")
+fallback = main._EvaluationFallbackHandler
+assert not any(isinstance(h, fallback) for h in worker.handlers), "fallback installed despite external config"
+assert state("app.services.evaluation_worker") == worker_before, "external worker config was modified"
+print("CLIENT_FALLBACK=%d" % sum(isinstance(h, fallback) for h in client.handlers), file=sys.stderr)
+worker.info("PROBE-WORKER-INFO")
+worker.warning("PROBE-WORKER-WARNING")
+client.info("PROBE-CLIENT-INFO")
+"""
+
+
+@pytest.mark.parametrize("case,prepare,worker_lines,client_fallback", [
+    # No handler on the propagation path: Python's own logging.lastResort still
+    # prints WARNING+ as a bare message; that is stdlib behaviour, not a fallback.
+    ("target propagate=False, no handler",
+     'logging.getLogger("app.services.evaluation_worker").propagate = False', {"PROBE-WORKER-WARNING"}, 1),
+    ("ancestor propagate=False, no handler",
+     'logging.getLogger("app.services").propagate = False', {"PROBE-WORKER-WARNING"}, 0),
+    ("ancestor with handler",
+     'logging.getLogger("app").addHandler(logging.StreamHandler(sys.stderr))', {"PROBE-WORKER-WARNING"}, 0),
+    ("target disabled", 'logging.getLogger("app.services.evaluation_worker").disabled = True', set(), 1),
+    ("target filter", 'logging.getLogger("app.services.evaluation_worker").addFilter(lambda record: False)',
+     set(), 1),
+    ("target level", 'logging.getLogger("app.services.evaluation_worker").setLevel(logging.ERROR)', set(), 1),
+    ("logging.disable", "logging.disable(logging.CRITICAL)", set(), 0),
+])
+def test_external_logging_choices_are_respected_even_when_silent(case, prepare, worker_lines,
+                                                                 client_fallback) -> None:
+    completed = _runtime_program({}, _EXTERNAL_CASE_PROGRAM.format(prepare=prepare))
+    assert completed.returncode == 0, completed.stderr
+    output = completed.stderr
+    assert f"CLIENT_FALLBACK={client_fallback}" in output
+    for line in ("PROBE-WORKER-INFO", "PROBE-WORKER-WARNING"):
+        assert output.count(line) == (1 if line in worker_lines else 0), (case, line)
+    assert "app.services.evaluation_worker: PROBE" not in output    # never our fallback format
+    # The untouched client logger still gets the fallback (and prints INFO) unless
+    # an ancestor or logging.disable() governs it as well.
+    assert output.count("PROBE-CLIENT-INFO") == client_fallback
+
+
+def test_default_uvicorn_configuration_installs_one_fallback_per_logger() -> None:
+    completed = _runtime_program({}, """
+import logging, sys
+from uvicorn.config import Config
+Config("app.main:app", workers=1).configure_logging()
+import app.main as main
+for _ in range(3):
+    main.configure_evaluation_logging()
+for name in main.EVALUATION_LOGGERS:
+    handlers = logging.getLogger(name).handlers
+    assert len(handlers) == 1 and isinstance(handlers[0], main._EvaluationFallbackHandler)
+logging.getLogger("app.services.evaluation_worker").info("PROBE-DEFAULT-INFO")
+""")
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stderr.count("PROBE-DEFAULT-INFO") == 1

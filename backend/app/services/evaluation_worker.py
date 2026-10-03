@@ -7,6 +7,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 import logging
 import math
+import re
 import threading
 import time
 from typing import Protocol
@@ -23,8 +24,8 @@ from app.models.event_frame import (
 )
 from app.services.evaluation_budget import EvaluationBudget
 from app.services.event_frame_buffer import EventFrameBuffer
-from app.services.gemini_evaluation_client import GeminiEvaluationError
-from app.services.langflow_evaluation_client import LangflowDispatchRejected
+from app.services.gemini_evaluation_client import GeminiErrorKind, GeminiEvaluationError
+from app.services.langflow_evaluation_client import LangflowDispatchRejected, LangflowErrorKind
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +55,36 @@ class LangflowDispatcher(Protocol):
 
 
 FrameSelectionPlanFactory = Callable[[str, str, float], FrameSelectionPlan]
+
+
+_SHORT_ID = re.compile(r"[A-Za-z0-9-]{1,8}")
+
+
+def _log_dispatch_failure(event: object, category: EvaluationFailure, error: object) -> None:
+    """Metadata only: never the exception text, repr, class name, traceback,
+    URL, payload or response body.
+
+    ``kind`` is logged only when it is a member of a known transport error enum
+    (allowlist); anything else, including look-alike objects, is UNEXPECTED.
+    ``http`` is logged only as an integer status in 100-599.
+    """
+    try:
+        kind = getattr(error, "kind", None)
+        kind_text = (kind.value if isinstance(kind, (GeminiErrorKind, LangflowErrorKind))
+                     else "UNEXPECTED")
+        status = getattr(error, "status_code", None)
+        status_text = str(status) if type(status) is int and 100 <= status <= 599 else "-"
+        domain = getattr(event, "domain", None)
+        event_id = getattr(event, "event_id", None)
+        short_id = event_id[:8] if isinstance(event_id, str) else ""
+        logger.warning(
+            "evaluation dispatch failed event=%s domain=%s category=%s kind=%s http=%s",
+            short_id if _SHORT_ID.fullmatch(short_id) else "-",
+            domain.value if isinstance(domain, DomainName) else "-",
+            category.value, kind_text, status_text,
+        )
+    except Exception:
+        pass                                  # observability never changes the outcome
 
 
 def _dispatch_failure_category(error: Exception) -> EvaluationFailure:
@@ -480,14 +511,16 @@ class EvaluationWorker:
             except (LangflowDispatchRejected, GeminiEvaluationError) as error:
                 # Closed now: no callback follows. For an uncertain direct failure the
                 # provider may still have processed the request; the quota stays spent.
+                category = _dispatch_failure_category(error)
                 with self._state_lock:
                     if self._pending is not None and self._pending.event_id == event.event_id:
-                        self._fail_pending_locked(self._clock(), EvaluationWorkerState.FAILED,
-                                                  _dispatch_failure_category(error))
+                        self._fail_pending_locked(self._clock(), EvaluationWorkerState.FAILED, category)
+                _log_dispatch_failure(event, category, error)
             except Exception:
                 # Timeout/connection failure can happen after the Webhook received
                 # the body. Never retry or release the reservation prematurely.
                 self._record_failure(EvaluationFailure.DISPATCH_UNCERTAIN)
+                _log_dispatch_failure(event, EvaluationFailure.DISPATCH_UNCERTAIN, None)
             finally:
                 with self._state_lock:
                     if self._pending is not None and self._pending.event_id == event.event_id:
@@ -502,6 +535,7 @@ class EvaluationWorker:
                 if self._pending is not None and event is not None and self._pending.event_id == event.event_id:
                     self._fail_pending_locked(self._clock(), EvaluationWorkerState.FAILED,
                                               EvaluationFailure.CLIENT_ERROR)
+            _log_dispatch_failure(event, EvaluationFailure.CLIENT_ERROR, None)
             return event is not None
         finally:
             if not handed_off:
@@ -543,8 +577,12 @@ class EvaluationWorker:
         try:
             # publish_ms covers acceptance and the audio-gate offer call only; it is
             # not evidence of when (or whether) a sound was actually heard.
-            logger.info("evaluation result event=%s disposition=%s publish_ms=%.1f",
-                        event.event_id[:8], disposition.value, (time.perf_counter() - started) * 1000)
+            logger.log(
+                logging.INFO if disposition is CallbackDisposition.ACCEPTED else logging.WARNING,
+                "evaluation result event=%s domain=%s disposition=%s publish_ms=%.1f",
+                event.event_id[:8], event.domain.value, disposition.value,
+                (time.perf_counter() - started) * 1000,
+            )
         except Exception:
             pass
 

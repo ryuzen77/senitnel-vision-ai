@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import enum
 import logging
 import threading
 
@@ -268,3 +269,116 @@ def test_late_generic_transport_exception_after_stop_leaves_the_new_session_alon
     assert snapshot.last_failure is EvaluationFailure.DISPATCH_UNCERTAIN    # diagnostic only
     assert budget.get_snapshot(10).pending_event_id is None and trigger.failed == ["e1"]
     assert "offer" not in [call[0] for call in gate.calls]
+
+
+
+# ── Metadata logging (safe fields only) ──────────────────────────────────────
+
+SECRET_TEXT = "sk-live-SECRET-123 https://private.invalid/v1beta/models/x:generateContent"
+
+
+def _worker_log_records(caplog):
+    return [r for r in caplog.records if r.name == "app.services.evaluation_worker"]
+
+
+def test_success_logs_dispatch_and_accepted_result_once_at_info(caplog) -> None:
+    worker, trigger, _ = _worker(FakeDirectClient())
+    trigger.queue(_event("e1", 10))
+    with caplog.at_level(logging.INFO, logger="app.services.evaluation_worker"):
+        assert worker.process_one(10)
+    records = _worker_log_records(caplog)
+    messages = [r.getMessage() for r in records]
+    assert [r.levelno for r in records] == [logging.INFO, logging.INFO]
+    assert messages[0].startswith("evaluation dispatch attempt 1/unlimited event=e1 session=one "
+                                  "domain=PARKING_MOTORCYCLE bundle_ms=")
+    assert messages[1].startswith("evaluation result event=e1 domain=PARKING_MOTORCYCLE "
+                                  "disposition=ACCEPTED publish_ms=")
+    assert "dispatch failed" not in caplog.text
+
+
+@pytest.mark.parametrize("error,category,kind,http", [
+    (GeminiEvaluationError(GeminiErrorKind.HTTP_REJECTED, status_code=429), "CLIENT_ERROR", "HTTP_REJECTED", "429"),
+    (GeminiEvaluationError(GeminiErrorKind.HTTP_SERVER_ERROR, status_code=503), "DISPATCH_UNCERTAIN",
+     "HTTP_SERVER_ERROR", "503"),
+    (GeminiEvaluationError(GeminiErrorKind.TIMEOUT), "DISPATCH_UNCERTAIN", "TIMEOUT", "-"),
+    (GeminiEvaluationError(GeminiErrorKind.TRUNCATED), "INVALID_RESPONSE", "TRUNCATED", "-"),
+    (RuntimeError(SECRET_TEXT), "DISPATCH_UNCERTAIN", "UNEXPECTED", "-"),
+])
+def test_each_failed_dispatch_logs_one_safe_warning(caplog, error, category, kind, http) -> None:
+    worker, trigger, _ = _worker(FakeDirectClient(error=error))
+    trigger.queue(_event("e1", 10))
+    with caplog.at_level(logging.INFO, logger="app.services.evaluation_worker"):
+        assert worker.process_one(10)
+    failures = [r for r in _worker_log_records(caplog) if "dispatch failed" in r.getMessage()]
+    assert len(failures) == 1 and failures[0].levelno == logging.WARNING
+    assert failures[0].getMessage() == (
+        f"evaluation dispatch failed event=e1 domain=PARKING_MOTORCYCLE category={category} "
+        f"kind={kind} http={http}")
+    assert failures[0].exc_info is None                     # no raw exception or traceback
+    for leaked in ("sk-live-SECRET", "private.invalid", "RuntimeError", "generateContent"):
+        assert leaked not in caplog.text
+
+
+def test_unexpected_processing_error_logs_a_generic_category(caplog) -> None:
+    class ExplodingBuffer(FakeBuffer):
+        def wait_for_bundle(self, plan, timeout_seconds):
+            raise RuntimeError(SECRET_TEXT)
+
+    worker, trigger, _ = _worker(FakeDirectClient(), buffer=ExplodingBuffer())
+    trigger.queue(_event("e1", 10))
+    with caplog.at_level(logging.INFO, logger="app.services.evaluation_worker"):
+        assert worker.process_one(10)
+    (record,) = _worker_log_records(caplog)
+    assert record.levelno == logging.WARNING and record.exc_info is None
+    assert record.getMessage() == ("evaluation dispatch failed event=e1 domain=PARKING_MOTORCYCLE "
+                                   "category=CLIENT_ERROR kind=UNEXPECTED http=-")
+    assert "sk-live-SECRET" not in caplog.text and "private.invalid" not in caplog.text
+
+
+def test_rejected_direct_result_is_logged_at_warning_without_content(caplog) -> None:
+    worker, trigger, _ = _worker(FakeDirectClient(mismatch=True))
+    trigger.queue(_event("e1", 10))
+    with caplog.at_level(logging.INFO, logger="app.services.evaluation_worker"):
+        assert worker.process_one(10)
+    (result,) = [r for r in _worker_log_records(caplog) if r.getMessage().startswith("evaluation result")]
+    assert result.levelno == logging.WARNING and "disposition=REJECTED" in result.getMessage()
+    assert "Observasi" not in caplog.text and "jaket" not in caplog.text and "someone-else" not in caplog.text
+
+
+
+class _LeakyKind:
+    """Look-alike of an error kind whose value carries sensitive text."""
+
+    value = SECRET_TEXT
+
+
+@pytest.mark.parametrize("kind,status", [
+    (_LeakyKind(), SECRET_TEXT),                         # not an allowlisted enum member
+    (SECRET_TEXT, 99999),                                # raw string kind, out-of-range status
+    (enum.Enum("FakeKind", {"LEAK": SECRET_TEXT}).LEAK, True),   # enum, but not a transport enum
+])
+def test_unknown_kind_or_status_is_logged_as_generic(caplog, kind, status) -> None:
+    error = GeminiEvaluationError(GeminiErrorKind.TIMEOUT)
+    error.kind = kind                                     # tampered after construction
+    error.status_code = status
+    worker, trigger, _ = _worker(FakeDirectClient(error=error))
+    trigger.queue(_event("e1", 10))
+    with caplog.at_level(logging.INFO, logger="app.services.evaluation_worker"):
+        assert worker.process_one(10)
+    (failure,) = [r for r in _worker_log_records(caplog) if "dispatch failed" in r.getMessage()]
+    assert failure.getMessage() == ("evaluation dispatch failed event=e1 domain=PARKING_MOTORCYCLE "
+                                    "category=DISPATCH_UNCERTAIN kind=UNEXPECTED http=-")
+    for leaked in ("sk-live-SECRET", "private.invalid", "_LeakyKind", "FakeKind", "99999"):
+        assert leaked not in caplog.text
+
+
+def test_known_langflow_kind_is_allowlisted(caplog) -> None:
+    from app.services.langflow_evaluation_client import LangflowDispatchRejected, LangflowErrorKind
+
+    error = LangflowDispatchRejected(LangflowErrorKind.HTTP_STATUS, status_code=403)
+    worker, trigger, _ = _worker(FakeDirectClient(error=error))
+    trigger.queue(_event("e1", 10))
+    with caplog.at_level(logging.INFO, logger="app.services.evaluation_worker"):
+        assert worker.process_one(10)
+    (failure,) = [r for r in _worker_log_records(caplog) if "dispatch failed" in r.getMessage()]
+    assert failure.getMessage().endswith("category=CLIENT_ERROR kind=HTTP_STATUS http=403")
