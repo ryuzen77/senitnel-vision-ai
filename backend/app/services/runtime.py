@@ -26,6 +26,7 @@ from app.services.audio_alert_service import (
 from app.services.evaluation_budget import EvaluationBudget
 from app.services.evaluation_worker import MAX_DISPATCHES_LIMIT, EvaluationWorker
 from app.services.event_frame_buffer import EventFrameBuffer
+from app.services.gemini_evaluation_client import GeminiEvaluationClient, GeminiEvaluationError
 from app.services.langflow_evaluation_client import LangflowDispatchRejected, LangflowEvaluationClient
 from app.services.scene_domain_classifier import SceneDomainClassifier
 from app.services.parking_candidate_trigger import ParkingCandidateTrigger
@@ -52,6 +53,34 @@ def _create_langflow_client() -> LangflowEvaluationClient | None:
     except LangflowDispatchRejected:
         logger.warning("Langflow evaluation disabled: invalid transport configuration")
         return None
+
+
+EVALUATION_TRANSPORTS = ("langflow", "gemini")
+
+
+def _evaluation_transport() -> str | None:
+    """Exactly one transport; unset means Langflow. Anything else disables evaluation."""
+    raw = os.getenv("SENTINEL_EVALUATION_TRANSPORT")
+    if raw is None:
+        return "langflow"
+    if raw not in EVALUATION_TRANSPORTS:
+        logger.warning("External evaluation disabled: invalid transport selection")
+        return None
+    return raw
+
+
+def _create_gemini_client(callback_timeout_seconds: float | None) -> GeminiEvaluationClient | None:
+    """Direct Gemini client; its HTTP timeout must end before the result deadline."""
+    try:
+        client = GeminiEvaluationClient()
+    except GeminiEvaluationError:
+        logger.warning("Gemini evaluation disabled: invalid transport configuration")
+        return None
+    if callback_timeout_seconds is None or not client.timeout_seconds < callback_timeout_seconds:
+        logger.warning("Gemini evaluation disabled: request timeout must be below the result deadline")
+        client.close()
+        return None
+    return client
 
 
 def _external_evaluation_enabled(client: LangflowEvaluationClient | None) -> bool:
@@ -150,16 +179,24 @@ effective_callback_timeout_seconds = evaluation_callback_timeout_seconds or 45.0
 evaluation_budget = EvaluationBudget(
     pending_timeout_seconds=effective_callback_timeout_seconds + 15,
 )
-langflow_client = _create_langflow_client()
+evaluation_transport = _evaluation_transport()
+# Only the selected transport is constructed; there is no fallback between them.
+langflow_client = _create_langflow_client() if evaluation_transport == "langflow" else None
+gemini_client = (_create_gemini_client(evaluation_callback_timeout_seconds)
+                 if evaluation_transport == "gemini" else None)
+evaluation_client = langflow_client if evaluation_transport == "langflow" else gemini_client
 evaluation_max_dispatches_valid, evaluation_max_dispatches = _evaluation_max_dispatches()
-# A callback token is required before spending an external evaluation request.
-evaluation_enabled = (_external_evaluation_enabled(langflow_client)
+# Langflow needs a callback token before spending a request; Gemini returns the
+# assessment directly and needs only its own API key (checked by the client).
+transport_ready = (_external_evaluation_enabled(langflow_client) if evaluation_transport == "langflow"
+                   else gemini_client is not None)
+evaluation_enabled = (transport_ready
                       and evaluation_callback_timeout_seconds is not None
                       and evaluation_max_dispatches_valid)
 audio_alert_gate = _create_audio_alert_gate()
 evaluation_worker = EvaluationWorker(
     parking_candidate_trigger, evaluation_budget, event_frame_buffer,
-    langflow_client if langflow_client is not None else _UnavailableDispatcher(),
+    evaluation_client if evaluation_client is not None else _UnavailableDispatcher(),
     callback_timeout_seconds=effective_callback_timeout_seconds,
     enabled=evaluation_enabled,
     max_dispatches=evaluation_max_dispatches,

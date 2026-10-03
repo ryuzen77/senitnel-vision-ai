@@ -23,6 +23,7 @@ from app.models.event_frame import (
 )
 from app.services.evaluation_budget import EvaluationBudget
 from app.services.event_frame_buffer import EventFrameBuffer
+from app.services.gemini_evaluation_client import GeminiEvaluationError
 from app.services.langflow_evaluation_client import LangflowDispatchRejected
 
 logger = logging.getLogger(__name__)
@@ -30,18 +31,38 @@ logger = logging.getLogger(__name__)
 MAX_DISPATCHES_LIMIT = 1000
 
 class LangflowDispatcher(Protocol):
-    """A normal return means Webhook dispatch ACK, never an assessment.
+    """One evaluation transport; exactly one is active per process.
 
-    LangflowDispatchRejected means definitive rejection and immediately fails
-    the budget and candidate. Transport exceptions are uncertain because the
-    remote flow might still call back; wait until the callback deadline and
-    never retry automatically.
+    Webhook transport (Langflow): returning None is only a dispatch ACK; the
+    assessment arrives later through the authenticated callback.
+    Direct transport (Gemini): returns an ``EvaluationCallback`` correlated by
+    the backend; the worker publishes it through ``accept_callback``, the same
+    acceptance path as the HTTP callback (no self-POST, no duplicated rules).
+    LangflowDispatchRejected is a definitive Webhook rejection. A
+    GeminiEvaluationError is classified (rejected, uncertain or invalid
+    response); because the direct transport has no later callback, the worker
+    closes the pending event for every class and fails the budget and
+    candidate at once. An "uncertain" class (timeout, connection or stream
+    error, HTTP 5xx) does not prove the provider stopped processing; it only
+    means no result will be accepted for that event. Any other exception keeps
+    the event pending until the callback deadline (a Langflow flow might still
+    call back). Nothing is retried and a spent dispatch attempt is never
+    returned to the quota.
     """
 
-    def dispatch(self, request: EvaluationRequest) -> None: ...
+    def dispatch(self, request: EvaluationRequest) -> EvaluationCallback | None: ...
 
 
 FrameSelectionPlanFactory = Callable[[str, str, float], FrameSelectionPlan]
+
+
+def _dispatch_failure_category(error: Exception) -> EvaluationFailure:
+    """Diagnostic class only; every one of them closes the pending event."""
+    if getattr(error, "uncertain", False):
+        return EvaluationFailure.DISPATCH_UNCERTAIN     # provider outcome unknown
+    if getattr(error, "invalid_response", False):
+        return EvaluationFailure.INVALID_RESPONSE       # answered, but not publishable
+    return EvaluationFailure.CLIENT_ERROR               # rejected before/at the provider
 
 
 class CandidateEvent(Protocol):
@@ -379,6 +400,7 @@ class EvaluationWorker:
             event = self._trigger.claim_next_candidate(claim_at)
             if event is None:
                 return False
+            prepare_started = time.perf_counter()   # monotonic; durations only
             with self._state_lock:
                 if self._ended_session_id == event.source_session_id:
                     self._record_failure(EvaluationFailure.STALE_SESSION)
@@ -421,6 +443,7 @@ class EvaluationWorker:
                 event.triggered_at, event.person_track_id, event.object_track_id,
                 event.evidence, bundle_decision.bundle,
             )
+            prepare_ms = (time.perf_counter() - prepare_started) * 1000
             requested_at = self._clock()
             with self._state_lock:
                 if not self._current(event):
@@ -444,20 +467,23 @@ class EvaluationWorker:
                 handed_off = True
             try:
                 logger.info(
-                    "evaluation dispatch attempt %d/%s event=%s session=%s", attempt,
-                    self._max_dispatches if self._max_dispatches is not None else "unlimited",
-                    event.event_id[:8], event.source_session_id[:8],
+                    "evaluation dispatch attempt %d/%s event=%s session=%s domain=%s bundle_ms=%.1f",
+                    attempt, self._max_dispatches if self._max_dispatches is not None else "unlimited",
+                    event.event_id[:8], event.source_session_id[:8], event.domain.value, prepare_ms,
                 )
             except Exception:
                 pass  # Observability must never change dispatch behavior.
+            outcome: EvaluationCallback | None = None
             try:
                 # Outside every worker lock: Stop and callbacks never wait for it.
-                self._client.dispatch(request)
-            except LangflowDispatchRejected:
+                outcome = self._client.dispatch(request)
+            except (LangflowDispatchRejected, GeminiEvaluationError) as error:
+                # Closed now: no callback follows. For an uncertain direct failure the
+                # provider may still have processed the request; the quota stays spent.
                 with self._state_lock:
                     if self._pending is not None and self._pending.event_id == event.event_id:
                         self._fail_pending_locked(self._clock(), EvaluationWorkerState.FAILED,
-                                                  EvaluationFailure.CLIENT_ERROR)
+                                                  _dispatch_failure_category(error))
             except Exception:
                 # Timeout/connection failure can happen after the Webhook received
                 # the body. Never retry or release the reservation prematurely.
@@ -466,6 +492,8 @@ class EvaluationWorker:
                 with self._state_lock:
                     if self._pending is not None and self._pending.event_id == event.event_id:
                         self._state = EvaluationWorkerState.WAITING_CALLBACK
+            if outcome is not None:
+                self._publish_direct_result(event, outcome)
             self.sweep(self._clock())
             return True
         except Exception:
@@ -494,6 +522,31 @@ class EvaluationWorker:
                             and self._session_id == event.source_session_id):
                         self._state = EvaluationWorkerState.FAILED
             self._processing_lock.release()
+
+    def _publish_direct_result(self, event: CandidateEvent, outcome: object) -> None:
+        """Publish a direct-transport result through the callback acceptance path.
+
+        A result for a cancelled or replaced session is REJECTED there and has no
+        effect. A result that is rejected while its event is still pending fails
+        that event now: no callback will ever follow on this transport.
+        """
+        started = time.perf_counter()
+        disposition = CallbackDisposition.REJECTED
+        if (isinstance(outcome, EvaluationCallback) and outcome.event_id == event.event_id
+                and outcome.source_session_id == event.source_session_id):
+            disposition = self.accept_callback(outcome, self._clock())
+        if disposition is not CallbackDisposition.ACCEPTED:
+            with self._state_lock:
+                if self._pending is not None and self._pending.event_id == event.event_id:
+                    self._fail_pending_locked(self._clock(), EvaluationWorkerState.FAILED,
+                                              EvaluationFailure.CLIENT_ERROR)
+        try:
+            # publish_ms covers acceptance and the audio-gate offer call only; it is
+            # not evidence of when (or whether) a sound was actually heard.
+            logger.info("evaluation result event=%s disposition=%s publish_ms=%.1f",
+                        event.event_id[:8], disposition.value, (time.perf_counter() - started) * 1000)
+        except Exception:
+            pass
 
     def accept_callback(self, callback: EvaluationCallback, now: float) -> CallbackDisposition:
         """First matching callback wins; a conflicting replay is rejected.

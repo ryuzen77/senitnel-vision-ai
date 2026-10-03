@@ -43,10 +43,14 @@ class CallbackReceipt(BaseModel):
 
 
 def get_callback_consumer() -> CallbackConsumer | None:
-    """Return the one process-local worker only while evaluation is enabled."""
-    from app.services.runtime import evaluation_enabled, evaluation_worker
+    """Return the worker only while the Langflow (callback) transport is enabled.
 
-    return evaluation_worker if evaluation_enabled else None
+    The direct Gemini transport publishes in-process; its results never arrive
+    through this endpoint, so the route is unavailable while it is active.
+    """
+    from app.services.runtime import evaluation_enabled, evaluation_transport, evaluation_worker
+
+    return evaluation_worker if evaluation_enabled and evaluation_transport == "langflow" else None
 
 
 def get_callback_token() -> str:

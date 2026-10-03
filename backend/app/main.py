@@ -13,8 +13,8 @@ from app.services.runtime import (
     detector_service,
     event_frame_buffer,
     evaluation_budget,
+    evaluation_client,
     evaluation_worker,
-    langflow_client,
     parking_candidate_trigger,
     scene_domain_classifier,
     shutdown_services,
@@ -37,7 +37,7 @@ async def lifespan(app: FastAPI):  # noqa: ANN001
         video_service, scene_domain_classifier, detector_service,
         parking_candidate_trigger, tracker_service, event_frame_buffer,
         evaluation_worker=evaluation_worker,
-        langflow_client=langflow_client,
+        langflow_client=evaluation_client,  # the one active transport client
         evaluation_budget=evaluation_budget,
         audio_alert=audio_alert_gate,
     )

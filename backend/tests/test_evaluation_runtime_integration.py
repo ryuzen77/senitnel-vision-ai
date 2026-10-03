@@ -136,7 +136,8 @@ def test_max_dispatches_rejects_invalid_values_without_logging_them(monkeypatch,
         assert runtime._evaluation_max_dispatches() == (False, None)
     assert "External evaluation disabled: invalid dispatch limit configuration" in caplog.text
     if configured.strip():
-        assert configured.strip() not in caplog.text
+        # Messages only: caplog.text also carries source line numbers, which may contain digits.
+        assert configured.strip() not in " ".join(caplog.messages)
 
 
 @pytest.mark.parametrize("configured", ["", "0", "1001", "invalid-private-value"])
@@ -535,3 +536,90 @@ def test_lifespan_starts_worker_before_serving_and_shutdown_is_ordered(monkeypat
     assert events == expected
     runtime.shutdown_services(*args, **kwargs)
     assert events == expected
+
+
+# ── Evaluation transport selection (import only: no lifespan, no network) ────
+
+def _runtime_program(environment_updates: dict[str, str], program: str,
+                     removed: tuple[str, ...] = ()) -> subprocess.CompletedProcess:
+    environment = os.environ.copy()
+    for key in ("SENTINEL_EVALUATION_TRANSPORT", "SENTINEL_GEMINI_API_KEY", "SENTINEL_GEMINI_MODEL",
+                "SENTINEL_GEMINI_TIMEOUT_SECONDS", "SENTINEL_LANGFLOW_URL", "SENTINEL_CALLBACK_TOKEN",
+                "SENTINEL_EVALUATION_CALLBACK_TIMEOUT_SECONDS", *removed):
+        environment.pop(key, None)
+    environment.update(environment_updates)
+    return subprocess.run(
+        [sys.executable, "-c", program], cwd=Path(__file__).resolve().parents[1],
+        env=environment, capture_output=True, text=True, timeout=20, check=False,
+    )
+
+
+GEMINI_KEY = "synthetic-gemini-secret-value"
+
+
+def test_default_transport_stays_langflow_even_with_gemini_settings() -> None:
+    completed = _runtime_program({
+        "SENTINEL_LANGFLOW_URL": "https://example.invalid/api/v1/webhook/flow",
+        "SENTINEL_CALLBACK_TOKEN": "synthetic-token",
+        "SENTINEL_GEMINI_API_KEY": GEMINI_KEY, "SENTINEL_GEMINI_MODEL": "gemini-test-flash",
+    }, """
+from app.api.evaluation import get_callback_consumer
+from app.services import runtime
+assert runtime.evaluation_transport == "langflow" and runtime.gemini_client is None
+assert runtime.evaluation_enabled is True
+assert runtime.evaluation_worker._client is runtime.langflow_client is runtime.evaluation_client
+assert get_callback_consumer() is runtime.evaluation_worker
+""")
+    assert completed.returncode == 0, completed.stderr
+    assert GEMINI_KEY not in completed.stderr
+
+
+def test_gemini_transport_is_the_only_active_client_and_needs_no_callback_token() -> None:
+    completed = _runtime_program({
+        "SENTINEL_EVALUATION_TRANSPORT": "gemini",
+        "SENTINEL_GEMINI_API_KEY": GEMINI_KEY, "SENTINEL_GEMINI_MODEL": "gemini-test-flash",
+        "SENTINEL_LANGFLOW_URL": "https://example.invalid/api/v1/webhook/flow",
+    }, """
+from app.api.evaluation import get_callback_consumer
+from app.services import runtime
+from app.services.gemini_evaluation_client import GeminiEvaluationClient
+assert runtime.evaluation_transport == "gemini" and runtime.langflow_client is None
+assert isinstance(runtime.gemini_client, GeminiEvaluationClient)
+assert runtime.evaluation_worker._client is runtime.gemini_client is runtime.evaluation_client
+assert runtime.evaluation_enabled is True and runtime.gemini_client.timeout_seconds == 30.0
+assert get_callback_consumer() is None              # no HTTP callback path on this transport
+assert runtime.evaluation_worker.get_snapshot().running is False
+""")
+    assert completed.returncode == 0, completed.stderr
+    assert GEMINI_KEY not in completed.stderr + completed.stdout
+
+
+@pytest.mark.parametrize("updates,message", [
+    # A complete Langflow setup must not become a fallback for an invalid selection.
+    ({"SENTINEL_EVALUATION_TRANSPORT": "Gemini", "SENTINEL_CALLBACK_TOKEN": "synthetic-token",
+      "SENTINEL_LANGFLOW_URL": "https://example.invalid/api/v1/webhook/flow"}, "invalid transport selection"),
+    ({"SENTINEL_EVALUATION_TRANSPORT": "", "SENTINEL_CALLBACK_TOKEN": "synthetic-token",
+      "SENTINEL_LANGFLOW_URL": "https://example.invalid/api/v1/webhook/flow"}, "invalid transport selection"),
+    ({"SENTINEL_EVALUATION_TRANSPORT": "gemini", "SENTINEL_GEMINI_MODEL": "gemini-test-flash"},
+     "Gemini evaluation disabled: invalid transport configuration"),
+    ({"SENTINEL_EVALUATION_TRANSPORT": "gemini", "SENTINEL_GEMINI_API_KEY": GEMINI_KEY},
+     "Gemini evaluation disabled: invalid transport configuration"),
+    ({"SENTINEL_EVALUATION_TRANSPORT": "gemini", "SENTINEL_GEMINI_API_KEY": GEMINI_KEY,
+      "SENTINEL_GEMINI_MODEL": "gemini-test-flash", "SENTINEL_GEMINI_TIMEOUT_SECONDS": "30",
+      "SENTINEL_EVALUATION_CALLBACK_TIMEOUT_SECONDS": "30"},
+     "request timeout must be below the result deadline"),
+])
+def test_invalid_transport_configuration_disables_evaluation_without_leaking(updates, message) -> None:
+    completed = _runtime_program(updates, """
+from fastapi.testclient import TestClient
+from app.main import app
+from app.services import runtime
+assert not runtime.evaluation_enabled and not runtime.evaluation_worker.enabled
+assert runtime.evaluation_client is None or runtime.evaluation_transport == "langflow"
+with TestClient(app) as client:
+    assert client.get('/api/health').status_code == 200
+    assert client.get('/api/evaluation/current').json()['enabled'] is False
+""")
+    assert completed.returncode == 0, completed.stderr
+    assert message in completed.stderr
+    assert GEMINI_KEY not in completed.stderr + completed.stdout
