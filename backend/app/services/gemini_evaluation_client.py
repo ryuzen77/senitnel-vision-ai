@@ -10,7 +10,10 @@ model, and the model output must contain exactly the assessment fields.
 Contract verified against the official Gemini API reference (generateContent):
 ``POST /v1beta/models/{model}:generateContent`` with ``x-goog-api-key``;
 images as ``parts[].inlineData{mimeType, data(base64)}``; structured output via
-``generationConfig.responseFormat.text{mimeType: application/json, schema}``;
+``generationConfig.responseFormat.text{mimeType: APPLICATION_JSON, schema}``
+(``TextResponseFormat.mimeType`` is the enum ``MimeType``: APPLICATION_JSON or
+TEXT_PLAIN; the provider rejected the string "application/json" with HTTP 400
+INVALID_ARGUMENT on generation_config.response_format.text.mime_type);
 text in ``candidates[0].content.parts[].text`` (``thought`` parts skipped),
 ``candidates[0].finishReason`` and ``promptFeedback.blockReason``. The newer
 Interactions API is not used: its compatibility was not assumed, and this
@@ -466,7 +469,8 @@ class GeminiEvaluationClient:
         payload = {
             "contents": [{"role": "user", "parts": parts}],
             "generationConfig": {
-                "responseFormat": {"text": {"mimeType": "application/json", "schema": ASSESSMENT_SCHEMA}},
+                # Enum value per the TextResponseFormat reference (not a MIME string).
+                "responseFormat": {"text": {"mimeType": "APPLICATION_JSON", "schema": ASSESSMENT_SCHEMA}},
             },
         }
         try:

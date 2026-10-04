@@ -86,7 +86,7 @@ def test_request_uses_the_documented_generate_content_contract() -> None:
     body = json.loads(sent.content)
     assert set(body) == {"contents", "generationConfig"}
     assert body["generationConfig"] == {
-        "responseFormat": {"text": {"mimeType": "application/json", "schema": ASSESSMENT_SCHEMA}}}
+        "responseFormat": {"text": {"mimeType": "APPLICATION_JSON", "schema": ASSESSMENT_SCHEMA}}}
     parts = body["contents"][0]["parts"]
     images = [part["inlineData"] for part in parts if "inlineData" in part]
     assert len(images) == 5                                     # exactly five images
@@ -611,3 +611,26 @@ def test_non_strict_json_discards_the_whole_diagnosis(body) -> None:
 def test_strict_json_still_accepts_a_clean_body() -> None:
     error, _ = _rejected(b'{"error": {"code": 400, "status": "INVALID_ARGUMENT", "ratio": 0.5}}')
     assert error.diagnosis == ProviderErrorDiagnosis("400", "INVALID_ARGUMENT", "-", ())
+
+
+def test_structured_output_mime_type_is_the_documented_enum_value() -> None:
+    # TextResponseFormat.mimeType is enum MimeType {MIME_TYPE_UNSPECIFIED, APPLICATION_JSON, TEXT_PLAIN};
+    # the schema only applies with APPLICATION_JSON. HTTP headers stay real MIME types.
+    seen: list[httpx.Request] = []
+    _client(_replying(_provider_body(), seen=seen)).dispatch(_request())
+    text_format = json.loads(seen[0].content)["generationConfig"]["responseFormat"]["text"]
+    assert text_format["mimeType"] == "APPLICATION_JSON" and text_format["schema"] == ASSESSMENT_SCHEMA
+    assert b"application/json" not in seen[0].content                  # never in the body
+    assert seen[0].headers["content-type"] == "application/json"
+
+
+def test_observed_mime_type_rejection_is_diagnosed() -> None:
+    # Regression fixture for the observed provider rejection (metadata shape only, synthetic text).
+    body = _error_body(code=400, status="INVALID_ARGUMENT", message=f"invalid value: {LEAK}", details=[
+        {"@type": BAD_REQUEST, "fieldViolations": [
+            {"field": "generation_config.response_format.text.mime_type", "description": f"bad: {LEAK}"}]},
+    ])
+    error, _ = _rejected(body)
+    assert error.diagnosis == ProviderErrorDiagnosis(
+        "400", "INVALID_ARGUMENT", "-", ("generation_config.response_format.text.mime_type",))
+    _assert_no_leak(error)
