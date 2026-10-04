@@ -1,0 +1,123 @@
+# Architecture — Sentinel Vision AI
+
+Verified against source at commit `36ffa20` (2026-10-04). "Runtime" means wired in
+`backend/app/services/runtime.py` and used by the running app; "core only" means
+built and unit-tested in isolation, not wired; "planned" means a draft exec plan.
+
+## 1. Shape
+
+Single FastAPI process, exactly one Uvicorn worker. All state is in memory and
+session-scoped; there is no database. A *session* starts when video starts and ends
+on Stop, EOF, error or a new start; every pipeline service drops results from an
+old session.
+
+```
+VideoService (capture thread, JPEG once, MJPEG slot)            video_service.py
+ ├─ EventFrameBuffer.offer(BufferedFrame)                        event_frame_buffer.py
+ ├─ DetectorService.offer(packet)  [YOLO worker, latest-frame-wins, CUDA gate]
+ │    ├─ DomainService.observe        3-of-5 motorcycle → PARKING_MOTORCYCLE lock
+ │    ├─ TrackerService.observe       anonymous person/motorcycle tracks
+ │    └─ ParkingCandidateTrigger.observe → candidate episodes
+ ├─ SceneDomainClassifier.offer(packet) [5 early samples → CLIP, CUDA gate]
+ │    └─ DomainService.apply_scene_decision (first lock wins; may lock UNKNOWN)
+ └─ EvaluationWorker (start/end_session from VideoService; daemon thread)
+      claim → EvaluationBudget.try_reserve → FrameSelectionPlan (strategy by domain)
+      → EventFrameBuffer.wait_for_bundle → atomic handoff (quota) → dispatcher
+      → result accepted only through accept_callback → EvaluationRecord
+      → AudioAlertGate.offer (parking domain, CRITICAL only)
+```
+
+## 2. Components
+
+| Component | Files | Status |
+|---|---|---|
+| Video input, upload guards, MJPEG | `services/video_service.py`, `api/video.py` | runtime |
+| Detection (YOLO `yolo26s.pt`, COCO 80 classes) | `services/detector_service.py` | runtime |
+| Tracking (IoU + centre, anonymous IDs, 1.5 s loss tolerance) | `services/tracker_service.py` | runtime |
+| Domain lock (YOLO fast path + CLIP) | `services/domain_service.py`, `scene_domain_classifier.py`, `clip_scene_runner.py` | runtime |
+| Parking candidate trigger (person ↔ motorcycle episodes) | `services/parking_candidate_trigger.py` | runtime |
+| Event frame buffer (6 s / 240 frames / 32 MiB JPEG) | `services/event_frame_buffer.py` | runtime |
+| Evaluation budget (1 pending, 10 s interval, 2 per 60 s) | `services/evaluation_budget.py` | runtime |
+| Evaluation worker (states, deadlines, per-process quota) | `services/evaluation_worker.py` | runtime |
+| Gemini direct transport (REST `generateContent`) | `services/gemini_evaluation_client.py` | runtime when `SENTINEL_EVALUATION_TRANSPORT=gemini` |
+| Langflow Webhook transport + callback | `services/langflow_evaluation_client.py`, `api/evaluation.py` | runtime when transport `langflow` (default) |
+| Current evaluation view | `GET /api/evaluation/current` | runtime |
+| Local audio alert gate | `services/audio_alert_service.py` | runtime, off by default |
+| Retail trigger (ROI zones) + retail plan/strategy | `services/retail_candidate_trigger.py`, `models/event_frame.py` | core only (no router/runtime) |
+| Private parking trigger (T1) | `services/private_parking_trigger.py`, `models/private_parking.py`, `services/private_parking_authorization.py` | core only |
+| Private parking evidence sampler (T2) | `services/private_parking_evidence_sampler.py`, `models/private_parking_evidence.py` | core only |
+| Private parking integration (T3) | — | planned, draft: [`docs/exec-plans/active/t3-private-parking-integration.md`](docs/exec-plans/active/t3-private-parking-integration.md) |
+| Frontend dashboard | `frontend/src/` | runtime; see [`docs/FRONTEND.md`](docs/FRONTEND.md) |
+
+## 3. Domains and modes
+
+`DomainName`: `UNKNOWN`, `PARKING_MOTORCYCLE`, `RETAIL_STORE`. The domain is locked
+once per session. **Private parking is a mode of `PARKING_MOTORCYCLE`**, not a fourth
+domain; it is core only today. A cashier domain does not exist.
+
+## 4. Contracts that matter
+
+- **Sessions**: every pipeline service implements `start_session/end_session/close`
+  and ignores input from another session. `VideoService` drives the lifecycle.
+- **Two timelines**: observation timestamps (`FramePacket.ts`, monotonic) order frames,
+  tracks and markers; injected control clocks drive TTLs and deadlines so they expire
+  without new frames.
+- **Evaluation handoff**: the dispatch is committed at one atomic handoff under the
+  worker lock (session re-check, quota increment, pending record). Stop before handoff
+  means no dispatch; after handoff the request may still reach the transport, but a
+  late ACK, error or result can never revive state, publish or reach audio. No retry,
+  no fallback between transports, spent quota is never returned.
+- **Single acceptance path**: the Langflow HTTP callback and the Gemini direct result
+  both go through `EvaluationWorker.accept_callback`; event/session IDs come from the
+  backend, never from the model; `ThreatAssessment.validate()` enforces score bands
+  (0–34 NORMAL, 35–64 WARNING, 65–100 CRITICAL).
+- **Bundles**: exactly five JPEG frames, strictly increasing timestamps and sequence
+  numbers, each within the plan's deviation (`EvaluationWorker._valid_bundle`).
+  Parking offsets are −2, −1, −0.4, 0, +0.4 s. Private-parking evidence plans carry
+  the sealed frames' actual offsets with a 1e-6 s tolerance (exact 0.0 fails on
+  float rounding).
+- **Audio**: only an ACCEPTED parking-domain CRITICAL result is offered to
+  `AudioAlertGate`. The gate plays at most one clip per event, CRITICAL only,
+  first-wins with cooldown; Stop/new session cancels; a failed device stop disables
+  audio until restart. An offer is not proof a sound was heard.
+
+### Local access warning vs CRITICAL assessment (private mode, core only)
+
+These are two different signals and must stay separate:
+- **Local access warning**: a rule outcome of the private-parking trigger — an
+  episode that crossed the entry line without authorization was confirmed close to a
+  parked motorcycle. It is issued by the local rule without waiting for a model or
+  evidence, and is not a threat score. Its end-to-end latency (target under one
+  second) is unverified; the private parking → speaker path is not wired.
+- **CRITICAL assessment**: a validated model result for the same event, possibly
+  seconds later, possibly NORMAL. It never upgrades or replaces the warning, and the
+  warning never fabricates a CRITICAL.
+They share one `event_id` so audio deduplication plays at most once. Wiring is T3 (draft).
+
+## 5. API
+
+`GET /api/health` · `POST /api/video/webcam/start` · `POST /api/video/upload`
+(MP4/WebM, ≤ 200 MB) · `POST /api/video/stop` · `GET /api/video/status` ·
+`GET /api/video/stream` (MJPEG) · `GET /api/detections/latest` (204 = none) ·
+`GET /api/domain/current` · `GET /api/evaluation/current` ·
+`POST /api/evaluation/callback` (Langflow transport only; static shared token header,
+constant-time comparison, 16 KiB body limit). CORS allows only the local Vite origin.
+No other endpoint is authenticated: the API is meant for `127.0.0.1`.
+
+## 6. Configuration
+
+Environment variables only (nothing loads `.env`); see `backend/.env.example`.
+Invalid values disable the affected feature and log a generic warning without the
+value. Key switches: `SENTINEL_EVALUATION_TRANSPORT` (`langflow` default | `gemini`),
+`SENTINEL_GEMINI_*`, `SENTINEL_LANGFLOW_*`, `SENTINEL_CALLBACK_TOKEN`,
+`SENTINEL_EVALUATION_CALLBACK_TIMEOUT_SECONDS` (45), `SENTINEL_EVALUATION_MAX_DISPATCHES`,
+`SENTINEL_AUDIO_ALERT_*`, `SENTINEL_CLIP_MODEL_*`, `SENTINEL_VIDEO_STARTUP_TIMING_ENABLED`.
+
+## 7. Threads and locks
+
+Capture thread (never blocks; only `offer`), detector worker, CLIP worker, evaluation
+worker, audio device thread, FastAPI threadpool. One shared CUDA lock for YOLO and CLIP.
+Lock order flows outward from the evaluation worker: while holding its state lock it
+calls the trigger, budget, frame buffer (snapshots/completion) and the audio gate;
+none of those ever call back into the worker. The audio device (PlaySound) and all
+HTTP run outside every lock. Shutdown order: `runtime.shutdown_services`.
