@@ -46,6 +46,30 @@ actual offsets (deviation tolerance ``EVIDENCE_OFFSET_EPSILON`` for float
 rounding). ``wait_for_bundle`` returns READY only for a plan that matches the
 sealed evidence exactly; it never waits. Missing/expired private evidence must
 not fall back to the legacy parking buffer on T3.
+
+Tokens and markers (T3a1)
+-------------------------
+Sealed evidence and failure records store the candidate token given to
+``seal``; ``release``, ``plan_for`` and ``failure_for`` act only when the given
+token equals the stored one (``None`` matches only ``None``), so a late call with
+an old token is a counted no-op even if an event id is reused. An explicit
+release leaves a bounded ``RELEASED`` tombstone. ``plan_for_candidate`` maps the
+store to a plan or an explicit ``PlanUnavailable`` (FAILED / EXPIRED / RELEASED /
+MISSING). ``apply_markers`` applies the trigger's marker batches in sequence
+order per trigger generation; older batches/views are ignored and counted.
+Working samples are kept only for ENTERED episodes and for triggered episodes
+still waiting for their seal; sealed evidence follows its token and TTL.
+
+Episode instances: marker-managed episodes are keyed by their episode instance
+(unique in the process), not by ``episode_id`` (which may repeat, even within one
+generation). Every marker, view row and token names the instance, and the pair
+(episode_id, instance) must match before anything changes; a token can only seal
+the instance it was issued for. Untokened T2 calls address untokened episodes by
+id and never reach a marker-managed one.
+
+Expiry runs inside every public method; there is no timer thread. Without
+calls (no frames, no markers) bytes stay held until the next call, Stop or
+close, always within ``max_total_bytes``.
 """
 
 from __future__ import annotations
@@ -58,9 +82,11 @@ import threading
 import time
 
 from app.models.domain import DomainName
+from app.models.evaluation import PlanUnavailable, PlanUnavailableReason
 from app.models.event_frame import (
     BufferedFrame, BundleDecision, BundleStatus, EventFrameBundle, FrameSelectionPlan, SelectedFrame,
 )
+from app.models.private_parking import CandidateToken, EpisodeMarker, EvidenceView, MarkerBatch, MarkerKind
 from app.models.private_parking_evidence import (
     EVIDENCE_FRAME_COUNT, EVIDENCE_OFFSET_EPSILON, EvidenceFailure, EvidenceFrame, EvidenceRole,
     EvidenceSamplerLimits, SamplerDiagnostic, SealedEvidence, SealResult,
@@ -72,7 +98,15 @@ _COUNTERS = (
     "episodes_ended", "episodes_aged_out", "crossing_anchor_missing", "seals_succeeded",
     "seals_failed", "sealed_rejected_capacity", "sealed_expired", "sealed_released",
     "failure_records_evicted", "bundles_served", "bundles_refused", "stale_calls_ignored",
+    "token_mismatches", "markers_applied", "markers_stale", "views_applied", "views_stale",
+    "generations_replaced", "episodes_cancelled_resync", "episodes_begun_resync",
+    "sealed_released_marker", "sealed_released_resync", "plans_unavailable", "stale_seals_rejected",
+    "seals_unverified", "instance_mismatches",
 )
+_FAILURE_TO_PLAN = {
+    EvidenceFailure.EXPIRED: PlanUnavailableReason.EXPIRED,
+    EvidenceFailure.RELEASED: PlanUnavailableReason.RELEASED,
+}
 
 
 def _finite(value: object) -> bool:
@@ -91,12 +125,15 @@ class _Episode:
     stride: int = 1
     seen: int = 0
     latest: BufferedFrame | None = None
+    generation: int | None = None        # trigger generation of its markers (None: untokened T2 call)
+    instance: int | None = None          # episode instance (marker-managed); dict key when set
 
 
 @dataclasses.dataclass
 class _Sealed:
     evidence: SealedEvidence
     deadline: float
+    token: object | None = None          # candidate token given to seal (None: untokened T2 call)
 
 
 class EpisodeEvidenceSampler:
@@ -123,9 +160,13 @@ class EpisodeEvidenceSampler:
         self._held: dict[int, list] = {}          # seq -> [frame, refcount]
         self._held_bytes = 0
         self._preroll: deque[BufferedFrame] = deque()
-        self._episodes: dict[str, _Episode] = {}
+        # key: episode instance (int) for marker-managed episodes, episode_id (str) for untokened ones
+        self._episodes: dict[object, _Episode] = {}
         self._sealed: OrderedDict[str, _Sealed] = OrderedDict()
-        self._failures: OrderedDict[str, EvidenceFailure] = OrderedDict()
+        # event_id -> (failure, token); bounded by max_failure_records (oldest evicted, counted)
+        self._failures: OrderedDict[str, tuple[EvidenceFailure, object | None]] = OrderedDict()
+        self._marker_generation: int | None = None
+        self._applied_seq = 0
         self._last_seq: int | None = None
         self._last_ts: float | None = None
         self._counts = dict.fromkeys(_COUNTERS, 0)
@@ -214,6 +255,10 @@ class EpisodeEvidenceSampler:
 
     # ── frames ───────────────────────────────────────────────────────────────
 
+    def offer(self, frame: BufferedFrame) -> bool:
+        """Frame-sink alias of ``offer_frame`` (the method name VideoService calls)."""
+        return self.offer_frame(frame)
+
     def offer_frame(self, frame: BufferedFrame) -> bool:
         with self._lock:
             self._expire_locked(self._clock())
@@ -301,21 +346,26 @@ class EpisodeEvidenceSampler:
             self._expire_locked(now)
             if not self._active(session_id):
                 return False
-            if not isinstance(episode_id, str) or not episode_id or not _finite(crossed_at):
-                self._counts["stale_calls_ignored"] += 1
-                return False
-            if episode_id in self._episodes:
-                self._counts["episodes_rejected_duplicate"] += 1
-                return False
-            if len(self._episodes) >= self._limits.max_episodes:
-                self._counts["episodes_rejected_capacity"] += 1
-                return False
-            episode = _Episode(episode_id, float(crossed_at), now)
-            self._episodes[episode_id] = episode
-            self._counts["episodes_started"] += 1
-            for frame in tuple(self._preroll):           # back-fill from the pre-roll, in order
-                self._observe_episode_locked(episode, frame)
-            return True
+            return self._begin_locked(episode_id, crossed_at, now)
+
+    def _begin_locked(self, episode_id: object, crossed_at: object, now: float,
+                      generation: int | None = None, instance: int | None = None) -> bool:
+        if not isinstance(episode_id, str) or not episode_id or not _finite(crossed_at):
+            self._counts["stale_calls_ignored"] += 1
+            return False
+        key = instance if instance is not None else episode_id
+        if key in self._episodes:
+            self._counts["episodes_rejected_duplicate"] += 1
+            return False
+        if len(self._episodes) >= self._limits.max_episodes:
+            self._counts["episodes_rejected_capacity"] += 1
+            return False
+        episode = _Episode(episode_id, float(crossed_at), now, generation=generation, instance=instance)
+        self._episodes[key] = episode
+        self._counts["episodes_started"] += 1
+        for frame in tuple(self._preroll):           # back-fill from the pre-roll, in order
+            self._observe_episode_locked(episode, frame)
+        return True
 
     def cancel_episode(self, session_id: str, episode_id: str) -> bool:
         """E.g. authorized before any trigger: evidence is discarded."""
@@ -325,34 +375,80 @@ class EpisodeEvidenceSampler:
         return self._remove_episode(session_id, episode_id, "episodes_ended")
 
     def _remove_episode(self, session_id: str, episode_id: str, counter: str) -> bool:
+        """Public (untokened, T2) removal: never touches a marker-managed episode, which
+        only ``apply_markers`` of its own generation may change."""
         with self._lock:
             self._expire_locked(self._clock())
             if not self._active(session_id):
                 return False
-            episode = self._episodes.pop(episode_id, None)
-            if episode is None:
+            episode = self._episodes.get(episode_id)       # str key: untokened episodes only
+            if episode is not None and episode.generation is not None:
+                self._counts["stale_calls_ignored"] += 1
                 return False
-            self._release_episode(episode)
-            self._counts[counter] += 1
-            return True
+            return self._remove_locked(episode_id, counter)
 
-    def seal(self, session_id: str, episode_id: str, event_id: str, triggered_at: float) -> SealResult:
+    def _remove_locked(self, key: object, counter: str) -> bool:
+        episode = self._episodes.pop(key, None)
+        if episode is None:
+            return False
+        self._release_episode(episode)
+        self._counts[counter] += 1
+        return True
+
+    def _remove_instance_locked(self, episode_id: str, instance: object, counter: str) -> bool:
+        """Remove one marker-managed instance, only if the (episode_id, instance) pair matches."""
+        episode = self._episodes.get(instance) if type(instance) is int else None
+        if episode is None or episode.episode_id != episode_id:
+            if episode is not None:
+                self._counts["instance_mismatches"] += 1
+            return False
+        return self._remove_locked(instance, counter)
+
+    def seal(self, session_id: str, episode_id: str, event_id: str, triggered_at: float, *,
+             token: object | None = None) -> SealResult:
+        """Seal the episode's evidence for ``event_id`` under ``token`` (stored; every
+        later release/plan/failure lookup must present the same token).
+
+        Identity is validated BEFORE anything changes: a token must belong to the
+        current trigger generation and to the episode's generation (an untokened call
+        only matches an untokened episode). A stale call returns STALE_TOKEN and
+        changes no episode, JPEG reference, counter of ownership or record."""
         with self._lock:
             now = self._clock()
             self._expire_locked(now)
             if not self._active(session_id) or not isinstance(event_id, str) or not event_id \
                     or not _finite(triggered_at) or event_id in self._sealed or event_id in self._failures:
                 return SealResult(None, EvidenceFailure.UNKNOWN_EPISODE)
-            episode = self._episodes.pop(episode_id, None)
+            generation = getattr(token, "session_generation", None) if token is not None else None
+            if token is not None and (not isinstance(token, CandidateToken)
+                                      or generation != self._marker_generation
+                                      or type(token.episode_instance) is not int):
+                self._counts["stale_seals_rejected"] += 1
+                return SealResult(None, EvidenceFailure.STALE_TOKEN)
+            key = token.episode_instance if token is not None else episode_id
+            episode = self._episodes.get(key)
+            if episode is not None and (episode.episode_id != episode_id or episode.generation != generation):
+                self._counts["stale_seals_rejected"] += 1          # token issued for another instance
+                return SealResult(None, EvidenceFailure.STALE_TOKEN)
+            if episode is None and any(other.episode_id == episode_id for other in self._episodes.values()):
+                # The id now belongs to another instance (or to the other call kind): refuse, touch nothing.
+                self._counts["stale_seals_rejected"] += 1
+                return SealResult(None, EvidenceFailure.STALE_TOKEN)
             if episode is None:
-                return self._record_failure_locked(event_id, EvidenceFailure.UNKNOWN_EPISODE)
+                if token is not None:
+                    # Its own instance is gone; the pair cannot be verified, so nothing is
+                    # recorded (a record could block the rightful event) and nothing else is touched.
+                    self._counts["seals_unverified"] += 1
+                    return SealResult(None, EvidenceFailure.UNKNOWN_EPISODE)
+                return self._record_failure_locked(event_id, EvidenceFailure.UNKNOWN_EPISODE, token)
+            del self._episodes[key]
             try:
                 failure, frames = self._select_locked(episode, float(triggered_at))
                 if failure is None and len(self._sealed) >= self._limits.max_sealed:
                     failure = EvidenceFailure.CAPACITY
                     self._counts["sealed_rejected_capacity"] += 1
                 if failure is not None:
-                    return self._record_failure_locked(event_id, failure)
+                    return self._record_failure_locked(event_id, failure, token)
                 evidence = SealedEvidence(event_id, session_id, episode_id, float(triggered_at), tuple(
                     EvidenceFrame(role, frame.source_frame_seq, frame.source_timestamp,
                                   frame.source_timestamp - float(triggered_at), frame.frame_width,
@@ -360,7 +456,7 @@ class EpisodeEvidenceSampler:
                     for role, frame in frames))
                 for _role, frame in frames:
                     self._held[frame.source_frame_seq][1] += 1     # sealed ownership (already held)
-                self._sealed[event_id] = _Sealed(evidence, now + self._limits.sealed_ttl_seconds)
+                self._sealed[event_id] = _Sealed(evidence, now + self._limits.sealed_ttl_seconds, token)
                 self._counts["seals_succeeded"] += 1
                 return SealResult(evidence, None)
             finally:
@@ -400,13 +496,17 @@ class EpisodeEvidenceSampler:
         return None, ((EvidenceRole.CROSSING, crossing), *((EvidenceRole.JOURNEY, f) for f in chosen),
                       (EvidenceRole.APPROACH, approach))
 
-    def _record_failure_locked(self, event_id: str, failure: EvidenceFailure) -> SealResult:
+    def _record_failure_locked(self, event_id: str, failure: EvidenceFailure, token: object | None) -> SealResult:
         self._counts["seals_failed"] += 1
-        self._failures[event_id] = failure
+        self._tombstone_locked(event_id, failure, token)
+        return SealResult(None, failure)
+
+    def _tombstone_locked(self, event_id: str, failure: EvidenceFailure, token: object | None) -> None:
+        self._failures[event_id] = (failure, token)
+        self._failures.move_to_end(event_id)
         while len(self._failures) > self._limits.max_failure_records:
             self._failures.popitem(last=False)
             self._counts["failure_records_evicted"] += 1
-        return SealResult(None, failure)
 
     # ── control timeline ─────────────────────────────────────────────────────
 
@@ -420,10 +520,7 @@ class EpisodeEvidenceSampler:
             if now >= sealed.deadline:
                 self._release_sealed_locked(event_id)
                 self._counts["sealed_expired"] += 1
-                self._failures[event_id] = EvidenceFailure.EXPIRED
-                while len(self._failures) > self._limits.max_failure_records:
-                    self._failures.popitem(last=False)
-                    self._counts["failure_records_evicted"] += 1
+                self._tombstone_locked(event_id, EvidenceFailure.EXPIRED, sealed.token)
 
     def _release_sealed_locked(self, event_id: str) -> None:
         sealed = self._sealed.pop(event_id, None)
@@ -434,28 +531,80 @@ class EpisodeEvidenceSampler:
             if entry is not None:
                 self._drop(entry[0])
 
-    def release(self, event_id: str) -> bool:
+    def _release_with_tombstone_locked(self, event_id: str, counter: str) -> None:
+        sealed = self._sealed[event_id]
+        self._release_sealed_locked(event_id)
+        self._counts[counter] += 1
+        self._tombstone_locked(event_id, EvidenceFailure.RELEASED, sealed.token)
+
+    def _release_token_locked(self, token: object, counter: str) -> bool:
+        for event_id, sealed in list(self._sealed.items()):
+            if token is not None and sealed.token == token:
+                self._release_with_tombstone_locked(event_id, counter)
+                return True
+        return False
+
+    def release(self, event_id: str, *, token: object | None = None) -> bool:
+        """Release sealed evidence; only the token given to ``seal`` may do it."""
         with self._lock:
-            if event_id not in self._sealed:
+            sealed = self._sealed.get(event_id)
+            if sealed is None:
                 return False
-            self._release_sealed_locked(event_id)
-            self._counts["sealed_released"] += 1
+            if sealed.token != token:
+                self._counts["token_mismatches"] += 1
+                return False
+            self._release_with_tombstone_locked(event_id, "sealed_released")
             return True
 
     # ── plans and bundles ────────────────────────────────────────────────────
 
-    def plan_for(self, event_id: str) -> FrameSelectionPlan | None:
+    @staticmethod
+    def _plan_locked(evidence: SealedEvidence) -> FrameSelectionPlan:
+        return FrameSelectionPlan(
+            evidence.event_id, evidence.source_session_id, DomainName.PARKING_MOTORCYCLE,
+            evidence.triggered_at, tuple(frame.actual_offset_seconds for frame in evidence.frames),
+            EVIDENCE_OFFSET_EPSILON, EVIDENCE_FRAME_COUNT)
+
+    def plan_for(self, event_id: str, *, token: object | None = None) -> FrameSelectionPlan | None:
         """Evidence-derived plan: offsets are the sealed frames' actual offsets."""
         with self._lock:
             self._expire_locked(self._clock())
             sealed = self._sealed.get(event_id)
             if sealed is None:
                 return None
-            evidence = sealed.evidence
-            return FrameSelectionPlan(
-                evidence.event_id, evidence.source_session_id, DomainName.PARKING_MOTORCYCLE,
-                evidence.triggered_at, tuple(frame.actual_offset_seconds for frame in evidence.frames),
-                EVIDENCE_OFFSET_EPSILON, EVIDENCE_FRAME_COUNT)
+            if sealed.token != token:
+                self._counts["token_mismatches"] += 1
+                return None
+            return self._plan_locked(sealed.evidence)
+
+    def plan_for_candidate(self, candidate: object) -> FrameSelectionPlan | PlanUnavailable:
+        """Worker strategy for private candidates: a plan, or why there is none.
+
+        Only what this store records is reported: FAILED (seal failure, detail =
+        the evidence failure), EXPIRED (sealed TTL), RELEASED (explicit release,
+        marker or resync), otherwise MISSING (never sealed here, record evicted,
+        session reset, or a record under another token).
+        """
+        event_id = getattr(candidate, "event_id", None)
+        token = getattr(candidate, "token", None)
+        session_id = getattr(candidate, "source_session_id", None)
+        triggered_at = getattr(candidate, "triggered_at", None)
+        with self._lock:
+            self._expire_locked(self._clock())
+            sealed = self._sealed.get(event_id) if isinstance(event_id, str) else None
+            if (sealed is not None and sealed.token == token
+                    and session_id == self._session_id == sealed.evidence.source_session_id
+                    and triggered_at == sealed.evidence.triggered_at):
+                return self._plan_locked(sealed.evidence)
+            self._counts["plans_unavailable"] += 1
+            record = self._failures.get(event_id) if isinstance(event_id, str) else None
+            if record is not None and record[1] == token and session_id == self._session_id:
+                failure = record[0]
+                reason = _FAILURE_TO_PLAN.get(failure)
+                if reason is not None:
+                    return PlanUnavailable(reason)
+                return PlanUnavailable(PlanUnavailableReason.FAILED, failure.value)
+            return PlanUnavailable(PlanUnavailableReason.MISSING)
 
     def wait_for_bundle(self, plan: FrameSelectionPlan, timeout_seconds: float = 0.0) -> BundleDecision:
         """Never waits: sealed evidence is complete or the event has no bundle."""
@@ -494,14 +643,110 @@ class EpisodeEvidenceSampler:
                 evidence.event_id, evidence.source_session_id, DomainName.PARKING_MOTORCYCLE,
                 evidence.triggered_at, tuple(frames), evidence.total_jpeg_bytes))
 
-    def failure_for(self, event_id: str) -> EvidenceFailure | None:
+    def failure_for(self, event_id: str, *, token: object | None = None) -> EvidenceFailure | None:
         with self._lock:
             self._expire_locked(self._clock())
-            return self._failures.get(event_id)
+            record = self._failures.get(event_id)
+            if record is None:
+                return None
+            if record[1] != token:
+                self._counts["token_mismatches"] += 1
+                return None
+            return record[0]
+
+    # ── trigger markers (T3a1) ───────────────────────────────────────────────
+
+    def apply_markers(self, batch: MarkerBatch) -> bool:
+        """Apply one ``PrivateParkingTrigger.pop_markers()`` batch atomically.
+
+        Ordering: a batch from an older trigger generation, a marker with
+        ``seq <= applied_seq`` and a view with ``upto_seq <= applied_seq`` are
+        ignored (counted), so an old transition never overwrites a newer one.
+        A newer generation within the same sampler session (trigger restarted)
+        discards working samples and the old generation's tokened evidence.
+        """
+        with self._lock:
+            now = self._clock()
+            self._expire_locked(now)
+            if not isinstance(batch, MarkerBatch) or not self._active(batch.session_id) \
+                    or type(batch.session_generation) is not int or type(batch.upto_seq) is not int:
+                return False
+            generation = batch.session_generation
+            if self._marker_generation is not None and generation < self._marker_generation:
+                self._counts["markers_stale"] += len(batch.markers) + (batch.view is not None)
+                return False
+            if self._marker_generation is None or generation > self._marker_generation:
+                if self._marker_generation is not None:
+                    self._counts["generations_replaced"] += 1
+                    for key, episode in list(self._episodes.items()):
+                        if episode.generation is not None:     # untokened episodes are not marker-managed
+                            self._remove_locked(key, "episodes_cancelled_resync")
+                    for event_id, sealed in list(self._sealed.items()):
+                        if getattr(sealed.token, "session_generation", generation) < generation:
+                            self._release_with_tombstone_locked(event_id, "sealed_released_resync")
+                self._marker_generation, self._applied_seq = generation, 0
+            if batch.view is not None:
+                if batch.upto_seq <= self._applied_seq:
+                    self._counts["views_stale"] += 1
+                    return False
+                self._reconcile_locked(batch.view, now)
+                self._applied_seq = batch.upto_seq
+                self._counts["views_applied"] += 1
+                return True
+            for marker in batch.markers:
+                if not isinstance(marker, EpisodeMarker) or marker.seq <= self._applied_seq:
+                    self._counts["markers_stale"] += 1
+                    continue
+                self._apply_marker_locked(marker, now)
+                self._applied_seq = marker.seq
+                self._counts["markers_applied"] += 1
+            self._applied_seq = max(self._applied_seq, batch.upto_seq)
+            return True
+
+    def _apply_marker_locked(self, marker: EpisodeMarker, now: float) -> None:
+        kind = marker.kind
+        instance = marker.episode_instance
+        if kind is MarkerKind.EPISODE_ENTERED:
+            if type(instance) is not int:
+                self._counts["markers_stale"] += 1         # marker-managed episodes need an instance
+            elif instance not in self._episodes:
+                self._begin_locked(marker.episode_id, marker.crossed_in_at, now, self._marker_generation,
+                                   instance)
+        elif kind is MarkerKind.EPISODE_AUTHORIZED:
+            self._remove_instance_locked(marker.episode_id, instance, "episodes_cancelled")
+        elif kind is MarkerKind.EPISODE_ENDED:
+            if not marker.keep_samples:            # a candidate still waiting for its seal keeps them
+                self._remove_instance_locked(marker.episode_id, instance, "episodes_ended")
+        elif kind is MarkerKind.CANDIDATE_CLOSED:   # closed without publication: nothing will need it
+            self._remove_instance_locked(marker.episode_id, instance, "episodes_cancelled")
+            self._release_token_locked(marker.token, "sealed_released_marker")
+        elif kind in (MarkerKind.CANDIDATE_EXPIRED, MarkerKind.CANDIDATE_FINISHED):
+            self._release_token_locked(marker.token, "sealed_released_marker")
+        # EPISODE_TRIGGERED: no change; the episode waits for its seal
+
+    def _reconcile_locked(self, view: EvidenceView, now: float) -> None:
+        entered = {instance: (episode_id, crossed_in_at)
+                   for episode_id, instance, _revision, crossed_in_at in view.entered if type(instance) is int}
+        keep = {instance: episode_id for instance, (episode_id, _crossed) in entered.items()}
+        for episode_id, token in view.preparing:
+            if isinstance(token, CandidateToken) and type(token.episode_instance) is int:
+                keep[token.episode_instance] = episode_id
+        for key, episode in list(self._episodes.items()):
+            if episode.generation is None:             # untokened episodes are not marker-managed
+                continue
+            if keep.get(key) != episode.episode_id:    # AUTHORIZED, ENDED, unknown or another instance
+                self._remove_locked(key, "episodes_cancelled_resync")
+        for instance, (episode_id, crossed_in_at) in entered.items():
+            if instance not in self._episodes and self._begin_locked(episode_id, crossed_in_at, now,
+                                                                     self._marker_generation, instance):
+                self._counts["episodes_begun_resync"] += 1
+        for event_id, sealed in list(self._sealed.items()):
+            if sealed.token is not None and sealed.token not in view.live_tokens:
+                self._release_with_tombstone_locked(event_id, "sealed_released_resync")
 
     def get_snapshot(self) -> SamplerDiagnostic:
         with self._lock:
             self._expire_locked(self._clock())
             return SamplerDiagnostic(self._session_id, len(self._episodes), len(self._sealed),
                                      len(self._failures), len(self._held), self._held_bytes,
-                                     tuple(self._counts.items()))
+                                     tuple(self._counts.items()), self._applied_seq)

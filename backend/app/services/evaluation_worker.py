@@ -16,7 +16,7 @@ from app.models.domain import DomainName
 from app.models.evaluation import (
     CallbackDisposition, EvaluationCallback, EvaluationCurrentView, EvaluationFailure,
     EvaluationLatestView, EvaluationRecord, EvaluationRequest, EvaluationWorkerState,
-    ThreatAssessment, WorkerSnapshot,
+    PlanUnavailable, PlanUnavailableReason, ThreatAssessment, WorkerSnapshot,
 )
 from app.models.event_frame import (
     BundleStatus, EventFrameBundle, FrameSelectionPlan, make_parking_frame_selection_plan,
@@ -55,6 +55,9 @@ class LangflowDispatcher(Protocol):
 
 
 FrameSelectionPlanFactory = Callable[[str, str, float], FrameSelectionPlan]
+# Candidate-aware strategy (e.g. private parking): receives the claimed candidate and
+# returns an evidence-derived plan or an explicit PlanUnavailable (never a guess).
+CandidatePlanFactory = Callable[["CandidateEvent"], "FrameSelectionPlan | PlanUnavailable"]
 
 
 _SHORT_ID = re.compile(r"[A-Za-z0-9-]{1,8}")
@@ -139,6 +142,11 @@ class CandidateTrigger(Protocol):
 
     def get_snapshot(self) -> CandidateTriggerSnapshot: ...
 
+    # Identity extension (T3a1): when a claimed candidate carries a ``token``, the
+    # worker calls ``complete/fail(event_id, now, token=token)`` and also requires
+    # ``get_snapshot().pending_token == token``. Candidates without a token (legacy
+    # parking, retail) keep the calls above unchanged.
+
 
 class AudioGate(Protocol):
     """Bounded internal control gate, updated INSIDE the worker state lock.
@@ -166,6 +174,11 @@ class _PendingEvaluation:
     deadline: float
     frame_source_sequences: tuple[int, ...]
     client_name: str
+    candidate_token: object | None = None     # identity of the claimed candidate, if it has one
+
+
+def _candidate_token(event: object) -> object | None:
+    return getattr(event, "token", None)
 
 
 class EvaluationWorker:
@@ -181,6 +194,7 @@ class EvaluationWorker:
         enabled: bool = True,
         max_dispatches: int | None = None,
         audio_gate: AudioGate | None = None,
+        candidate_strategies: Mapping[DomainName, CandidatePlanFactory] | None = None,
     ) -> None:
         if max_dispatches is not None and (
                 type(max_dispatches) is not int or not 1 <= max_dispatches <= MAX_DISPATCHES_LIMIT):
@@ -201,6 +215,9 @@ class EvaluationWorker:
             DomainName.PARKING_MOTORCYCLE: make_parking_frame_selection_plan,
             DomainName.RETAIL_STORE: make_retail_frame_selection_plan,
         }
+        # A candidate strategy takes precedence over the legacy factory for its domain.
+        self._candidate_strategies = dict(candidate_strategies) if candidate_strategies is not None else {}
+        self._plan_unavailable: Counter[PlanUnavailableReason] = Counter()
         self._bundle_timeout = bundle_timeout_seconds
         self._callback_timeout = callback_timeout_seconds
         self._state_lock = threading.RLock()
@@ -300,8 +317,19 @@ class EvaluationWorker:
                 return False
         snapshot = self._trigger.get_snapshot()
         return (snapshot.source_session_id == event.source_session_id
-                and snapshot.pending_event_id == event.event_id
+                and self._trigger_pending_is(snapshot, event.event_id, _candidate_token(event))
                 and self._buffer.get_snapshot().source_session_id == event.source_session_id)
+
+    @staticmethod
+    def _trigger_pending_is(snapshot: object, event_id: str, token: object | None) -> bool:
+        """The trigger's claimed candidate is this one: id, and token when there is one."""
+        if getattr(snapshot, "pending_event_id", None) != event_id:
+            return False
+        return token is None or getattr(snapshot, "pending_token", None) == token
+
+    def _trigger_finish(self, method: str, event_id: str, token: object | None, now: float) -> bool:
+        finish = getattr(self._trigger, method)
+        return finish(event_id, now) if token is None else finish(event_id, now, token=token)
 
     @staticmethod
     def _valid_bundle(bundle: EventFrameBundle, plan: FrameSelectionPlan) -> bool:
@@ -346,7 +374,7 @@ class EvaluationWorker:
                 self._record_failure(EvaluationFailure.CLIENT_ERROR)
         finally:
             try:
-                self._trigger.fail(pending.event_id, now)
+                self._trigger_finish("fail", pending.event_id, pending.candidate_token, now)
             except Exception:
                 self._record_failure(EvaluationFailure.CLIENT_ERROR)
         self._record_failure(category)
@@ -438,12 +466,31 @@ class EvaluationWorker:
                     return True
                 if self._session_id is None:
                     self._session_id = event.source_session_id
+            candidate_strategy = self._candidate_strategies.get(event.domain)
             strategy = self._strategies.get(event.domain)
-            if event.domain is DomainName.UNKNOWN or strategy is None:
+            if event.domain is DomainName.UNKNOWN or (candidate_strategy is None and strategy is None):
                 self._record_failure(EvaluationFailure.NO_STRATEGY)
                 return True
             if not self._current(event):
                 self._record_failure(EvaluationFailure.STALE_SESSION)
+                return True
+            # Plan BEFORE budget: a missing or invalid plan never reserves (or is
+            # rate-limited by) a budget grant. The first failing step is recorded;
+            # later steps do not run. Every early return releases the claim in finally.
+            if candidate_strategy is not None:
+                plan = candidate_strategy(event)
+            else:
+                plan = strategy(event.event_id, event.source_session_id, event.triggered_at)
+            if isinstance(plan, PlanUnavailable):
+                reason = (plan.reason if isinstance(plan.reason, PlanUnavailableReason)
+                          else PlanUnavailableReason.MISSING)
+                with self._state_lock:
+                    self._plan_unavailable[reason] += 1
+                self._record_failure(EvaluationFailure.EVIDENCE_UNAVAILABLE)
+                return True
+            if (not isinstance(plan, FrameSelectionPlan) or plan.domain is not event.domain
+                    or plan.event_id != event.event_id or plan.source_session_id != event.source_session_id):
+                self._record_failure(EvaluationFailure.BUNDLE_INVALID)
                 return True
             decision = self._budget.try_reserve(
                 event.event_id, event.source_session_id, event.domain, event.triggered_at, claim_at,
@@ -453,11 +500,6 @@ class EvaluationWorker:
                 return True
             reservation_id = decision.reservation_id
             assert reservation_id is not None
-            plan = strategy(event.event_id, event.source_session_id, event.triggered_at)
-            if (not isinstance(plan, FrameSelectionPlan) or plan.domain is not event.domain
-                    or plan.event_id != event.event_id or plan.source_session_id != event.source_session_id):
-                self._record_failure(EvaluationFailure.BUNDLE_INVALID)
-                return True
             bundle_decision = self._buffer.wait_for_bundle(plan, self._bundle_timeout)
             if bundle_decision.status is BundleStatus.WAITING_FOR_FUTURE_FRAME:
                 self._record_failure(EvaluationFailure.BUNDLE_TIMEOUT)
@@ -493,6 +535,7 @@ class EvaluationWorker:
                     reservation_id, requested_at, requested_at + self._callback_timeout,
                     tuple(frame.source_frame_seq for frame in request.frame_bundle.frames),
                     str(getattr(self._client, "name", type(self._client).__name__)),
+                    _candidate_token(event),
                 )
                 self._state = EvaluationWorkerState.DISPATCHING
                 handed_off = True
@@ -546,7 +589,7 @@ class EvaluationWorker:
                         self._record_failure(EvaluationFailure.CLIENT_ERROR)
                 if event is not None:
                     try:
-                        self._trigger.fail(event.event_id, self._clock())
+                        self._trigger_finish("fail", event.event_id, _candidate_token(event), self._clock())
                     except Exception:
                         self._record_failure(EvaluationFailure.CLIENT_ERROR)
                 with self._state_lock:
@@ -615,13 +658,14 @@ class EvaluationWorker:
             except (ValueError, TypeError, AttributeError):
                 return CallbackDisposition.REJECTED
             if (self._buffer.get_snapshot().source_session_id != pending.source_session_id
-                    or self._trigger.get_snapshot().pending_event_id != pending.event_id):
+                    or not self._trigger_pending_is(self._trigger.get_snapshot(), pending.event_id,
+                                                    pending.candidate_token)):
                 return CallbackDisposition.REJECTED
             if not self._budget.complete(pending.reservation_id, now):
                 self._fail_pending_locked(now, EvaluationWorkerState.FAILED,
                                           EvaluationFailure.STALE_SESSION)
                 return CallbackDisposition.REJECTED
-            if not self._trigger.complete(pending.event_id, now):
+            if not self._trigger_finish("complete", pending.event_id, pending.candidate_token, now):
                 self._pending = None
                 self._state = EvaluationWorkerState.FAILED
                 self._record_failure(EvaluationFailure.STALE_SESSION)
@@ -687,6 +731,7 @@ class EvaluationWorker:
                 self._last_failure, self._last_budget_denial_reason, self._state,
                 self._pending.deadline if self._pending is not None else None,
                 self._dispatch_attempts, self._max_dispatches,
+                tuple((reason, self._plan_unavailable[reason]) for reason in PlanUnavailableReason),
             )
 
     def close(self, timeout_seconds: float = 2.0) -> None:

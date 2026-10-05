@@ -36,14 +36,29 @@ depend on the state the failed update may have left half-applied.
 
 Exactly-once alerting per event comes from the worker publishing ACCEPTED once;
 the bounded recent-event set here is only an extra guard.
+
+Local access warning (T3a1, not wired yet): ``offer_local(event_id, session_id)``
+is a rule outcome, never an assessment. It plays a separate local clip (never the
+CRITICAL clip, and no fallback to it), uses the gate's current epoch and requires
+the gate's current session, and shares the single first-wins slot, cooldown,
+fault rules and recent-event set with ``offer``. The caller (detector thread)
+takes only ``gate._lock``, a leaf lock. An event is remembered only at GRANT
+("attempt spent even if it fails"): a local offer rejected before grant (no
+local clip, busy, cooldown, fault, stale) leaves the event eligible for one later
+CRITICAL grant, which is not a second playback; once a local grant exists, a
+CRITICAL for the same event is a duplicate even if the device start failed. A
+rejection stores nothing, so it never bypasses the cooldown or a fault for a
+later offer. At most one playback per event; never a guarantee that it sounds.
 """
 
 from __future__ import annotations
 
 from collections import OrderedDict
 import dataclasses
+import enum
 import logging
 import math
+import os
 import threading
 import time
 from collections.abc import Callable
@@ -98,10 +113,16 @@ def probe_wav_duration(path: Path) -> float | None:
     return duration if math.isfinite(duration) and duration > 0 else None
 
 
+class AlertClip(str, enum.Enum):
+    CRITICAL = "CRITICAL"             # validated CRITICAL assessment (worker)
+    LOCAL = "LOCAL"                   # local access warning (rule outcome, separate clip)
+
+
 @dataclasses.dataclass(frozen=True)
 class _Candidate:
     event_id: str
     epoch: int
+    clip: AlertClip = AlertClip.CRITICAL
 
 
 @dataclasses.dataclass
@@ -111,6 +132,7 @@ class _Attempt:
     epoch: int
     cancel: threading.Event
     granted_at: float
+    clip: AlertClip = AlertClip.CRITICAL
     state: str = "GRANTED"            # GRANTED -> STARTING -> IN_FLIGHT
     start_attempted: bool = False
     started_at: float | None = None
@@ -141,13 +163,24 @@ class AudioAlertSnapshot:
     dropped_cooldown: int
     dropped_busy: int
     dropped_device_fault: int
+    offered_local: int = 0
+    granted_local: int = 0
+    dropped_no_local_clip: int = 0
+    local_clip_configured: bool = False
+    attempt_clip: str | None = None
 
 
 _COUNTERS = (
     "offered_critical", "granted", "completed", "stopped", "cancelled_before_start",
     "failed", "stop_failures", "dropped_not_critical", "dropped_stale",
     "dropped_duplicate", "dropped_cooldown", "dropped_busy", "dropped_device_fault",
+    "offered_local", "granted_local", "dropped_no_local_clip",
 )
+
+
+def _same_path(first: str, second: str) -> bool:
+    """Lexical comparison only (no filesystem access)."""
+    return os.path.normcase(os.path.normpath(first)) == os.path.normcase(os.path.normpath(second))
 
 
 class AudioAlertGate:
@@ -158,6 +191,8 @@ class AudioAlertGate:
         cooldown_seconds: float = DEFAULT_COOLDOWN_SECONDS,
         clock: Callable[[], float] = time.monotonic,
         join_timeout_seconds: float = SHUTDOWN_JOIN_SECONDS,
+        local_wav_path: str | None = None,
+        local_duration_seconds: float | None = None,
     ) -> None:
         if not callable(getattr(device, "start", None)) or not callable(getattr(device, "stop", None)):
             raise TypeError("device must implement start(path) and stop()")
@@ -166,6 +201,17 @@ class AudioAlertGate:
         if (isinstance(duration_seconds, bool) or not isinstance(duration_seconds, (int, float))
                 or not math.isfinite(duration_seconds) or not 0 < duration_seconds <= MAX_ALERT_SECONDS):
             raise ValueError(f"duration_seconds must be in (0, {MAX_ALERT_SECONDS}]")
+        if (local_wav_path is None) != (local_duration_seconds is None):
+            raise ValueError("local_wav_path and local_duration_seconds must be given together")
+        if local_wav_path is not None:
+            if not isinstance(local_wav_path, str) or not local_wav_path:
+                raise ValueError("local_wav_path must be a non-empty string")
+            if _same_path(local_wav_path, wav_path):
+                raise ValueError("the local clip must differ from the CRITICAL clip")
+            if (isinstance(local_duration_seconds, bool) or not isinstance(local_duration_seconds, (int, float))
+                    or not math.isfinite(local_duration_seconds)
+                    or not 0 < local_duration_seconds <= MAX_ALERT_SECONDS):
+                raise ValueError(f"local_duration_seconds must be in (0, {MAX_ALERT_SECONDS}]")
         if (isinstance(cooldown_seconds, bool) or not isinstance(cooldown_seconds, (int, float))
                 or not math.isfinite(cooldown_seconds)
                 or not MIN_COOLDOWN_SECONDS <= cooldown_seconds <= MAX_COOLDOWN_SECONDS):
@@ -176,6 +222,8 @@ class AudioAlertGate:
         self._device = device
         self._path = wav_path
         self._duration = float(duration_seconds)
+        self._local_path = local_wav_path
+        self._local_duration = float(local_duration_seconds) if local_duration_seconds is not None else None
         self._cooldown = float(cooldown_seconds)
         self._clock = clock
         self._join_timeout = float(join_timeout_seconds)
@@ -247,6 +295,36 @@ class AudioAlertGate:
             self._slot = _Candidate(event_id, epoch)
             self._wake.notify_all()
 
+    def offer_local(self, event_id: str, session_id: str | None) -> None:
+        """Local access warning (rule outcome). Leaf lock only; never waits.
+
+        Bound to the gate's CURRENT epoch and session: a late offer from an old
+        session is stale, and a queued local slot is dropped at grant once the
+        lifecycle moved on. Shares slot, cooldown, fault and dedup with ``offer``.
+        """
+        with self._lock:
+            self._counts["offered_local"] += 1
+            if self._closed or session_id is None or session_id != self._session:
+                self._counts["dropped_stale"] += 1
+                return
+            if self._local_path is None:
+                self._counts["dropped_no_local_clip"] += 1     # never the CRITICAL clip instead
+                return
+            if self._device_fault:
+                self._counts["dropped_device_fault"] += 1
+                return
+            if event_id in self._recent_events or (self._slot is not None and self._slot.event_id == event_id):
+                self._counts["dropped_duplicate"] += 1
+                return
+            if self._in_cooldown_locked():
+                self._counts["dropped_cooldown"] += 1          # dropped, never deferred
+                return
+            if self._slot is not None or self._attempt is not None:
+                self._counts["dropped_busy"] += 1              # first-wins
+                return
+            self._slot = _Candidate(event_id, self._epoch, AlertClip.LOCAL)
+            self._wake.notify_all()
+
     def _invalidate_locked(self) -> None:
         if self._slot is not None:
             self._slot = None
@@ -288,8 +366,10 @@ class AudioAlertGate:
         self._last_grant_at = now
         self._next_attempt_id += 1
         self._attempt = _Attempt(self._next_attempt_id, candidate.event_id, candidate.epoch,
-                                 threading.Event(), now)
+                                 threading.Event(), now, candidate.clip)
         self._counts["granted"] += 1
+        if candidate.clip is AlertClip.LOCAL:
+            self._counts["granted_local"] += 1
         return self._attempt
 
     def run_once(self, timeout: float | None = 0.5) -> bool:
@@ -313,8 +393,13 @@ class AudioAlertGate:
                 attempt.state = "STARTING"
                 outcome = None
         if outcome is None:
+            local = attempt.clip is AlertClip.LOCAL
+            path = self._local_path if local else self._path      # each kind plays only its own clip
+            duration = self._local_duration if local else self._duration
             try:
-                self._device.start(self._path)
+                if path is None or duration is None:
+                    raise RuntimeError("clip not configured")
+                self._device.start(path)
             except Exception:
                 outcome = "failed"
                 self._log("Audio alert start failed")
@@ -322,7 +407,7 @@ class AudioAlertGate:
                 with self._lock:
                     attempt.state, attempt.started_at = "IN_FLIGHT", self._clock()
                 # WAV length is the playback policy bound, not proof the device finished.
-                outcome = "stopped" if attempt.cancel.wait(self._duration) else "completed"
+                outcome = "stopped" if attempt.cancel.wait(duration) else "completed"
             stop_ok = True
             try:
                 self._device.stop()                         # always close a started (or maybe-started) attempt
@@ -400,4 +485,6 @@ class AudioAlertGate:
                 short(self._session), short(self._slot.event_id) if self._slot else None,
                 short(attempt.event_id) if attempt else None, attempt.state if attempt else None,
                 stalled, self._device_fault, self._lifecycle_fault, **self._counts,
+                local_clip_configured=self._local_path is not None,
+                attempt_clip=attempt.clip.value if attempt else None,
             )

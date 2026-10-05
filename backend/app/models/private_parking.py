@@ -119,6 +119,7 @@ THRESHOLD_SPECS: dict[str, tuple[float, float, float, str]] = {
     "max_episodes": (16, 1, 256, "int"),
     "alert_queue_limit": (8, 1, 256, "int"),
     "max_candidates": (4, 1, 64, "int"),
+    "marker_queue_limit": (64, 4, 1024, "int"),               # overflow -> authoritative resync
 }
 
 
@@ -238,6 +239,83 @@ class AuthorizationSignal:
     episode_id: str | None = None
 
 
+@dataclasses.dataclass(frozen=True, order=True)
+class CandidateToken:
+    """Authority for one prepared candidate. ``serial`` is never reused in a
+    process, so a late call with an old token never matches a new candidate,
+    even when a session id or event id is reused. ``episode_instance`` binds the
+    token to the one episode instance it was issued for (episode ids may repeat;
+    instances never do), so it can never seal or change another episode."""
+
+    session_generation: int
+    serial: int
+    episode_instance: int | None = None
+
+
+class CandidateOutcome(str, enum.Enum):
+    """Result of ``publish_candidate`` / ``abandon_candidate`` (and the tombstone kept
+    for a closed preparing candidate)."""
+
+    PUBLISHED = "PUBLISHED"            # claimable by the worker
+    EXPIRED = "EXPIRED"                # deadline passed before publication
+    ABANDONED = "ABANDONED"            # evidence failed; never claimable
+    REJECTED_FULL = "REJECTED_FULL"    # candidate store was full at issue time
+    STALE = "STALE"                    # token from another session generation
+    UNKNOWN = "UNKNOWN"                # no record (never issued, or tombstone evicted)
+
+
+class MarkerKind(str, enum.Enum):
+    EPISODE_ENTERED = "EPISODE_ENTERED"
+    EPISODE_AUTHORIZED = "EPISODE_AUTHORIZED"
+    EPISODE_TRIGGERED = "EPISODE_TRIGGERED"
+    EPISODE_ENDED = "EPISODE_ENDED"
+    CANDIDATE_CLOSED = "CANDIDATE_CLOSED"        # preparing candidate closed without publication
+    CANDIDATE_EXPIRED = "CANDIDATE_EXPIRED"      # published candidate expired unclaimed
+    CANDIDATE_FINISHED = "CANDIDATE_FINISHED"    # claimed candidate completed or failed
+
+
+@dataclasses.dataclass(frozen=True)
+class EpisodeMarker:
+    """Lifecycle fact for the evidence sampler. ``seq`` is strictly increasing per
+    trigger session generation; ``keep_samples`` marks an ended episode whose
+    candidate is still waiting for its seal. ``episode_instance`` identifies the
+    episode instance (unique in the process); the sampler acts only on that
+    instance, never on another one that reuses ``episode_id``."""
+
+    seq: int
+    kind: MarkerKind
+    episode_id: str
+    revision: int
+    crossed_in_at: float
+    token: CandidateToken | None = None
+    keep_samples: bool = False
+    episode_instance: int | None = None
+
+
+@dataclasses.dataclass(frozen=True)
+class EvidenceView:
+    """Authoritative state after a marker overflow (replaces the lost markers).
+
+    ``entered``: (episode_id, episode_instance, revision, crossed_in_at) of episodes
+    that still need working samples; ``preparing``: (episode_id, token) of triggered
+    episodes whose candidate waits for its seal (the token names the instance; keep
+    samples, never re-begin); ``live_tokens``: every preparing, published or claimed
+    token (other sealed evidence may go)."""
+
+    entered: tuple[tuple[str, int, int, float], ...]
+    preparing: tuple[tuple[str, CandidateToken], ...]
+    live_tokens: frozenset[CandidateToken]
+
+
+@dataclasses.dataclass(frozen=True)
+class MarkerBatch:
+    session_id: str | None
+    session_generation: int
+    upto_seq: int                      # every marker of this generation with seq <= upto_seq is covered
+    markers: tuple[EpisodeMarker, ...]
+    view: EvidenceView | None = None   # set (and markers empty) after an overflow
+
+
 @dataclasses.dataclass(frozen=True)
 class ProximityEvidence:
     episode_id: str
@@ -260,11 +338,14 @@ class LocalProximityAlert:
     zone_name: str
     triggered_at: float          # observation timeline
     issued_at: float             # control clock
+    token: CandidateToken | None = None     # authority for seal/publish/abandon/release
 
 
 @dataclasses.dataclass(frozen=True)
 class PrivateParkingCandidate:
-    """Evaluation candidate in the PARKING_MOTORCYCLE domain (never an assessment)."""
+    """Evaluation candidate in the PARKING_MOTORCYCLE domain (never an assessment).
+
+    The token stays outside ``evidence`` so it never reaches a provider payload."""
 
     event_id: str
     source_session_id: str
@@ -274,6 +355,7 @@ class PrivateParkingCandidate:
     started_at: float            # crossing time (observation timeline)
     triggered_at: float          # approach confirmation (observation timeline)
     evidence: ProximityEvidence
+    token: CandidateToken | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -290,8 +372,12 @@ class PrivateParkingDiagnostic:
     pending_event_id: str | None
     episodes: tuple[EpisodeView, ...]
     queued_alerts: int
-    queued_candidates: int
+    queued_candidates: int                   # published (claimable or claimed)
     counts: tuple[tuple[str, int], ...]
+    preparing_candidates: int = 0            # waiting for seal/publication, never claimable
+    queued_markers: int = 0
+    resync_required: bool = False
+    pending_token: CandidateToken | None = None   # identity of the claimed candidate (with pending_event_id)
 
     def count(self, name: str) -> int:
         return dict(self.counts)[name]

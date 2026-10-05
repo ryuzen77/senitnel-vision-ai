@@ -13,7 +13,8 @@ import pytest
 from app.models.domain import DomainName
 from app.models.evaluation import (
     CallbackDisposition, EvaluationCallback, EvaluationFailure, EvaluationRequest,
-    EvaluationWorkerState, SubjectProfile, ThreatAssessment, ThreatStatus,
+    EvaluationWorkerState, PlanUnavailable, PlanUnavailableReason, SubjectProfile, ThreatAssessment,
+    ThreatStatus,
 )
 from app.models.event_frame import (
     BundleDecision, BundleStatus, EventFrameBundle, FrameSelectionPlan, SelectedFrame,
@@ -1571,3 +1572,199 @@ def test_stop_after_handoff_never_waits_and_the_old_attempt_stays_isolated(max_d
                    now=31) is CallbackDisposition.ACCEPTED
     assert worker.get_current_view().latest_result.event_id == "e2"
     assert gate.calls[-1] == ("offer", 3, "e2", "two", ThreatStatus.CRITICAL)
+
+
+# ── T3a1: plan before budget, PlanUnavailable, candidate strategies ──────────
+
+
+def _denying_budget() -> EvaluationBudget:
+    """A budget whose next reservation is denied (another request is pending)."""
+    budget = EvaluationBudget()
+    assert budget.try_reserve("other", "one", DomainName.PARKING_MOTORCYCLE, 10, 10).granted
+    return budget
+
+
+@pytest.mark.parametrize("reason", list(PlanUnavailableReason))
+def test_plan_unavailable_releases_the_claim_without_budget_or_dispatch(reason) -> None:
+    seen = []
+
+    def private_plan(event):
+        seen.append(event.event_id)
+        return PlanUnavailable(reason, "CROSSING_ANCHOR_MISSING" if reason is PlanUnavailableReason.FAILED else None)
+
+    trigger, budget, buffer, client, clock = FakeTrigger(), EvaluationBudget(), FakeBuffer(), FakeClient(), FakeClock(10)
+    worker = EvaluationWorker(trigger, budget, buffer, client, clock=clock,
+                              candidate_strategies={DomainName.PARKING_MOTORCYCLE: private_plan})
+    trigger.queue(_event())
+    assert worker.process_one(10)
+    snapshot = worker.get_snapshot()
+    assert seen == ["e1"] and trigger.failed == ["e1"] and trigger.pending is None    # finally -> fail
+    assert snapshot.last_failure is EvaluationFailure.EVIDENCE_UNAVAILABLE
+    assert dict(snapshot.failure_counts)[EvaluationFailure.BUNDLE_INVALID] == 0
+    assert dict(snapshot.plan_unavailable_counts)[reason] == 1
+    assert budget.get_snapshot(10).total_granted == 0 and budget.get_snapshot(10).pending_reservation_id is None
+    assert buffer.calls == [] and client.requests == [] and snapshot.dispatch_attempts == 0
+
+
+def test_unknown_plan_unavailable_reason_is_counted_as_missing() -> None:
+    worker = EvaluationWorker(
+        FakeTrigger(), EvaluationBudget(), FakeBuffer(), FakeClient(), clock=FakeClock(10),
+        candidate_strategies={DomainName.PARKING_MOTORCYCLE: lambda event: PlanUnavailable("bogus")})
+    worker._trigger.queue(_event())
+    assert worker.process_one(10)
+    assert dict(worker.get_snapshot().plan_unavailable_counts)[PlanUnavailableReason.MISSING] == 1
+
+
+def test_candidate_strategy_takes_precedence_and_a_valid_plan_dispatches() -> None:
+    legacy_calls = []
+
+    def legacy(event_id, session, triggered_at):
+        legacy_calls.append(event_id)
+        return make_parking_frame_selection_plan(event_id, session, triggered_at)
+
+    def private_plan(event):
+        return FrameSelectionPlan(event.event_id, event.source_session_id, DomainName.PARKING_MOTORCYCLE,
+                                  event.triggered_at, (-3.0, -2.0, -1.0, -0.5, 0.0), 1e-6, 5)
+
+    trigger, budget, buffer, client, clock = FakeTrigger(), EvaluationBudget(), FakeBuffer(), FakeClient(), FakeClock(10)
+    worker = EvaluationWorker(trigger, budget, buffer, client, clock=clock,
+                              strategies={DomainName.PARKING_MOTORCYCLE: legacy},
+                              candidate_strategies={DomainName.PARKING_MOTORCYCLE: private_plan})
+    trigger.queue(_event())
+    assert worker.process_one(10)
+    assert legacy_calls == [] and len(client.requests) == 1
+    assert buffer.calls[0].target_offsets_seconds == (-3.0, -2.0, -1.0, -0.5, 0.0)
+    assert budget.get_snapshot(10).total_granted == 1
+
+
+def test_legacy_invalid_plan_wins_over_a_budget_that_would_deny() -> None:
+    def invalid(event_id, session, triggered_at):
+        return FrameSelectionPlan(event_id, session, DomainName.RETAIL_STORE, triggered_at,
+                                  (-2, -1, -.4, 0, .4), .3, 5)                        # wrong domain
+
+    budget = _denying_budget()
+    worker, trigger, _, buffer, client, _ = _worker(
+        budget=budget, strategies={DomainName.PARKING_MOTORCYCLE: invalid})
+    trigger.queue(_event())
+    assert worker.process_one(10)
+    snapshot = worker.get_snapshot()
+    assert snapshot.last_failure is EvaluationFailure.BUNDLE_INVALID       # first failing step
+    assert dict(snapshot.failure_counts)[EvaluationFailure.BUDGET_DENIED] == 0
+    assert snapshot.last_budget_denial_reason is None
+    budget_snapshot = budget.get_snapshot(10)
+    assert budget_snapshot.total_granted == 1 and budget_snapshot.pending_event_id == "other"   # untouched
+    assert trigger.failed == ["e1"] and buffer.calls == client.requests == []
+
+
+@pytest.mark.parametrize("domain", [DomainName.PARKING_MOTORCYCLE, DomainName.RETAIL_STORE])
+def test_valid_legacy_and_retail_plans_still_report_budget_denial(domain) -> None:
+    worker, trigger, budget, buffer, client, _ = _worker(budget=_denying_budget())
+    trigger.queue(_event(domain=domain))
+    assert worker.process_one(10)
+    snapshot = worker.get_snapshot()
+    assert snapshot.last_failure is EvaluationFailure.BUDGET_DENIED
+    assert snapshot.last_budget_denial_reason == "REQUEST_PENDING"
+    assert trigger.failed == ["e1"] and buffer.calls == client.requests == []
+
+
+def test_stale_session_is_reported_before_any_plan_is_built() -> None:
+    calls = []
+    worker = EvaluationWorker(
+        FakeTrigger(), EvaluationBudget(), FakeBuffer(session="other"), FakeClient(), clock=FakeClock(10),
+        candidate_strategies={DomainName.PARKING_MOTORCYCLE: lambda event: calls.append(event)})
+    worker._trigger.queue(_event())
+    assert worker.process_one(10)
+    assert calls == [] and worker.get_snapshot().last_failure is EvaluationFailure.STALE_SESSION
+
+
+# ── T3a1 delta 1: candidate identity reaches the trigger ─────────────────────
+
+class TokenTrigger(FakeTrigger):
+    """A tokened trigger: finishing requires the claimed candidate's token."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.pending_token = None
+        self.finish_calls: list[tuple[str, str, object]] = []
+
+    def claim_next_candidate(self, now: float):
+        event = super().claim_next_candidate(now)
+        if event is not None:
+            self.pending_token = event.token
+        return event
+
+    def get_snapshot(self):
+        with self._condition:
+            return SimpleNamespace(source_session_id=self.session, pending_event_id=self.pending,
+                                   pending_token=self.pending_token)
+
+    def _finish(self, kind: str, event_id: str, token) -> bool:
+        self.finish_calls.append((kind, event_id, token))
+        if token != self.pending_token:
+            return False
+        self.pending_token = None
+        return super().complete(event_id, 0) if kind == "complete" else super().fail(event_id, 0)
+
+    def complete(self, event_id: str, now: float, *, token=None) -> bool:
+        return self._finish("complete", event_id, token)
+
+    def fail(self, event_id: str, now: float, *, token=None) -> bool:
+        return self._finish("fail", event_id, token)
+
+
+def _tokened_event(token="T-1", event_id="e1"):
+    base = _event(event_id)
+    fields = ("event_id", "source_session_id", "domain", "person_track_id", "object_track_id",
+              "started_at", "triggered_at", "evidence")
+    return SimpleNamespace(**{name: getattr(base, name) for name in fields}, token=token)
+
+
+def test_tokened_candidate_is_completed_with_its_token() -> None:
+    trigger = TokenTrigger()
+    worker, _, _, _, client, _ = _worker(trigger=trigger)
+    trigger.queue(_tokened_event())
+    assert worker.process_one(10) and len(client.requests) == 1
+    assert _accept(worker) is CallbackDisposition.ACCEPTED
+    assert trigger.finish_calls == [("complete", "e1", "T-1")] and trigger.completed == ["e1"]
+
+
+def test_tokened_candidate_is_failed_with_its_token_on_every_early_exit() -> None:
+    trigger = TokenTrigger()
+    worker, _, _, _, client, _ = _worker(trigger=trigger, budget=_denying_budget())
+    trigger.queue(_tokened_event())
+    assert worker.process_one(10)
+    assert trigger.finish_calls == [("fail", "e1", "T-1")] and trigger.failed == ["e1"]
+    assert client.requests == []
+
+
+def test_tokened_pending_is_failed_with_its_token_at_the_callback_deadline() -> None:
+    trigger = TokenTrigger()
+    worker, _, _, _, _, clock = _worker(trigger=trigger)
+    trigger.queue(_tokened_event())
+    assert worker.process_one(10)
+    clock.now = 10 + 46                                        # past the 45 s result deadline
+    assert worker.sweep(clock.now)
+    assert trigger.finish_calls == [("fail", "e1", "T-1")]
+
+
+def test_a_different_pending_token_makes_the_event_stale_and_the_callback_rejected() -> None:
+    trigger = TokenTrigger()
+    worker, _, _, _, client, _ = _worker(trigger=trigger)
+    trigger.queue(_tokened_event())
+    original = trigger.get_snapshot
+
+    def other_token_snapshot():
+        snapshot = original()
+        return SimpleNamespace(**{**vars(snapshot), "pending_token": "T-other"})
+
+    trigger.get_snapshot = other_token_snapshot
+    assert worker.process_one(10)
+    assert client.requests == [] and worker.get_snapshot().last_failure is EvaluationFailure.STALE_SESSION
+    assert trigger.finish_calls == [("fail", "e1", "T-1")]       # its own token, never another
+
+
+def test_legacy_candidates_keep_the_id_only_trigger_calls() -> None:
+    worker, trigger, _, _, _, _ = _worker()                    # FakeTrigger: complete/fail(event_id, now)
+    trigger.queue(_event())
+    assert worker.process_one(10)
+    assert _accept(worker) is CallbackDisposition.ACCEPTED and trigger.completed == ["e1"]

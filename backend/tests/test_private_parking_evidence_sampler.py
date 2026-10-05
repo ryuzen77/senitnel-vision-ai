@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import dataclasses
 import threading
+from types import SimpleNamespace
 
 import pytest
 
 from app.models.domain import DomainName
+from app.models.evaluation import PlanUnavailable, PlanUnavailableReason
 from app.models.event_frame import BufferedFrame, BundleStatus, FrameSelectionPlan
+from app.models.private_parking import CandidateToken, EpisodeMarker, EvidenceView, MarkerBatch, MarkerKind
 from app.models.private_parking_evidence import (
     EVIDENCE_OFFSET_EPSILON, EvidenceFailure, EvidenceRole, EvidenceSamplerLimits,
 )
@@ -604,3 +607,394 @@ def test_racing_seal_and_bundle_retrieval_never_return_partial_bundles() -> None
             assert [f.source_frame_seq for f in decision.bundle.frames] == [
                 f.source_frame_seq for f in results["seal"].evidence.frames]
         assert_ownership(rig.sampler)
+
+
+# ── T3a1: tokens, tombstones, plan mapping, markers and resync ───────────────
+
+# Hand-built ids for marker-managed episodes: each name maps to one episode instance,
+# and each token is bound to the instance it was issued for.
+_INSTANCE = {"ep1": 1, "ep2": 2, "ep3": 3, "ep4": 4, "ep5": 5, "marked": 1}
+T1, T2 = CandidateToken(1, 1, 1), CandidateToken(1, 2, 2)
+
+
+def _candidate(event_id="ev1", token=T1, session="s1", triggered_at=6.0):
+    return SimpleNamespace(event_id=event_id, token=token, source_session_id=session, triggered_at=triggered_at)
+
+
+def _begin(rig: Rig, episode_id: str, crossed_at: float, generation: int = 1, instance: int | None = None) -> None:
+    """Begin a marker-managed episode (as the coordinator will), in trigger generation 1."""
+    seq = rig.snapshot().applied_marker_seq + 1
+    instance = instance if instance is not None else _INSTANCE[episode_id]
+    marker = EpisodeMarker(seq, MarkerKind.EPISODE_ENTERED, episode_id, 1, crossed_at, episode_instance=instance)
+    assert rig.sampler.apply_markers(MarkerBatch("s1", generation, seq, (marker,)))
+    assert rig.snapshot().active_episodes >= 1
+
+
+def _sealed_token(rig: Rig, token=T1, event_id="ev1", episode_id="ep1", triggered_at=6.0):
+    rig.play(1.5)
+    _begin(rig, episode_id, 1.03)
+    rig.play(triggered_at)
+    result = rig.sampler.seal("s1", episode_id, event_id, triggered_at, token=token)
+    assert result.failure is None
+    return result
+
+
+def test_offer_is_an_alias_of_offer_frame() -> None:
+    rig = Rig()
+    assert rig.sampler.offer(frame(0, 0.0)) and not rig.sampler.offer(frame(0, 0.0))
+    assert rig.snapshot().count("frames_offered") == 2 and rig.snapshot().count("frames_rejected") == 1
+
+
+def test_release_plan_and_failure_lookups_require_the_sealing_token() -> None:
+    rig = Rig()
+    _sealed_token(rig)
+    held = rig.snapshot().held_bytes
+    for wrong in (None, T2):
+        assert not rig.sampler.release("ev1", token=wrong)
+        assert rig.sampler.plan_for("ev1", token=wrong) is None
+    assert rig.snapshot().count("token_mismatches") == 4 and rig.snapshot().held_bytes == held
+    assert rig.sampler.plan_for("ev1", token=T1) is not None
+    assert rig.sampler.release("ev1", token=T1)
+    assert rig.sampler.failure_for("ev1", token=T1) is EvidenceFailure.RELEASED       # tombstone
+    assert rig.sampler.failure_for("ev1", token=T2) is None
+    assert rig.snapshot().sealed == 0 and rig.snapshot().count("sealed_released") == 1
+
+
+def test_a_second_seal_for_an_event_id_held_under_another_token_is_refused() -> None:
+    rig = Rig()
+    _sealed_token(rig)
+    _begin(rig, "ep2", 6.1)
+    rig.play(9.0)
+    result = rig.sampler.seal("s1", "ep2", "ev1", 9.0, token=T2)        # reused event id
+    assert result.evidence is None and result.failure is EvidenceFailure.UNKNOWN_EPISODE
+    assert rig.sampler.plan_for("ev1", token=T1) is not None              # original untouched
+
+
+@pytest.mark.parametrize("case,expected", [
+    ("sealed", None),
+    ("failed", (PlanUnavailableReason.FAILED, "INSUFFICIENT_JOURNEY")),
+    ("expired", (PlanUnavailableReason.EXPIRED, None)),
+    ("released", (PlanUnavailableReason.RELEASED, None)),
+    ("other_token", (PlanUnavailableReason.MISSING, None)),
+    ("never_sealed", (PlanUnavailableReason.MISSING, None)),
+    ("evicted", (PlanUnavailableReason.MISSING, None)),
+    ("session_reset", (PlanUnavailableReason.MISSING, None)),
+    ("other_trigger_time", (PlanUnavailableReason.MISSING, None)),
+])
+def test_plan_for_candidate_reports_only_what_the_store_knows(case, expected) -> None:
+    rig = Rig(max_failure_records=1, sealed_ttl_seconds=10.0)
+    candidate = _candidate()
+    if case == "failed":
+        rig.play(1.5)
+        _begin(rig, "ep1", 1.03)
+        result = rig.sampler.seal("s1", "ep1", "ev1", 1.2, token=T1)       # one frame between anchors
+        assert result.failure is EvidenceFailure.INSUFFICIENT_JOURNEY
+        candidate = _candidate(triggered_at=1.2)
+    elif case != "never_sealed":
+        _sealed_token(rig)
+    if case == "expired":
+        rig.clock.now += 10.0
+    elif case == "released":
+        assert rig.sampler.release("ev1", token=T1)
+    elif case == "other_token":
+        candidate = _candidate(token=T2)
+    elif case == "evicted":
+        assert rig.sampler.release("ev1", token=T1)
+        _begin(rig, "ep2", 5.9)
+        assert rig.sampler.seal("s1", "ep2", "ev2", 6.0, token=T2).failure is not None   # evicts ev1's tombstone
+    elif case == "session_reset":
+        rig.sampler.start_session("s1")
+    elif case == "other_trigger_time":
+        candidate = _candidate(triggered_at=6.5)
+    result = rig.sampler.plan_for_candidate(candidate)
+    if expected is None:
+        assert isinstance(result, FrameSelectionPlan) and result.event_id == "ev1"
+    else:
+        assert isinstance(result, PlanUnavailable) and (result.reason, result.detail) == expected
+
+
+def _batch(markers=(), *, generation=1, upto=None, view=None, session="s1"):
+    upto = upto if upto is not None else max((m.seq for m in markers), default=0)
+    return MarkerBatch(session, generation, upto, tuple(markers), view)
+
+
+def _marker(seq, kind, episode_id="ep1", *, token=None, keep=False, crossed=1.03, instance=None):
+    instance = instance if instance is not None else _INSTANCE.get(episode_id)
+    return EpisodeMarker(seq, kind, episode_id, 1, crossed, token, keep, instance)
+
+
+def test_markers_begin_cancel_and_keep_working_samples() -> None:
+    rig = Rig()
+    rig.play(2.0)
+    assert rig.sampler.apply_markers(_batch([_marker(1, MarkerKind.EPISODE_ENTERED),
+                                             _marker(2, MarkerKind.EPISODE_ENTERED, "ep2", crossed=1.5)]))
+    assert rig.snapshot().active_episodes == 2
+    assert rig.sampler.apply_markers(_batch([_marker(3, MarkerKind.EPISODE_TRIGGERED),       # waits for seal
+                                             _marker(4, MarkerKind.EPISODE_ENDED, keep=True),
+                                             _marker(5, MarkerKind.EPISODE_AUTHORIZED, "ep2")]))
+    snapshot = rig.snapshot()
+    assert snapshot.active_episodes == 1 and snapshot.count("episodes_cancelled") == 1
+    assert rig.sampler.apply_markers(_batch([_marker(6, MarkerKind.EPISODE_ENDED)]))
+    assert rig.snapshot().active_episodes == 0 and rig.snapshot().applied_marker_seq == 6
+
+
+def test_closing_markers_release_working_samples_and_sealed_evidence_by_token() -> None:
+    rig = Rig()
+    _sealed_token(rig, T1)
+    _begin(rig, "ep2", 6.1)                                               # markers 1-2 applied
+    rig.play(7.0)
+    assert rig.sampler.apply_markers(_batch([_marker(3, MarkerKind.CANDIDATE_CLOSED, "ep2", token=T2)]))
+    assert rig.snapshot().active_episodes == 0 and rig.snapshot().sealed == 1
+    assert rig.sampler.apply_markers(_batch([_marker(4, MarkerKind.CANDIDATE_EXPIRED, "ep1", token=T2)]))
+    assert rig.snapshot().sealed == 1                                    # other token: no effect
+    assert rig.sampler.apply_markers(_batch([_marker(5, MarkerKind.CANDIDATE_FINISHED, "ep1", token=T1)]))
+    snapshot = rig.snapshot()
+    assert snapshot.sealed == 0 and snapshot.count("sealed_released_marker") == 1
+    assert rig.sampler.failure_for("ev1", token=T1) is EvidenceFailure.RELEASED
+
+
+def test_stale_markers_views_generations_and_sessions_are_ignored() -> None:
+    rig = Rig()
+    rig.play(2.0)
+    assert rig.sampler.apply_markers(_batch([_marker(5, MarkerKind.EPISODE_ENTERED)]))
+    assert rig.sampler.apply_markers(_batch([_marker(4, MarkerKind.EPISODE_AUTHORIZED)]))     # older seq
+    assert rig.snapshot().active_episodes == 1 and rig.snapshot().count("markers_stale") == 1
+    view = EvidenceView((), (), frozenset())
+    assert not rig.sampler.apply_markers(_batch(upto=5, view=view))                          # not newer
+    assert rig.snapshot().active_episodes == 1 and rig.snapshot().count("views_stale") == 1
+    assert not rig.sampler.apply_markers(_batch([_marker(9, MarkerKind.EPISODE_AUTHORIZED)], generation=0))
+    assert not rig.sampler.apply_markers(_batch([_marker(9, MarkerKind.EPISODE_AUTHORIZED)], session="s0"))
+    assert not rig.sampler.apply_markers("not a batch")
+    assert rig.snapshot().active_episodes == 1
+
+
+def test_a_newer_trigger_generation_drops_old_working_samples_and_old_tokens() -> None:
+    rig = Rig()
+    _sealed_token(rig, T1)
+    _begin(rig, "ep2", 6.1)
+    assert rig.sampler.apply_markers(_batch([_marker(3, MarkerKind.EPISODE_TRIGGERED, "ep2")]))
+    assert rig.sampler.apply_markers(_batch([_marker(1, MarkerKind.EPISODE_ENTERED, "ep3", crossed=6.2)],
+                                            generation=2))
+    snapshot = rig.snapshot()
+    assert snapshot.count("generations_replaced") == 1 and snapshot.sealed == 0
+    assert snapshot.active_episodes == 1 and snapshot.applied_marker_seq == 1          # only ep3
+
+
+def test_view_keeps_entered_and_preparing_and_releases_everything_else() -> None:
+    rig = Rig()
+    _sealed_token(rig, T1, "ev1", "ep1")                                  # sealed, still live
+    rig.sampler.seal("s1", "x", "ev0", 6.0)                              # (failure record only)
+    _begin(rig, "ep2", 4.0)                                               # ENTERED, kept
+    _begin(rig, "ep3", 4.5)                                               # TRIGGERED + preparing, kept
+    _begin(rig, "ep4", 5.0)                                               # AUTHORIZED: not in the view
+    rig.play(7.0)
+    t3 = CandidateToken(1, 3, 3)
+    view = EvidenceView((("ep2", 2, 1, 4.0), ("ep5", 5, 1, 6.5)), (("ep3", t3),), frozenset({t3}))
+    assert rig.sampler.apply_markers(_batch(upto=10, view=view))
+    snapshot = rig.snapshot()
+    assert snapshot.active_episodes == 3                                  # ep2, ep3, ep5 (re-begun)
+    assert snapshot.count("episodes_cancelled_resync") == 1 and snapshot.count("episodes_begun_resync") == 1
+    assert snapshot.sealed == 0 and snapshot.count("sealed_released_resync") == 1   # T1 not live
+    assert rig.sampler.seal("s1", "ep4", "ev4", 7.0, token=CandidateToken(1, 4, 4)).failure \
+        is EvidenceFailure.UNKNOWN_EPISODE
+
+
+def test_untokened_sealed_evidence_is_never_touched_by_markers_or_views() -> None:
+    rig = Rig()
+    _sealed(rig)                                                          # T2-style seal, token None
+    assert rig.sampler.apply_markers(_batch([_marker(1, MarkerKind.CANDIDATE_FINISHED)]))
+    assert rig.sampler.apply_markers(_batch(upto=2, view=EvidenceView((), (), frozenset())))
+    assert rig.snapshot().sealed == 1 and rig.sampler.plan_for("ev1") is not None
+
+
+def test_without_calls_bytes_stay_until_the_next_call_and_no_timer_exists() -> None:
+    threads_before = threading.active_count()
+    rig = Rig(sealed_ttl_seconds=1.0)
+    _sealed_token(rig)
+    assert threading.active_count() == threads_before                   # no background thread
+    held = rig.sampler._held_bytes
+    rig.clock.now += 5.0                                                  # far past the TTL, no calls
+    assert rig.sampler._held_bytes == held                                # nothing ran
+    assert rig.sampler.plan_for_candidate(_candidate()) == PlanUnavailable(PlanUnavailableReason.EXPIRED)
+    assert rig.sampler._held_bytes < held and rig.snapshot().sealed == 0  # released by that call
+
+
+# ── T3a1 delta 1: a stale call never touches newer state ─────────────────────
+
+_STALE_COUNTERS = {"stale_seals_rejected", "stale_calls_ignored"}
+
+
+def _state(rig: Rig):
+    """Everything an old call must not change (stale-rejection counters excluded)."""
+    snapshot = rig.snapshot()
+    counts = tuple((name, value) for name, value in snapshot.counts if name not in _STALE_COUNTERS)
+    held = tuple(sorted((seq, entry[1]) for seq, entry in rig.sampler._held.items()))
+    return (snapshot.active_episodes, snapshot.sealed, snapshot.failure_records, snapshot.held_frames,
+            snapshot.held_bytes, snapshot.applied_marker_seq, counts, held)
+
+
+def test_old_token_seal_after_a_trigger_restart_with_reused_ids_changes_nothing() -> None:
+    rig = Rig()
+    rig.play(1.5)
+    _begin(rig, "ep1", 1.03, generation=1)
+    rig.play(3.0)
+    _begin(rig, "ep1", 2.5, generation=2, instance=9)   # trigger restarted: same session and episode id
+    rig.play(6.0)
+    before = _state(rig)
+    stale = rig.sampler.seal("s1", "ep1", "ev1", 6.0, token=CandidateToken(1, 1, 1))
+    assert stale.evidence is None and stale.failure is EvidenceFailure.STALE_TOKEN
+    assert _state(rig) == before                      # episode, JPEG refs, counters, records intact
+    assert rig.snapshot().count("stale_seals_rejected") == 1
+    assert rig.sampler.failure_for("ev1", token=CandidateToken(1, 1, 1)) is None   # nothing recorded
+    fresh = rig.sampler.seal("s1", "ep1", "ev1", 6.0, token=CandidateToken(2, 10, 9))
+    assert fresh.failure is None and fresh.evidence.frames[0].source_timestamp == pytest.approx(2.5)
+
+
+def test_old_token_seal_after_a_sampler_session_restart_with_reused_ids_changes_nothing() -> None:
+    rig = Rig()
+    rig.play(1.5)
+    _begin(rig, "ep1", 1.03, generation=1)
+    rig.sampler.end_session("s1")
+    rig.sampler.start_session("s1")                    # same session id
+    rig.seq = 0
+    rig.play(1.5)
+    _begin(rig, "ep1", 1.03, generation=2, instance=9)
+    rig.play(6.0)
+    before = _state(rig)
+    assert rig.sampler.seal("s1", "ep1", "ev1", 6.0, token=CandidateToken(1, 1, 1)).failure \
+        is EvidenceFailure.STALE_TOKEN
+    assert _state(rig) == before
+    assert rig.sampler.seal("s1", "ep1", "ev1", 6.0, token=CandidateToken(2, 7, 9)).failure is None
+
+
+def test_token_and_untokened_calls_never_cross() -> None:
+    rig = Rig()
+    rig.play(1.5)
+    _begin(rig, "marked", 1.03)                        # marker-managed (generation 1)
+    assert rig.sampler.begin_episode("s1", "plain", 1.03)
+    rig.play(6.0)
+    before = _state(rig)
+    assert rig.sampler.seal("s1", "marked", "ev1", 6.0).failure is EvidenceFailure.STALE_TOKEN
+    assert rig.sampler.seal("s1", "plain", "ev2", 6.0, token=T1).failure is EvidenceFailure.STALE_TOKEN
+    assert not rig.sampler.cancel_episode("s1", "marked") and not rig.sampler.end_episode("s1", "marked")
+    assert rig.sampler.seal("s1", "marked", "ev3", 6.0, token="not-a-token").failure is EvidenceFailure.STALE_TOKEN
+    assert _state(rig) == before
+    assert rig.sampler.seal("s1", "marked", "ev1", 6.0, token=T1).failure is None
+    assert rig.sampler.seal("s1", "plain", "ev2", 6.0).failure is None
+
+
+# ── T3a1 delta 2: episode instances (episode_id reused within one generation) ─
+
+TOKEN_A = CandidateToken(1, 10, 101)          # issued for instance 101 (episode A)
+TOKEN_B = CandidateToken(1, 11, 102)          # issued for instance 102 (episode B, same episode_id)
+TOKEN_C = CandidateToken(1, 12, 103)          # issued for instance 103 (another episode)
+
+
+def _a_ended_then_b_entered(rig: Rig) -> None:
+    """Generation 1: ENTERED A -> ENDED A -> ENTERED B, all with episode_id "ep-x"."""
+    rig.play(1.5)
+    assert rig.sampler.apply_markers(_batch([
+        _marker(1, MarkerKind.EPISODE_ENTERED, "ep-x", crossed=1.03, instance=101),
+        _marker(2, MarkerKind.EPISODE_ENDED, "ep-x", instance=101),
+        _marker(3, MarkerKind.EPISODE_ENTERED, "ep-x", crossed=1.43, instance=102),
+        _marker(4, MarkerKind.EPISODE_ENTERED, "ep-c", crossed=1.23, instance=103),
+    ]))
+    rig.play(6.0)
+    assert rig.snapshot().active_episodes == 2                        # B and C only
+
+
+def test_a_token_for_an_old_instance_cannot_seal_the_new_one_with_the_same_id() -> None:
+    rig = Rig()
+    _a_ended_then_b_entered(rig)
+    before = _state(rig)
+    result = rig.sampler.seal("s1", "ep-x", "ev-b", 6.0, token=TOKEN_A)
+    assert result.evidence is None and result.failure is EvidenceFailure.STALE_TOKEN
+    assert _state(rig) == before                                      # B active, bytes/refcounts intact
+    assert rig.sampler.failure_for("ev-b", token=TOKEN_A) is None     # nothing recorded
+    sealed = rig.sampler.seal("s1", "ep-x", "ev-b", 6.0, token=TOKEN_B)
+    assert sealed.failure is None
+    assert sealed.evidence.frames[0].source_timestamp == pytest.approx(1.4)   # B's crossing, not A's
+
+
+def test_a_token_of_another_episode_in_the_same_generation_is_refused() -> None:
+    rig = Rig()
+    _a_ended_then_b_entered(rig)
+    before = _state(rig)
+    assert rig.sampler.seal("s1", "ep-x", "ev-b", 6.0, token=TOKEN_C).failure is EvidenceFailure.STALE_TOKEN
+    assert rig.sampler.seal("s1", "ep-c", "ev-b", 6.0, token=TOKEN_B).failure is EvidenceFailure.STALE_TOKEN
+    assert _state(rig) == before
+    assert rig.sampler.seal("s1", "ep-c", "ev-c", 6.0, token=TOKEN_C).failure is None
+
+
+def test_old_instance_operations_never_cancel_or_release_the_new_instance() -> None:
+    rig = Rig()
+    _a_ended_then_b_entered(rig)
+    before = _state(rig)
+    assert rig.sampler.apply_markers(_batch([                           # late facts about instance A
+        _marker(5, MarkerKind.EPISODE_AUTHORIZED, "ep-x", instance=101),
+        _marker(6, MarkerKind.EPISODE_ENDED, "ep-x", instance=101),
+        _marker(7, MarkerKind.CANDIDATE_CLOSED, "ep-x", token=TOKEN_A, instance=101),
+    ]))
+    assert not rig.sampler.cancel_episode("s1", "ep-x") and not rig.sampler.end_episode("s1", "ep-x")
+    after = _state(rig)
+    assert after[:5] == before[:5] and after[7] == before[7]          # same episodes, bytes and refcounts
+    assert rig.sampler.seal("s1", "ep-x", "ev-b", 6.0, token=TOKEN_B).failure is None
+    held = rig.snapshot().held_bytes
+    assert not rig.sampler.release("ev-b", token=TOKEN_A)
+    assert rig.sampler.apply_markers(_batch([
+        _marker(8, MarkerKind.CANDIDATE_EXPIRED, "ep-x", token=TOKEN_A, instance=101),
+        _marker(9, MarkerKind.CANDIDATE_FINISHED, "ep-x", token=TOKEN_A, instance=101),
+    ]))
+    snapshot = rig.snapshot()
+    assert snapshot.sealed == 1 and snapshot.held_bytes == held
+    assert rig.sampler.plan_for("ev-b", token=TOKEN_B) is not None
+
+
+def test_view_keeps_the_listed_instance_and_drops_another_with_the_same_id() -> None:
+    rig = Rig()
+    _a_ended_then_b_entered(rig)
+    view = EvidenceView((("ep-x", 102, 1, 1.43),), (), frozenset())    # B listed; C not listed
+    assert rig.sampler.apply_markers(_batch(upto=10, view=view))
+    assert rig.snapshot().active_episodes == 1
+    assert rig.sampler.seal("s1", "ep-x", "ev-b", 6.0, token=TOKEN_B).failure is None
+    other = EvidenceView((("ep-x", 101, 1, 1.03),), (("ep-x", TOKEN_B),), frozenset({TOKEN_B}))
+    assert rig.sampler.apply_markers(_batch(upto=20, view=other))      # names instance A, keeps B's token
+    assert rig.sampler.plan_for("ev-b", token=TOKEN_B) is not None    # B's sealed evidence untouched
+    assert rig.snapshot().sealed == 1
+
+
+def test_markers_without_an_instance_never_create_marker_managed_episodes() -> None:
+    rig = Rig()
+    rig.play(1.5)
+    assert rig.sampler.apply_markers(_batch([EpisodeMarker(1, MarkerKind.EPISODE_ENTERED, "ep-x", 1, 1.03)]))
+    assert rig.snapshot().active_episodes == 0 and rig.snapshot().count("markers_stale") == 1
+
+
+def test_an_unverifiable_tokened_seal_records_nothing_that_could_block_the_rightful_event() -> None:
+    rig = Rig()
+    _a_ended_then_b_entered(rig)
+    records = rig.snapshot().failure_records
+    ghost = CandidateToken(1, 99, 999)                                 # its instance no longer exists
+    assert rig.sampler.seal("s1", "ep-ghost", "ev-b", 6.0, token=ghost).failure is EvidenceFailure.UNKNOWN_EPISODE
+    assert rig.snapshot().failure_records == records and rig.snapshot().count("seals_unverified") == 1
+    assert rig.sampler.seal("s1", "ep-x", "ev-b", 6.0, token=TOKEN_B).failure is None   # not blocked
+
+
+def test_a_marker_naming_the_instance_with_another_episode_id_changes_nothing() -> None:
+    rig = Rig()
+    _a_ended_then_b_entered(rig)
+    before = _state(rig)
+    assert rig.sampler.apply_markers(_batch([_marker(5, MarkerKind.EPISODE_AUTHORIZED, "ep-wrong", instance=102)]))
+    after = _state(rig)
+    assert after[:5] == before[:5] and after[7] == before[7]
+    assert rig.snapshot().count("instance_mismatches") == 1
+
+
+def test_a_view_naming_another_instance_of_the_same_id_drops_the_unlisted_one() -> None:
+    rig = Rig()
+    _a_ended_then_b_entered(rig)
+    view = EvidenceView((("ep-x", 105, 1, 5.5),), (), frozenset())   # same id, different instance
+    assert rig.sampler.apply_markers(_batch(upto=10, view=view))
+    snapshot = rig.snapshot()
+    assert snapshot.count("episodes_cancelled_resync") == 2 and snapshot.count("episodes_begun_resync") == 1
+    assert rig.sampler.seal("s1", "ep-x", "ev-b", 6.0, token=TOKEN_B).failure is EvidenceFailure.STALE_TOKEN

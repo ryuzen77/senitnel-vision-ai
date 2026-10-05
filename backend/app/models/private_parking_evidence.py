@@ -39,8 +39,10 @@ class EvidenceFailure(str, enum.Enum):
     APPROACH_ANCHOR_MISSING = "APPROACH_ANCHOR_MISSING"
     INSUFFICIENT_JOURNEY = "INSUFFICIENT_JOURNEY"
     CAPACITY = "CAPACITY"
-    EXPIRED = "EXPIRED"
+    EXPIRED = "EXPIRED"                  # sealed evidence reached its TTL
     UNKNOWN_EPISODE = "UNKNOWN_EPISODE"
+    RELEASED = "RELEASED"                # tombstone: sealed evidence released explicitly (release/marker/resync)
+    STALE_TOKEN = "STALE_TOKEN"          # seal refused: token/generation not current; never recorded
 
 
 def _number(name: str, value: object, low: float, high: float) -> float:
@@ -134,6 +136,7 @@ class SamplerDiagnostic:
     held_frames: int
     held_bytes: int
     counts: tuple[tuple[str, int], ...]
+    applied_marker_seq: int = 0          # highest trigger marker sequence applied this session
 
     def count(self, name: str) -> int:
         return dict(self.counts)[name]

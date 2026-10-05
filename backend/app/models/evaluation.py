@@ -157,6 +157,24 @@ class EvaluationFailure(str, enum.Enum):
     DISPATCH_UNCERTAIN = "DISPATCH_UNCERTAIN"
     CALLBACK_TIMEOUT = "CALLBACK_TIMEOUT"
     CANCELLED = "CANCELLED"
+    EVIDENCE_UNAVAILABLE = "EVIDENCE_UNAVAILABLE"   # PlanUnavailable: no budget, no dispatch
+
+
+class PlanUnavailableReason(str, enum.Enum):
+    """Why an evidence-derived plan does not exist; only what the evidence store knows."""
+
+    FAILED = "FAILED"        # the seal failed (detail: the evidence failure)
+    EXPIRED = "EXPIRED"      # sealed evidence reached its TTL
+    RELEASED = "RELEASED"    # sealed evidence was released explicitly
+    MISSING = "MISSING"      # no record for this candidate (never sealed, evicted, reset, other token)
+
+
+@dataclasses.dataclass(frozen=True)
+class PlanUnavailable:
+    """Strategy result instead of a plan; recorded as EVIDENCE_UNAVAILABLE (never BUNDLE_INVALID)."""
+
+    reason: PlanUnavailableReason
+    detail: str | None = None
 
 
 class EvaluationWorkerState(str, enum.Enum):
@@ -184,6 +202,7 @@ class WorkerSnapshot:
     callback_deadline: float | None = None
     dispatch_attempts: int = 0
     max_dispatches: int | None = None
+    plan_unavailable_counts: tuple[tuple[PlanUnavailableReason, int], ...] = ()
 
 
 @dataclasses.dataclass(frozen=True)

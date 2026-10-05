@@ -469,3 +469,179 @@ def test_probe_wav_duration_reads_header_only(tmp_path) -> None:
     text.write_text("not audio")
     assert probe_wav_duration(text) is None
     assert probe_wav_duration(tmp_path / "missing.wav") is None
+
+
+# ── local access warning (T3a1): separate clip, grant-based dedup ────────────
+
+LOCAL_PATH = "C:/outside/local-warning.wav"
+
+
+class PathDevice(FakeDevice):
+    """Records which clip each start used."""
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.paths: list[str] = []
+
+    def start(self, path: str) -> None:
+        self.paths.append(path)
+        super().start(path)
+
+
+def _local_gate(device: FakeDevice | None = None, *, clock: FakeClock | None = None, local: bool = True,
+                duration: float = 0.01, cooldown: float = 30.0):
+    device = device or PathDevice()
+    clock = clock or FakeClock()
+    extra = {"local_wav_path": LOCAL_PATH, "local_duration_seconds": duration} if local else {}
+    gate = AudioAlertGate(device, PATH, duration, cooldown_seconds=cooldown, clock=clock,
+                          join_timeout_seconds=2.0, **extra)
+    gate.apply_lifecycle(1, "A")
+    return gate, device, clock
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"local_wav_path": LOCAL_PATH},                                   # duration missing
+    {"local_duration_seconds": 1.0},                                  # path missing
+    {"local_wav_path": "", "local_duration_seconds": 1.0},
+    {"local_wav_path": "x.wav", "local_duration_seconds": 1.0},       # same clip as CRITICAL
+    {"local_wav_path": "./x.wav", "local_duration_seconds": 1.0},     # same clip, other spelling
+    {"local_wav_path": LOCAL_PATH, "local_duration_seconds": 0},
+    {"local_wav_path": LOCAL_PATH, "local_duration_seconds": 8.01},
+    {"local_wav_path": LOCAL_PATH, "local_duration_seconds": True},
+    {"local_wav_path": LOCAL_PATH, "local_duration_seconds": float("nan")},
+])
+def test_local_clip_configuration_is_validated(kwargs) -> None:
+    with pytest.raises(ValueError):
+        AudioAlertGate(FakeDevice(), "x.wav", 4.0, **kwargs)
+
+
+def test_local_and_critical_clips_are_never_swapped() -> None:
+    gate, device, clock = _local_gate()
+    gate.offer_local("e1", "A")
+    assert gate.run_once(0)
+    clock.now += 31
+    gate.offer(1, "e2", "A", CRITICAL)
+    assert gate.run_once(0)
+    clock.now += 31
+    gate.offer_local("e3", "A")
+    assert gate.run_once(0)
+    assert device.paths == [LOCAL_PATH, PATH, LOCAL_PATH]
+    snapshot = gate.get_snapshot()
+    assert (snapshot.granted, snapshot.granted_local, snapshot.local_clip_configured) == (3, 2, True)
+
+
+def test_snapshot_reports_the_clip_kind_of_the_attempt() -> None:
+    gate, _, _ = _local_gate(duration=5.0)
+    gate.offer_local("e1", "A")
+    runner = _in_thread(gate.run_once, 0)
+    assert _wait_until(lambda: gate.get_snapshot().attempt_state == "IN_FLIGHT")
+    assert gate.get_snapshot().attempt_clip == "LOCAL"
+    gate.apply_lifecycle(2, None)                  # Stop cuts the local clip promptly
+    runner.join(2)
+    assert not runner.is_alive() and gate.get_snapshot().stopped == 1
+
+
+@pytest.mark.parametrize("session", [None, "B"])
+def test_local_offer_from_another_session_is_stale(session) -> None:
+    gate, device, _ = _local_gate()
+    gate.offer_local("e1", session)
+    assert not gate.run_once(0)
+    assert device.paths == [] and gate.get_snapshot().dropped_stale == 1
+
+
+def test_pending_local_offer_dies_when_the_lifecycle_moves_on() -> None:
+    gate, device, _ = _local_gate()
+    gate.offer_local("e1", "A")                    # queued, not yet granted
+    gate.apply_lifecycle(2, "B")                   # Stop / new session
+    gate.offer_local("e1", "A")                    # late offer from the old session
+    assert not gate.run_once(0)
+    assert device.paths == [] and gate.get_snapshot().dropped_stale == 2
+
+
+def test_planted_local_slot_with_an_old_epoch_is_refused_at_grant() -> None:
+    from app.services.audio_alert_service import AlertClip, _Candidate
+
+    gate, device, _ = _local_gate()
+    gate.apply_lifecycle(2, "A")                   # same session id, new lifecycle epoch
+    gate._slot = _Candidate("e1", 1, AlertClip.LOCAL)
+    assert gate.run_once(0)
+    assert device.paths == [] and gate.get_snapshot().granted == 0
+
+
+def test_missing_local_clip_disables_local_audio_and_lets_one_critical_through() -> None:
+    gate, device, _ = _local_gate(local=False)
+    gate.offer_local("e1", "A")
+    assert not gate.run_once(0)
+    snapshot = gate.get_snapshot()
+    assert snapshot.dropped_no_local_clip == 1 and not snapshot.local_clip_configured
+    gate.offer(1, "e1", "A", CRITICAL)             # rejected before grant: not remembered
+    assert gate.run_once(0)
+    gate.offer(1, "e1", "A", CRITICAL)
+    assert not gate.run_once(0)
+    assert device.paths == [PATH]                  # once, with the CRITICAL clip, never a fallback
+    assert gate.get_snapshot().dropped_duplicate == 1
+
+
+@pytest.mark.parametrize("start_error", [None, RuntimeError("driver error")])
+def test_local_grant_blocks_a_later_critical_for_the_same_event(start_error) -> None:
+    gate, device, clock = _local_gate(PathDevice(start_error=start_error))
+    gate.offer_local("e1", "A")
+    assert gate.run_once(0)
+    clock.now += 60                                # cooldown over: only dedup can refuse it
+    gate.offer(1, "e1", "A", CRITICAL)
+    assert not gate.run_once(0)
+    snapshot = gate.get_snapshot()
+    assert device.paths == [LOCAL_PATH] and snapshot.granted == 1 and snapshot.dropped_duplicate == 1
+
+
+def test_queued_local_offer_absorbs_a_critical_for_the_same_event() -> None:
+    gate, device, _ = _local_gate()
+    gate.offer_local("e1", "A")
+    gate.offer(1, "e1", "A", CRITICAL)             # same event already in the slot
+    assert gate.run_once(0) and not gate.run_once(0)
+    assert device.paths == [LOCAL_PATH] and gate.get_snapshot().dropped_duplicate == 1
+
+
+def test_shared_slot_and_cooldown_drop_other_events_with_reasons() -> None:
+    gate, device, clock = _local_gate()
+    gate.offer_local("e1", "A")
+    gate.offer(1, "e2", "A", CRITICAL)             # slot busy: dropped, never queued
+    assert gate.run_once(0)
+    clock.now += 10
+    gate.offer_local("e3", "A")                    # inside the shared cooldown
+    gate.offer(1, "e4", "A", CRITICAL)
+    assert not gate.run_once(0)
+    snapshot = gate.get_snapshot()
+    assert (snapshot.dropped_busy, snapshot.dropped_cooldown) == (1, 2)
+    assert device.paths == [LOCAL_PATH]
+
+
+def test_rejected_local_offer_never_bypasses_cooldown_or_fault() -> None:
+    gate, device, clock = _local_gate(PathDevice(stop_error=RuntimeError("stop failed")), local=True)
+    gate.offer(1, "e1", "A", CRITICAL)
+    assert gate.run_once(0)                        # granted; stop fails -> device fault
+    clock.now += 60
+    gate.offer_local("e2", "A")                    # rejected: device fault
+    gate.offer(1, "e2", "A", CRITICAL)             # rejected too: the fault still holds
+    assert not gate.run_once(0)
+    assert gate.get_snapshot().dropped_device_fault == 2 and device.paths == [PATH]
+
+    gate, device, clock = _local_gate(local=False)
+    gate.offer(1, "e1", "A", CRITICAL)
+    assert gate.run_once(0)
+    clock.now += 5
+    gate.offer_local("e2", "A")                    # rejected: no local clip (stores nothing)
+    gate.offer(1, "e2", "A", CRITICAL)             # still inside the cooldown of e1
+    assert not gate.run_once(0)
+    snapshot = gate.get_snapshot()
+    assert (snapshot.dropped_no_local_clip, snapshot.dropped_cooldown) == (1, 1)
+    clock.now += 26
+    gate.offer(1, "e2", "A", CRITICAL)             # after the cooldown: one grant for e2
+    assert gate.run_once(0) and device.paths == [PATH, PATH]
+
+
+def test_local_offer_after_fail_closed_is_refused() -> None:
+    gate, device, _ = _local_gate()
+    gate.fail_closed()
+    gate.offer_local("e1", "A")
+    assert not gate.run_once(0) and device.paths == []

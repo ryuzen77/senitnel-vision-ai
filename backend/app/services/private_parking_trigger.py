@@ -28,9 +28,29 @@ candidate TTL and alert TTL, so they expire even when observations stop.
 
 Overflow policy (counted, never silent): a full alert queue drops the NEW alert
 (``alerts_dropped_queue_full``) while the event and its candidate still issue
-once; a full candidate store drops the NEW candidate (``candidates_dropped_full``)
-while the alert still issues. Neither is retried. All thresholds are
-provisional and uncalibrated.
+once; a full candidate store drops the NEW candidate (``candidates_dropped_full``,
+outcome ``REJECTED_FULL``) while the alert still issues. Neither is retried. All
+thresholds are provisional and uncalibrated.
+
+Candidate preparation (T3a1): an issued candidate is PREPARING and never
+claimable. It carries a ``CandidateToken`` (session generation + a serial that is
+never reused) that the alert also carries. Only ``publish_candidate(token)``,
+called after the evidence seal succeeded, makes it claimable, and only within
+its deadline (control clock, read inside the lock); ``abandon_candidate(token)``
+closes it after an evidence failure. A closed preparing candidate leaves a
+bounded tombstone, so a late publish reports EXPIRED/ABANDONED/REJECTED_FULL
+while the tombstone exists and UNKNOWN after eviction; an expired candidate is
+never published. Nothing is retried.
+
+Evidence markers: every episode/candidate transition queues an ``EpisodeMarker``
+(sequence per session generation). ``pop_markers`` drains them atomically. If the
+bounded queue overflows, it is dropped and the next ``pop_markers`` returns an
+authoritative ``EvidenceView`` instead (episodes that still need working samples,
+including triggered episodes whose candidate still waits for its seal).
+
+Expiry runs only inside method calls (observe, pop_*, publish/abandon, wait,
+claim, snapshot); there is no timer thread. A candidate past its deadline is
+never published or claimed, whenever the next call happens.
 """
 
 from __future__ import annotations
@@ -45,8 +65,9 @@ import uuid
 
 from app.models.domain import DomainName, DomainSnapshot, DomainState
 from app.models.private_parking import (
-    AuthorizationSignal, EpisodeOrigin, EpisodeState, EpisodeView, LocalProximityAlert,
-    PrivateParkingCandidate, PrivateParkingConfig, PrivateParkingDiagnostic, ProximityEvidence,
+    AuthorizationSignal, CandidateOutcome, CandidateToken, EpisodeMarker, EpisodeOrigin, EpisodeState,
+    EpisodeView, EvidenceView, LocalProximityAlert, MarkerBatch, MarkerKind, PrivateParkingCandidate,
+    PrivateParkingConfig, PrivateParkingDiagnostic, ProximityEvidence,
 )
 from app.models.tracking import TrackedDetection, TrackingSnapshot
 from app.services.private_parking_authorization import AuthorizationSignalSource
@@ -58,8 +79,14 @@ _COUNTERS = (
     "escort_paired", "escort_ambiguous", "authorizations_applied", "authorizations_rejected",
     "authorizations_after_trigger", "authorization_source_errors", "events_issued",
     "alerts_dropped_queue_full", "alerts_expired", "alerts_popped", "candidates_dropped_full",
-    "candidates_expired", "candidates_claimed", "candidates_finished",
+    "candidates_expired", "candidates_claimed", "candidates_finished", "candidates_published",
+    "candidates_prepare_expired", "candidates_abandoned", "publish_rejected", "abandon_rejected",
+    "outcomes_evicted", "markers_emitted", "markers_popped", "marker_overflows",
+    "markers_dropped_overflow", "resyncs_issued", "finish_rejected", "episode_id_collisions",
 )
+_ID_ATTEMPTS = 4      # fresh ids tried when a minted episode id is already live
+# Tombstones of closed candidates kept per session: a multiple of max_candidates.
+_OUTCOME_FACTOR = 4
 
 
 def _is_number(value: object) -> bool:
@@ -95,12 +122,18 @@ class _Episode:
     approach_count: int = 0
     approach_target: int | None = None       # motor the current confirmation run is bound to
     min_edge: float = math.inf
+    revision: int = 1                        # bumped on every state change (markers, views)
+    instance: int = 0                        # unique per episode instance in the process (ids may repeat)
 
 
 @dataclasses.dataclass
 class _Candidate:
     candidate: PrivateParkingCandidate
-    deadline: float
+    deadline: float                          # control clock
+    token: CandidateToken
+    episode_id: str
+    revision: int
+    crossed_in_at: float
 
 
 class PrivateParkingTrigger:
@@ -118,6 +151,7 @@ class PrivateParkingTrigger:
         self._condition = threading.Condition(self._lock)
         self._wake_generation = 0
         self._session_generation = 0
+        self._serial = 0                       # token serials: never reset, never reused
         self._closed = False
         with self._lock:
             self._reset_locked(None)
@@ -130,8 +164,14 @@ class PrivateParkingTrigger:
         self._tracks: OrderedDict[int, _Track] = OrderedDict()
         self._episodes: dict[str, _Episode] = {}
         self._alerts: deque[LocalProximityAlert] = deque()
-        self._candidates: deque[_Candidate] = deque()
+        self._preparing: OrderedDict[CandidateToken, _Candidate] = OrderedDict()
+        self._candidates: deque[_Candidate] = deque()          # published: claimable or claimed
+        self._outcomes: OrderedDict[CandidateToken, CandidateOutcome] = OrderedDict()
+        self._markers: deque[EpisodeMarker] = deque()
+        self._marker_seq = 0
+        self._resync_required = False
         self._pending_event_id: str | None = None
+        self._pending_token: CandidateToken | None = None      # identity of the claimed candidate
         self._last_seq: int | None = None
         self._last_ts: float | None = None
         self._counts = dict.fromkeys(_COUNTERS, 0)
@@ -265,10 +305,23 @@ class PrivateParkingTrigger:
             self._counts["episodes_capacity_dropped"] += 1
             state.origin = EpisodeOrigin.UNKNOWN_INSIDE
             return
-        episode = _Episode(uuid.uuid4().hex, state.track_id, ts, now)
+        episode_id = uuid.uuid4().hex
+        for _attempt in range(_ID_ATTEMPTS):          # a live episode never shares its id
+            if episode_id not in self._episodes:
+                break
+            self._counts["episode_id_collisions"] += 1
+            episode_id = uuid.uuid4().hex
+        else:
+            self._counts["episodes_capacity_dropped"] += 1
+            state.origin = EpisodeOrigin.UNKNOWN_INSIDE
+            return
+        self._serial += 1                         # instances share the never-reused serial counter
+        episode = _Episode(episode_id, state.track_id, ts, now, instance=self._serial)
         self._episodes[episode.episode_id] = episode
         state.episode_id = episode.episode_id
         self._counts["episodes_started"] += 1
+        self._mark_locked(MarkerKind.EPISODE_ENTERED, episode.episode_id, episode.revision, ts,
+                          instance=episode.instance)
 
     def _pair_locked(self, ts: float) -> None:
         """Escort exemption only for one unambiguous motorcycle that crossed in and moved with the person."""
@@ -317,7 +370,10 @@ class PrivateParkingTrigger:
                     self._counts["authorizations_after_trigger"] += 1
                 elif episode.state is EpisodeState.ENTERED:
                     episode.state = EpisodeState.AUTHORIZED
+                    episode.revision += 1
                     self._counts["authorizations_applied"] += 1
+                    self._mark_locked(MarkerKind.EPISODE_AUTHORIZED, episode.episode_id,
+                                      episode.revision, episode.crossed_in_at, instance=episode.instance)
         if rejected:
             self._counts["authorizations_rejected"] += 1
 
@@ -354,30 +410,45 @@ class PrivateParkingTrigger:
         return issued
 
     def _issue_locked(self, episode: _Episode, motor_id: int, zone_name: str, ts: float, now: float) -> None:
-        """Atomic: state change, alert and candidate share one event_id; issued exactly once."""
+        """Atomic: state change, alert and PREPARING candidate share one event_id and
+        one token; issued exactly once. The candidate is not claimable until published."""
         episode.state = EpisodeState.TRIGGERED
+        episode.revision += 1
+        self._mark_locked(MarkerKind.EPISODE_TRIGGERED, episode.episode_id, episode.revision,
+                          episode.crossed_in_at, instance=episode.instance)
         event_id = uuid.uuid4().hex
+        self._serial += 1
+        token = CandidateToken(self._session_generation, self._serial, episode.instance)
         self._counts["events_issued"] += 1
         if len(self._alerts) >= self._t.alert_queue_limit:
             self._counts["alerts_dropped_queue_full"] += 1
         else:
             self._alerts.append(LocalProximityAlert(
                 event_id, self._session_id, episode.episode_id, episode.person_track_id, motor_id,
-                zone_name, ts, now))
-        if len(self._candidates) >= self._t.max_candidates:
+                zone_name, ts, now, token))
+        if len(self._preparing) + len(self._candidates) >= self._t.max_candidates:
             self._counts["candidates_dropped_full"] += 1
+            self._remember_outcome_locked(token, CandidateOutcome.REJECTED_FULL)
+            self._mark_locked(MarkerKind.CANDIDATE_CLOSED, episode.episode_id, episode.revision,
+                              episode.crossed_in_at, token)
             return
         evidence = ProximityEvidence(episode.episode_id, zone_name, episode.crossed_in_at,
                                      episode.approach_count, episode.min_edge, episode.escorted_motor)
-        self._candidates.append(_Candidate(PrivateParkingCandidate(
+        self._preparing[token] = _Candidate(PrivateParkingCandidate(
             event_id, self._session_id, DomainName.PARKING_MOTORCYCLE, episode.person_track_id,
-            motor_id, episode.crossed_in_at, ts, evidence), now + self._t.candidate_ttl_seconds))
+            motor_id, episode.crossed_in_at, ts, evidence, token),
+            now + self._t.candidate_ttl_seconds, token, episode.episode_id, episode.revision,
+            episode.crossed_in_at)
 
     def _end_episode_locked(self, episode_id: str, counter: str) -> None:
         episode = self._episodes.pop(episode_id, None)
         if episode is None:
             return
         self._counts[counter] += 1
+        episode.revision += 1
+        waiting_seal = any(entry.token.episode_instance == episode.instance for entry in self._preparing.values())
+        self._mark_locked(MarkerKind.EPISODE_ENDED, episode_id, episode.revision, episode.crossed_in_at,
+                          keep_samples=waiting_seal, instance=episode.instance)
         track = self._tracks.get(episode.person_track_id)
         if track is not None and track.episode_id == episode_id:
             track.episode_id = None
@@ -400,13 +471,133 @@ class PrivateParkingTrigger:
         while self._alerts and now - self._alerts[0].issued_at >= self._t.alert_ttl_seconds:
             self._alerts.popleft()
             self._counts["alerts_expired"] += 1
+        for token, entry in list(self._preparing.items()):
+            if now >= entry.deadline:
+                self._close_preparing_locked(token, CandidateOutcome.EXPIRED, "candidates_prepare_expired")
         kept = deque()
         for entry in self._candidates:
-            if entry.candidate.event_id != self._pending_event_id and now >= entry.deadline:
+            if entry.token != self._pending_token and now >= entry.deadline:
                 self._counts["candidates_expired"] += 1
+                self._remember_outcome_locked(entry.token, CandidateOutcome.EXPIRED)
+                self._mark_locked(MarkerKind.CANDIDATE_EXPIRED, entry.episode_id, entry.revision,
+                                  entry.crossed_in_at, entry.token)
             else:
                 kept.append(entry)
         self._candidates = kept
+
+    # ── candidate preparation (tokens) ───────────────────────────────────────
+
+    def _remember_outcome_locked(self, token: CandidateToken, outcome: CandidateOutcome) -> None:
+        self._outcomes[token] = outcome
+        self._outcomes.move_to_end(token)
+        while len(self._outcomes) > _OUTCOME_FACTOR * self._t.max_candidates:
+            self._outcomes.popitem(last=False)
+            self._counts["outcomes_evicted"] += 1
+
+    def _close_preparing_locked(self, token: CandidateToken, outcome: CandidateOutcome, counter: str) -> None:
+        entry = self._preparing.pop(token)
+        self._counts[counter] += 1
+        self._remember_outcome_locked(token, outcome)
+        self._mark_locked(MarkerKind.CANDIDATE_CLOSED, entry.episode_id, entry.revision,
+                          entry.crossed_in_at, token)
+
+    def _token_current_locked(self, token: object) -> bool:
+        return (isinstance(token, CandidateToken) and not self._closed and self._session_id is not None
+                and token.session_generation == self._session_generation)
+
+    def publish_candidate(self, token: CandidateToken) -> CandidateOutcome:
+        """Make a PREPARING candidate claimable after its evidence was sealed.
+
+        The deadline is checked with the injected control clock inside the lock,
+        BEFORE any sweep could close the entry; a closed entry answers from its
+        tombstone (EXPIRED / ABANDONED / REJECTED_FULL / PUBLISHED) while it is
+        kept, UNKNOWN after eviction. An expired candidate is never published.
+        """
+        with self._lock:
+            now = self._clock()
+            if not self._token_current_locked(token):
+                self._counts["publish_rejected"] += 1
+                return CandidateOutcome.STALE
+            entry = self._preparing.get(token)
+            if entry is None:
+                self._counts["publish_rejected"] += 1
+                return self._outcomes.get(token, CandidateOutcome.UNKNOWN)
+            if now >= entry.deadline:
+                self._close_preparing_locked(token, CandidateOutcome.EXPIRED, "candidates_prepare_expired")
+                self._counts["publish_rejected"] += 1
+                return CandidateOutcome.EXPIRED
+            del self._preparing[token]
+            self._candidates.append(entry)
+            self._remember_outcome_locked(token, CandidateOutcome.PUBLISHED)
+            self._counts["candidates_published"] += 1
+            self._expire_locked(now)                  # other entries; this one is still valid
+            self._condition.notify_all()
+            return CandidateOutcome.PUBLISHED
+
+    def abandon_candidate(self, token: CandidateToken) -> CandidateOutcome:
+        """Close a PREPARING candidate after an evidence failure (never claimable, no retry).
+
+        Same expiry contract as publish: the deadline is checked with the control
+        clock inside the lock, so a candidate past its deadline is recorded EXPIRED
+        whether or not a sweep ran first."""
+        with self._lock:
+            now = self._clock()
+            if not self._token_current_locked(token):
+                self._counts["abandon_rejected"] += 1
+                return CandidateOutcome.STALE
+            entry = self._preparing.get(token)
+            if entry is None:
+                self._counts["abandon_rejected"] += 1
+                return self._outcomes.get(token, CandidateOutcome.UNKNOWN)
+            if now >= entry.deadline:
+                self._close_preparing_locked(token, CandidateOutcome.EXPIRED, "candidates_prepare_expired")
+                self._counts["abandon_rejected"] += 1
+                return CandidateOutcome.EXPIRED
+            self._close_preparing_locked(token, CandidateOutcome.ABANDONED, "candidates_abandoned")
+            return CandidateOutcome.ABANDONED
+
+    # ── evidence markers ─────────────────────────────────────────────────────
+
+    def _mark_locked(self, kind: MarkerKind, episode_id: str, revision: int, crossed_in_at: float,
+                     token: CandidateToken | None = None, *, keep_samples: bool = False,
+                     instance: int | None = None) -> None:
+        if instance is None and token is not None:
+            instance = token.episode_instance      # candidate markers name their episode instance
+        self._marker_seq += 1
+        self._counts["markers_emitted"] += 1
+        if self._resync_required:                     # the next view covers it
+            self._counts["markers_dropped_overflow"] += 1
+            return
+        if len(self._markers) >= self._t.marker_queue_limit:
+            self._counts["marker_overflows"] += 1
+            self._counts["markers_dropped_overflow"] += len(self._markers) + 1
+            self._markers.clear()
+            self._resync_required = True
+            return
+        self._markers.append(EpisodeMarker(self._marker_seq, kind, episode_id, revision, crossed_in_at,
+                                           token, keep_samples, instance))
+
+    def _view_locked(self) -> EvidenceView:
+        entered = tuple((e.episode_id, e.instance, e.revision, e.crossed_in_at)
+                        for e in self._episodes.values() if e.state is EpisodeState.ENTERED)
+        preparing = tuple((entry.episode_id, token) for token, entry in self._preparing.items())
+        live = frozenset((*self._preparing, *(entry.token for entry in self._candidates)))
+        return EvidenceView(entered, preparing, live)
+
+    def pop_markers(self) -> MarkerBatch:
+        """Atomically drain markers; after an overflow, return the authoritative view instead."""
+        with self._lock:
+            self._expire_locked(self._clock())
+            if self._resync_required:
+                self._resync_required = False
+                self._markers.clear()
+                self._counts["resyncs_issued"] += 1
+                return MarkerBatch(self._session_id, self._session_generation, self._marker_seq, (),
+                                   self._view_locked())
+            markers = tuple(self._markers)
+            self._markers.clear()
+            self._counts["markers_popped"] += len(markers)
+            return MarkerBatch(self._session_id, self._session_generation, self._marker_seq, markers)
 
     def pop_alerts(self) -> tuple[LocalProximityAlert, ...]:
         """Atomically remove and return every queued, unexpired alert (each exactly once)."""
@@ -446,24 +637,33 @@ class PrivateParkingTrigger:
             if (self._closed or self._session_id is None or self._pending_event_id is not None
                     or not self._candidates):
                 return None
-            candidate = self._candidates[0].candidate
-            self._pending_event_id = candidate.event_id
+            entry = self._candidates[0]
+            self._pending_event_id, self._pending_token = entry.candidate.event_id, entry.token
             self._counts["candidates_claimed"] += 1
-            return candidate
+            return entry.candidate
 
-    def complete(self, event_id: str, now: float) -> bool:
-        return self._finish(event_id, now)
+    def complete(self, event_id: str, now: float, *, token: CandidateToken | None = None) -> bool:
+        return self._finish(event_id, now, token)
 
-    def fail(self, event_id: str, now: float) -> bool:
-        return self._finish(event_id, now)
+    def fail(self, event_id: str, now: float, *, token: CandidateToken | None = None) -> bool:
+        return self._finish(event_id, now, token)
 
-    def _finish(self, event_id: str, now: float) -> bool:
+    def _finish(self, event_id: str, now: float, token: CandidateToken | None) -> bool:
+        """Finish exactly the claimed candidate: both its event id and its token must
+        match (a call with the id alone is refused; there is no id-only fallback), so a
+        late cleanup can never finish a newer candidate that reuses the same id."""
         self._require_time(now)
         with self._lock:
-            if self._pending_event_id is None or event_id != self._pending_event_id:
+            if (self._pending_token is None or token != self._pending_token
+                    or event_id != self._pending_event_id):
+                self._counts["finish_rejected"] += 1
                 return False
-            self._candidates = deque(e for e in self._candidates if e.candidate.event_id != event_id)
-            self._pending_event_id = None
+            for entry in self._candidates:
+                if entry.token == token:
+                    self._mark_locked(MarkerKind.CANDIDATE_FINISHED, entry.episode_id, entry.revision,
+                                      entry.crossed_in_at, entry.token)
+            self._candidates = deque(e for e in self._candidates if e.token != token)
+            self._pending_event_id, self._pending_token = None, None
             self._counts["candidates_finished"] += 1
             self._condition.notify_all()
             return True
@@ -476,7 +676,8 @@ class PrivateParkingTrigger:
                 for e in sorted(self._episodes.values(), key=lambda item: item.person_track_id))
             return PrivateParkingDiagnostic(
                 self._session_id, self._pending_event_id, episodes, len(self._alerts),
-                len(self._candidates), tuple(self._counts.items()))
+                len(self._candidates), tuple(self._counts.items()), len(self._preparing),
+                len(self._markers), self._resync_required, self._pending_token)
 
     # ── helpers ──────────────────────────────────────────────────────────────
 
