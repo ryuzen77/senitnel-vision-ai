@@ -63,6 +63,27 @@ uncommitted changes belong to their author: never reset, checkout, stash, delete
 silently amend them. Reference files at the repository root (`geminiService.ts`,
 `package.json`) belong to an older project and are out of scope.
 
+## Errors: one attempt, then references
+
+For a code error, a failing test, or any other error (build, tool, environment):
+
+Scope: this rule applies to errors in work the agent is assigned to change. A read-only
+reviewer never edits: it reports the error with the full output and does not attempt a
+fix. A fix for a reviewer finding follows the same one-attempt rule, inside the scope
+the owner already authorized; it does not need re-approval unless it expands scope or
+needs an action not yet authorized.
+
+1. Make **one** fix attempt yourself, based on the full error output and the source.
+2. If it still fails, stop changing code. Look up references on the internet for that
+   exact error (official documentation, the project's issue tracker, changelogs).
+3. Continue with a fix based on those references and name the sources in the report.
+   If they do not resolve it, stop and report what was tried and what failed.
+
+Limits: search queries never contain secrets, tokens, private URLs, images, payloads
+or user data. A fix attempt never repeats a billed provider request, never runs a live
+device, and never installs packages without owner permission (Action boundaries still
+apply).
+
 ## Workflow: programmer → reviewer → owner
 
 1. **Owner** defines the task (or approves an exec plan under `docs/exec-plans/active/`).
