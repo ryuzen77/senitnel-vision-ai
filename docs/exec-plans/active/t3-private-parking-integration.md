@@ -3,9 +3,8 @@
 Code baseline `36ffa20` (T2 sampler); plan HEAD `7c41672` (H1 docs). §4.1 records the
 facts before T3a1. §4.2, §4.4, §4.5, §4.6 and §4.7 describe trigger, sampler, worker and
 audio-gate contracts as implemented by T3a1 (completed, core only, not wired into runtime).
-§4.3 (`VideoService` lifecycle) is planned for T3a2 and §4.8 for T3b/T3c; neither is
-implemented. T3a2–T3e code does not exist.
-Status: see §8 — **rev 11: design PASS WITH LIMITATIONS (owner-reported); T3a1 completed — core only (reviewed PASS WITH LIMITATIONS, Codex via owner; committed as "feat: prepare private parking integration contracts"); not wired into runtime; T3a2–T3e not started, not authorized. T3 as a whole is not complete.**
+§4.3 (`VideoService` lifecycle) is implemented by T3a2 (completed — lifecycle only). §4.8 is planned for T3b/T3c and not implemented. T3b–T3e code does not exist.
+Status: see §8 — **rev 12: design PASS WITH LIMITATIONS (owner-reported); T3a1 completed — core only (reviewed PASS WITH LIMITATIONS, Codex via owner; committed as "feat: prepare private parking integration contracts"); T3a2 completed — lifecycle only (reviewed PASS; committed as "fix: isolate video session lifecycle and cleanup"); private parking not wired into runtime; T3b–T3e not started, not authorized. T3 as a whole is not complete.**
 
 ## 1. Goal
 
@@ -191,48 +190,103 @@ a `token` the worker calls `complete/fail(event_id, now, token=token)` and requi
 `snapshot.pending_token == token` in `_current` and callback acceptance; candidates
 without a token (legacy, retail) keep the id-only calls.
 
-### 4.3 Start/Stop lifecycle (PM decision of the "rev 5 review" message; planned for T3a2, not implemented)
+### 4.3 Start/Stop lifecycle (T3a2; PM decision of the "rev 5 review" message + preflight delta)
 
 Rules: invalidation is immediate; cleanup may wait for an in-memory start that is
 already running; after cleanup no component is active in the old session; a late
 start result never disturbs a newer session.
 
+Preflight findings (T3a2, 2026-10-08) that the rev 5 pseudocode did not cover:
+- L1: the capture thread's "clean stop" path set `IDLE` itself while `stop()` was still
+  releasing resources and ending sinks; a new session could be reserved in that window
+  and `stop()`'s final write then overwrote the new session's state.
+- L2: when EOF/an error had already started cleanup, a concurrent `stop()` returned at
+  once (idempotent early return) before that cleanup had ended the sinks.
+- L5: after a join timeout (3 s) a new reservation cleared the shared `_stop_event`; the
+  old capture thread could resume, label its frames with the new session id, and run
+  EOF/error cleanup that released the new session's resources.
+- Webcam open had no stop check, so a `stop()` during a slow open could be revived into
+  `RUNNING`; a file open could be revived the same way after its token check.
+
+Design (all in `video_service.py`):
+- One `_CaptureSession` per reservation: `session_id`, token, its own `stop_event`,
+  `released` flag (guarded by `_lock`), its own `cap`/`thread`/`upload_path`/timing, and
+  a `cleanup_done` event. The capture thread receives its session and uses only it:
+  frames carry that session's id, the stop check is that session's event, and the
+  shared `_stop_event` is no longer read by capture loops.
+- Invalidation (`_lock`, O(1)): `released = True`, set the session's `stop_event`, and —
+  if it is still current — clear `_session_id` and set the shared `_stop_event` (used by
+  `wait_for_packet`). The first caller to invalidate becomes the cleanup runner; a later
+  caller waits for that attempt outside every lock, bounded by
+  `cleanup_wait_timeout_seconds` (logged if exceeded). The capture thread never waits.
+- Cleanup attempt vs cleanup success (review delta 1): `cleanup_done` means an attempt
+  ended; success (`cleanup_ok is True`) is computed from facts — capture released,
+  upload deleted, no sink left to end, no unexpected failure. A failing
+  `cap.release()`, upload deletion or `sink.end_session()` keeps that step pending, is
+  logged, and never stops the other steps.
+- Full pass (no `_lock`): close timing; join the thread if it was started and is not the
+  caller (bounded by `capture_join_timeout_seconds`); if the capture thread may still be
+  inside `read()`, the capture and upload release is **deferred** (never released
+  concurrently with a read); clear the packet slot only for this session; end every
+  pending sink under `_lifecycle_lock`.
+- Handoff of a deferred release (review delta 2): the runner's check "has the capture
+  thread left?" and its release of `cleanup_running` happen in ONE `_lock` section, and
+  `_on_capture_exit()` sets `capture_exited` and checks for an unowned deferred release
+  under the same lock. So exactly one owner finishes the release: the runner (thread
+  left before that section) or the exiting capture thread (thread left after it). The
+  release itself runs outside `_lock`, at most once (`cap_released`), and never while
+  the capture may still be reading. No automatic retry.
+- State is derived, never assumed (`_finalize_locked`, current session only): attempt
+  running or release deferred → `ERROR` ("cleanup has not finished" / "waits for it to
+  exit"); attempt failed → `ERROR` ("cleanup failed; Stop retries it"); succeeded and
+  stopped or EOF → `IDLE`; succeeded after a capture/open error → `ERROR` with that
+  error. A new session needs `IDLE`, so B is refused until A's cleanup succeeded.
+- Recovery after `ERROR`: each explicit `stop()` with no runner active resumes the
+  cleanup once per call (manual, never automatic) when it failed (`cleanup_ok False`) or
+  when a release is still deferred although the capture thread already left
+  (`cleanup_ok None`); only still-pending steps run. A capture thread that never leaves
+  `read()` keeps the service in `ERROR` until the process restarts.
+- Start: reservation under `_lock`, then the sink fan-out under `_lifecycle_lock` with a
+  per-call alive check. Attaching a capture and starting its thread happen under `_lock`
+  only while the session is current and unreleased; otherwise the opener releases the
+  capture itself and nothing is revived. Capture/open errors set a transitional
+  `STOPPING`; the final `ERROR` is written when the cleanup attempt ended.
+
 ```
 _atomic_reserve():
-    with _lock:                                   # unchanged reservation
-        require IDLE; sid = new id; _session_id = sid; _released = False; STARTING
+    with _lock: require IDLE; session = _CaptureSession(new ids); _current = session; STARTING
     with _lifecycle_lock:                         # order: _lifecycle_lock → _lock
-        for sink in (buffer_or_tee, detector, scene, worker):
-            with _lock: alive = (_session_id == sid and not _released)
-            if not alive: break                   # skip remaining starts
-            sink.start_session(sid)               # in-memory only, never blocks on I/O
-    return token
+        for sink in (buffer, detector, scene, worker):
+            with _lock: alive = (_current is session and not session.released)
+            if not alive: break
+            sink.start_session(session_id)        # in-memory only
 
 stop():
-    with _lock: if IDLE: return; STOPPING; _start_token = None
-    _release_resources()                          # called without _lock (existing)
-    with _lock: IDLE
+    with _lock: if IDLE: return; STOPPING; _start_token = None; session.stop_requested = True
+    _release_session(session)   # first invalidator → full pass; failed before → retry once;
+                                # otherwise wait (bounded) for the running attempt
+    with _lock: _finalize_locked(session)         # IDLE only after a successful cleanup
 
-_release_resources():
-    with _lock:                                   # immediate invalidation (existing)
-        if _released: return
-        _released = True; capture sid, cap, thread, upload
-    join thread / release cap / delete upload     # no lock held (existing)
-    clear packet slot under _packet_cond          # existing, no _lock
-    with _lifecycle_lock:                         # waits only for a running start fan-out
-        for sink in (worker, detector, scene, buffer_or_tee):
-            sink.end_session(sid)                 # services ignore a non-matching id
+capture EOF / error / open error:
+    with _lock: if released or not current: return; record end_reason; STOPPING
+    _release_session(session)                     # the attempt finalizes IDLE or ERROR
+
+runner handoff (end of each pass, one _lock section):
+    if deferred and capture_exited: keep ownership, deferred = False → capture-only pass
+    else: cleanup_running = False; cleanup_ok = None if deferred else success; finalize
+
+capture thread exit (same _lock):
+    capture_exited = True; take over if a release is deferred and no runner owns it
+    capture-only pass (release capture + upload) outside the lock, then the handoff
 ```
 
-Lock order: `_lifecycle_lock` → `_lock` (brief read) → each service lock. `_lock` is
-never held while acquiring `_lifecycle_lock`; `_lifecycle_lock` is never held during
-join, capture release, file deletion, HTTP or device calls (HTTP happens on the worker
-thread, device calls on the gate thread, neither inside `start_session`/`end_session`).
-Why it holds: a start fan-out for `sid` checks `_released` before every call; the end
-fan-out for `sid` runs after it and covers every sink that was started; session B can
-only be reserved after `stop()` returned (state `IDLE`), so a late start for A sees
-`_session_id != A` and stops. Coordinator and tee also keep generations bumped by their
-own `start_session`/`end_session` and drop results of calls captured under an older one.
+Lock order: `_lifecycle_lock` → `_lock` (brief) → each service lock; `_packet_cond` is
+never taken with `_lock` held. `_lock` is never held while acquiring `_lifecycle_lock`,
+and neither lock is held during a join, capture release, file deletion, HTTP or device
+call; a thread `start()` happens under `_lock` (it does not wait for the new thread's
+work). Session B can only be reserved after A is `IDLE`, i.e. after A's cleanup
+succeeded; a waiter whose bounded wait expires leaves `ERROR`, never `IDLE`, and A's
+later finalization never writes another session's state.
 
 ### 4.4 Authoritative resync of working samples
 
@@ -591,9 +645,86 @@ Limitations (delta 2):
 - The two equivalent mutants mark redundant guards kept as defence in depth.
 
 **T3a2 — session lifecycle**
-Files: `backend/app/services/video_service.py` and its tests.
-Scope: §4.3 `_lifecycle_lock`, per-call revive check, serialized end fan-out.
-Acceptance: 17, 18; all existing video and integration tests green.
+Files: `backend/app/services/video_service.py` and its tests (plus this plan).
+Scope: §4.3 — per-session capture context, `_lifecycle_lock`, per-call revive check,
+serialized end fan-out, invalidator-owned finalization, bounded waits, no revival of a
+stopped start. Out of scope: coordinator, runtime/env, API.
+Acceptance: 17, 18; deterministic gate tests for: start A held then Stop; Stop
+concurrent with EOF (both orders); A's finalization never overwrites B; capture A
+resuming after a join timeout; cleanup failure/timeout; old packets/resources never
+owned by B; all existing video and integration tests green.
+Status: **completed — lifecycle only, reviewed PASS** (implemented 2026-10-08 with review
+deltas 1–2; verdict PASS stated in the owner's commit instruction, 2026-10-08; committed as
+"fix: isolate video session lifecycle and cleanup"). Coordinator, runtime/env and API
+are not part of T3a2.
+
+**T3a2 results (agent run, 2026-10-08, HEAD `745cd44`, working tree; incl. review deltas 1–2)**
+
+Changed: `backend/app/services/video_service.py`; new
+`backend/tests/test_video_session_lifecycle.py`; this plan (§4.3, T3a2); `PLAN.md` status
+line. No other file.
+
+Review delta 1 (Codex findings relayed by the owner, 2026-10-08): (1) a cleanup waiter
+timeout no longer opens `IDLE` — A stays invalidated in `ERROR` and B is refused until A's
+cleanup succeeded, and the later finalization is consistent; (2) "attempt ended" is
+separated from "cleanup succeeded" — a failing `cap.release()`, upload deletion or
+`sink.end_session()` yields `ERROR`, keeps that step pending and still cleans the rest;
+(3) a capture still inside `read()` after the join timeout is never released
+concurrently — the release is deferred; (4) fake tests strengthened (below).
+
+Review delta 2 (Codex finding relayed by the owner, 2026-10-08): the deferred-release
+handoff was not atomic — the runner checked "thread left?" and released ownership in two
+`_lock` sections, so a capture thread exiting between them saw the runner still owning
+and did nothing, leaving the release unowned (`cleanup_ok None`, `ERROR` forever). Fixed
+by one `_lock` section for check + ownership release (shared with `_on_capture_exit`),
+and an explicit `stop()` now also resumes a deferred release whose capture thread has
+left (not only `cleanup_ok False`).
+
+Behaviour: per-session `_CaptureSession`; immediate invalidation; one cleanup runner per
+attempt; derived final state (§4.3); capture threads receive their session through
+`kwargs` (thread `args` unchanged) and never read the shared `_stop_event`; packets are
+never published after invalidation and only the own packet is cleared;
+`_lifecycle_lock` serializes sink start/end; a stop that wins during a slow open is
+never revived (a failing open after it is not turned into `ERROR`); constructor keywords
+`capture_join_timeout_seconds` (3 s) and `cleanup_wait_timeout_seconds` (join + 2 s),
+validated finite and > 0; the file pacing wait wakes on the session's stop.
+
+| Check | Command / method | Result |
+|---|---|---|
+| Lifecycle tests | `pytest backend/tests/test_video_session_lifecycle.py` (process timeout 120 s) | 25 passed, 3 consecutive runs |
+| Handoff gap reproduced | the handoff tests run against the previous (non-atomic) `video_service.py`, restored byte-for-byte | `[after]` (thread exits after "left?"=False, before ownership release) and the lost-handoff Stop test fail; `[before]`/`[inside]` pass there too |
+| Video + related integration | `pytest` on the 8 video/integration files (`test_video_session_lifecycle`, `test_video_service`, `test_video_api`, `test_video_event_frame_buffer`, `test_video_scene_pipeline`, `test_video_startup_timing`, `test_evaluation_runtime_integration`, `test_detector_tracker_integration`) | 193 passed |
+| Full backend, run after the targeted run (`--basetemp` unique) | `pytest backend/tests -q` | 1064 passed (1039 + 25) |
+| `pip check` / `git diff --check` / new-file whitespace | as listed | clean |
+| Mutations (20) | alive check, end fan-out lock, session signal, loser wait, publish stop check, revival on attach, finalize current-only, no IDLE while unfinished, no IDLE after failure, failed-start ownership, failed sink stays pending, failed release stays pending, no release during a read, capture thread finishes a deferred release, runner resumes it, runner gives up ownership before checking the thread (non-atomic handoff), Stop never resumes, Stop resumes only failures, bounded join, capture ownership | 19 killed; 1 equivalent (capture ownership guard: a late capture finish can only occur while A is deferred and B is refused) |
+
+Tests cover: start A held then Stop (two stages + lock-order check); EOF cleanup first
+then Stop, and Stop first then EOF; waiter timeout while a sink is held → `ERROR`, B
+refused, consistent `IDLE` after the cleanup succeeds; a late `stop()` wake never writing
+B; capture A blocked in `read()` past the join timeout (late frame / EOF / error) →
+`ERROR`, B refused, no release during the read, release by the capture thread on exit;
+the thread leaving while the runner is still ending sinks; a failing capture release
+(`ERROR`, B refused, each Stop retries once, success after the fault is gone); a sink that
+raises before clearing its session (`ERROR`, other sinks ended, only that sink retried);
+the runner/exit handoff paused before, inside and after the runner's handoff section
+(release exactly once, never during a read, cleanup succeeds, B accepted only after
+`IDLE`); a lost handoff resumed by an explicit Stop;
+slow webcam/file open raced by Stop (incl. a failing open); capture error with a
+concurrent Stop; invalid timeouts. The pre-delta "old implementation" comparison is no
+longer meaningful and is not repeated.
+
+Limitations:
+- A capture thread that never returns from `read()` keeps the service in `ERROR` (its
+  capture is intentionally not released); only a process restart clears it.
+- The handoff guarantee is shown with an instrumented `_lock` in fakes at three pause
+  points; it is not a proof for every interleaving of a real OpenCV backend.
+- A sink whose `end_session` keeps failing keeps the service in `ERROR`; each Stop
+  retries once. Nothing retries automatically.
+- After a bounded wait expires the caller returns while the other attempt continues;
+  the state stays `ERROR` until that attempt finalizes.
+- The `ERROR` text is the only external signal of a pending/failed cleanup (no new API
+  field; API changes are out of scope).
+- Only fakes are tested; the OpenCV backend behaviour of a blocked `read()` is not.
 
 **T3b — coordinator**
 Files: new `backend/app/services/private_parking_coordinator.py` (coordinator +
@@ -664,7 +795,9 @@ evidence was not included in the relay). Acceptance 24 and 30 finalised.
   CRLF working copies normalise to pure-LF blobs (`git hash-object` = LF-normalised hash).
 - Limitation kept open: `event_id`-based lookup in `wait_for_bundle` and failure
   records; T3b must pass each alert's own triple (see T3b).
-- **T3a2, T3b, T3c, T3d, T3e: not authorized** — each waits for its own owner
+- **T3a2: completed — lifecycle only, reviewed PASS** (review deltas 1–2 applied; see
+  "T3a2 results"; committed on the owner's instruction, 2026-10-08).
+- **T3b, T3c, T3d, T3e: not started, not authorized** — each waits for its own owner
   authorization (`docs/PLANS.md`).
 - Open for review: the deviations and limitations listed under "T3a1 results", the
   worker identity extension in "T3a1 delta 1", the episode-instance contract in
