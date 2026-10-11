@@ -63,6 +63,7 @@ from pydantic import ValidationError
 
 from app.models.domain import DomainName
 from app.models.evaluation import EvaluationCallback, EvaluationCallbackPayload, EvaluationRequest
+from app.models.private_parking import ProximityEvidence
 
 logger = logging.getLogger(__name__)
 
@@ -132,6 +133,32 @@ _DOMAIN_CONTEXT = {
         "score only for clearly visible concealment of merchandise in a bag or under clothing."
     ),
 }
+
+
+# Private parking (T3d): selected only for ProximityEvidence with the sealed frame roles in
+# this exact order; the legacy and retail texts above stay byte-identical.
+PRIVATE_FRAME_ROLES = ("CROSSING", "JOURNEY", "JOURNEY", "JOURNEY", "APPROACH")
+_PRIVATE_ROLE_LABELS = {"CROSSING": "crossing", "JOURNEY": "journey", "APPROACH": "approach"}
+_PRIVATE_PARKING_CONTEXT = (
+    "Context: a private parking area (home or boarding house) with an access line. The frames "
+    "follow one person: frame 1 (crossing) shows the person crossing the access line into the "
+    "area, frames 2-4 (journey) the walk inside, frame 5 (approach) the approach to a parked "
+    "motorcycle. Judge the visible actions across the whole crossing, journey and approach "
+    "sequence, not a single frame. Crossing the line, the missing authorization gesture, "
+    "looking around, walking through the area and approaching or standing next to a motorcycle "
+    "are not evidence of theft, alone or together: owners, family, staff and visitors often do "
+    "all of this without a gesture. Describe, only as far as the frames show it, hands on or "
+    "interaction with the lock or the handlebar, handling of components (ignition, cables, "
+    "seat, body panels) and movement of the motorcycle (pushed, lifted, rolled), and weigh them "
+    "in the score as the visible evidence supports them: repeated or forceful handling of the "
+    "lock or ignition, or moving a parked motorcycle away, weighs more than a brief touch. "
+    "Never infer identity, ownership or permission from the images. If the evidence is "
+    "ambiguous, occluded or of low quality, say so ('tidak terlihat jelas' or 'ambigu') and do "
+    "not turn it into certainty in either direction. A separate local rule already issued an "
+    "access warning because no gesture was seen; this assessment is independent of that "
+    "warning and neither confirms nor cancels it. Keep reasoning to at most two short "
+    "sentences, clothing and observedAction to a few words, and list only a few visible items."
+)
 
 
 class GeminiErrorKind(str, enum.Enum):
@@ -459,11 +486,18 @@ class GeminiEvaluationClient:
                 or bundle.total_jpeg_bytes != sum(len(frame.jpeg) for frame in frames)
                 or bundle.total_jpeg_bytes > MAX_BUNDLE_JPEG_BYTES):
             raise GeminiEvaluationError(GeminiErrorKind.INVALID_REQUEST)
+        # Private evidence is never sent with the open-parking context (no fallback).
+        private = isinstance(request.evidence, ProximityEvidence)
+        if private and (request.domain is not DomainName.PARKING_MOTORCYCLE
+                        or tuple(frame.role for frame in frames) != PRIVATE_FRAME_ROLES):
+            raise GeminiEvaluationError(GeminiErrorKind.INVALID_REQUEST)
+        context = _PRIVATE_PARKING_CONTEXT if private else _DOMAIN_CONTEXT[request.domain]
         parts: list[dict[str, Any]] = [
-            {"text": _COMMON_RULES.format(context=_DOMAIN_CONTEXT[request.domain])},
+            {"text": _COMMON_RULES.format(context=context)},
         ]
         for index, frame in enumerate(frames, 1):
-            parts.append({"text": f"Frame {index} of 5, t={frame.actual_offset_seconds:+.2f} s"})
+            role = f" ({_PRIVATE_ROLE_LABELS[frame.role]})" if private else ""
+            parts.append({"text": f"Frame {index} of 5{role}, t={frame.actual_offset_seconds:+.2f} s"})
             parts.append({"inlineData": {"mimeType": "image/jpeg",
                                          "data": base64.b64encode(frame.jpeg).decode("ascii")}})
         payload = {

@@ -52,6 +52,8 @@ class SelectedFrame:
     frame_height: int
     mime_type: str
     jpeg: bytes = dataclasses.field(repr=False)
+    # Private-parking evidence role (CROSSING | JOURNEY | APPROACH); None for buffer frames.
+    role: str | None = None
 
 
 @dataclasses.dataclass(frozen=True)

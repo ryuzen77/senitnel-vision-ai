@@ -2,11 +2,19 @@
 
 Parking mode (T3c): ``SENTINEL_PARKING_MODE`` unset/``legacy`` keeps today's legacy
 parking trigger; ``private`` with a valid ``SENTINEL_PRIVATE_PARKING_CONFIG_FILE`` wires the
-private-parking coordinator, evidence sampler and frame tee (detector and tee required,
-evaluation disabled until the private prompt exists); any other value, or a missing or
-invalid private configuration, wires an explicitly disabled candidate path — never a
-fallback to legacy. Only that selection lives in :func:`build_parking_wiring`; the rest of
-this module is unchanged. Paths and configuration contents are never logged.
+private-parking coordinator, evidence sampler and frame tee (detector and tee required);
+any other value, or a missing or invalid private configuration, wires an explicitly
+disabled candidate path — never a fallback to legacy. Only that selection lives in
+:func:`build_parking_wiring`; the rest of this module is unchanged. Paths and configuration
+contents are never logged.
+
+Private evaluation (T3d): :func:`evaluation_worker_enabled` decides the worker's
+``enabled`` flag. Legacy mode keeps the evaluation configuration's decision; the disabled
+mode never evaluates; private mode evaluates only when ``SENTINEL_PRIVATE_PARKING_EVALUATION``
+is ``true`` (unset/``false`` = off, any other value = off with a warning), the selected
+transport is ``gemini`` (the only one with the private prompt; Langflow = off with a
+warning) and the existing Gemini configuration is ready. Enabling it is a configuration
+change only; a live request still needs the owner's permission.
 """
 
 from __future__ import annotations
@@ -272,6 +280,34 @@ def _read_private_parking_config(env: Mapping[str, str]) -> PrivateParkingConfig
     return config
 
 
+def _private_parking_evaluation_requested(env: Mapping[str, str]) -> bool:
+    """SENTINEL_PRIVATE_PARKING_EVALUATION: unset/false = off; true = requested."""
+    raw = env.get("SENTINEL_PRIVATE_PARKING_EVALUATION")
+    if raw is None or raw == "false":
+        return False
+    if raw == "true":
+        return True
+    logger.warning("Private parking evaluation disabled: invalid enable flag configuration")
+    return False
+
+
+def evaluation_worker_enabled(wiring: "ParkingWiring", env: Mapping[str, str], *,
+                              transport: str | None, evaluation_enabled: bool) -> bool:
+    """Legacy: the evaluation configuration decides. Disabled mode: never. Private (T3d):
+    only with SENTINEL_PRIVATE_PARKING_EVALUATION=true, the direct Gemini transport (the
+    only one with the private prompt) and the existing Gemini readiness. Enabling it is a
+    configuration change only; a live request still needs the owner's permission."""
+    if wiring.worker_enabled_override is None:
+        return evaluation_enabled
+    if wiring.mode != "private" or not _private_parking_evaluation_requested(env):
+        return False
+    if transport != "gemini":
+        if transport is not None:
+            logger.warning("Private parking evaluation disabled: the selected transport has no private prompt")
+        return False
+    return evaluation_enabled
+
+
 @dataclasses.dataclass(frozen=True)
 class ParkingWiring:
     """The mode-dependent objects of the composition (everything else is shared)."""
@@ -295,8 +331,11 @@ def build_parking_wiring(env: Mapping[str, str], *, event_frame_buffer: EventFra
     """Select the parking objects for ``env`` (pure apart from reading the private
     configuration file once). Private: the coordinator in the detector slot, the tee
     (EventFrameBuffer + sampler) in the buffer slot, the SAMPLER as the only bundle
-    source, detector and tee required, evaluation disabled until the private prompt
-    (T3d). Invalid mode/config: one DisabledParkingTrigger, never the legacy trigger."""
+    source, detector and tee required, and ``worker_enabled_override=False`` so the
+    worker's ``enabled`` flag is decided by :func:`evaluation_worker_enabled` (on only
+    with ``SENTINEL_PRIVATE_PARKING_EVALUATION=true``, the ``gemini`` transport and a
+    ready Gemini configuration). Invalid mode/config: one DisabledParkingTrigger, never
+    the legacy trigger, and evaluation never enabled."""
     mode = _parking_mode(env)
     if mode == "legacy":
         trigger = ParkingCandidateTrigger()
@@ -367,8 +406,8 @@ evaluation_worker = EvaluationWorker(
     parking_wiring.worker_trigger, evaluation_budget, parking_wiring.bundle_source,
     evaluation_client if evaluation_client is not None else _UnavailableDispatcher(),
     callback_timeout_seconds=effective_callback_timeout_seconds,
-    enabled=(evaluation_enabled if parking_wiring.worker_enabled_override is None
-             else parking_wiring.worker_enabled_override),
+    enabled=evaluation_worker_enabled(parking_wiring, os.environ, transport=evaluation_transport,
+                                      evaluation_enabled=evaluation_enabled),
     max_dispatches=evaluation_max_dispatches,
     audio_gate=audio_alert_gate,
     candidate_strategies=parking_wiring.candidate_strategies,

@@ -644,7 +644,7 @@ class EpisodeEvidenceSampler:
                 frames.append(SelectedFrame(frame.source_frame_seq, frame.source_timestamp,
                                             frame.actual_offset_seconds, frame.actual_offset_seconds,
                                             deviation, frame.frame_width, frame.frame_height,
-                                            "image/jpeg", frame.jpeg))
+                                            "image/jpeg", frame.jpeg, role=frame.role.value))
             if (plan.domain is not DomainName.PARKING_MOTORCYCLE
                     or plan.triggered_at != evidence.triggered_at
                     or plan.required_frame_count != EVIDENCE_FRAME_COUNT

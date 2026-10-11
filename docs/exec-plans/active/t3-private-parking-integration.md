@@ -3,8 +3,8 @@
 Code baseline `36ffa20` (T2 sampler); plan HEAD `7c41672` (H1 docs). §4.1 records the
 facts before T3a1. §4.2, §4.4, §4.5, §4.6 and §4.7 describe trigger, sampler, worker and
 audio-gate contracts as implemented by T3a1 (completed, core only, not wired into runtime).
-§4.3 (`VideoService` lifecycle) is implemented by T3a2 (completed — lifecycle only). §4.2 alert sequence and §4.4 resync application are implemented by T3b (completed — core only: coordinator and tee, not wired). The T3c lifecycle prerequisites are implemented and committed: T3c0.1 (`e50d9e2`, detector cleanup/lease/delivery) and T3c0.2 (`d479357`, VideoService required-sink/refusal capability, token-bound upload rollback, capture cleanup). The rest of §4.8 — private-mode configuration and runtime wiring — is T3c: completed — fake integration verified (committed as "feat: wire private parking runtime with fail-closed configuration"); not proven on a real device. T3d and T3e code does not exist.
-Status: see §8 — **rev 13: design PASS WITH LIMITATIONS (owner-reported); T3a1 completed — core only (reviewed PASS WITH LIMITATIONS, Codex via owner; committed as "feat: prepare private parking integration contracts"); T3a2 completed — lifecycle only (reviewed PASS; committed as "fix: isolate video session lifecycle and cleanup"); T3b completed — core only (coordinator and bounded tee; independent review PASS on the overflow delta; committed as "feat: add private parking coordinator and bounded frame tee"); T3c0.1 completed (`e50d9e2`) and T3c0.2 completed (`d479357`) — lifecycle prerequisites, reviewed PASS WITH LIMITATIONS; T3c (wiring and mode) completed — fake integration verified (committed as "feat: wire private parking runtime with fail-closed configuration"); not proven on a real device; T3d and T3e not started, not authorized. T3 as a whole is not complete.**
+§4.3 (`VideoService` lifecycle) is implemented by T3a2 (completed — lifecycle only). §4.2 alert sequence and §4.4 resync application are implemented by T3b (completed — core only: coordinator and tee, not wired). The T3c lifecycle prerequisites are implemented and committed: T3c0.1 (`e50d9e2`, detector cleanup/lease/delivery) and T3c0.2 (`d479357`, VideoService required-sink/refusal capability, token-bound upload rollback, capture cleanup). The rest of §4.8 — private-mode configuration and runtime wiring — is T3c: completed — fake integration verified (committed as "feat: wire private parking runtime with fail-closed configuration"); not proven on a real device. T3d (private prompt and private dispatch gate) completed — reviewed PASS WITH LIMITATIONS, closure check PASS (Codex via PM); committed as "feat: enable direct Gemini evaluation for private parking"; model accuracy, gesture, latency and real devices not proven; T3e code does not exist.
+Status: see §8 — **rev 13: design PASS WITH LIMITATIONS (owner-reported); T3a1 completed — core only (reviewed PASS WITH LIMITATIONS, Codex via owner; committed as "feat: prepare private parking integration contracts"); T3a2 completed — lifecycle only (reviewed PASS; committed as "fix: isolate video session lifecycle and cleanup"); T3b completed — core only (coordinator and bounded tee; independent review PASS on the overflow delta; committed as "feat: add private parking coordinator and bounded frame tee"); T3c0.1 completed (`e50d9e2`) and T3c0.2 completed (`d479357`) — lifecycle prerequisites, reviewed PASS WITH LIMITATIONS; T3c (wiring and mode) completed — fake integration verified (committed as "feat: wire private parking runtime with fail-closed configuration"); not proven on a real device; T3d (private prompt and private dispatch gate) completed — reviewed PASS WITH LIMITATIONS, closure check PASS (Codex via PM); committed as "feat: enable direct Gemini evaluation for private parking"; model accuracy, gesture, latency and real devices not proven; T3e not started, not authorized. T3 as a whole is not complete.**
 
 ## 1. Goal
 
@@ -2002,6 +2002,240 @@ offsets, explicit statement that access without a gesture is not evidence of the
 legacy and retail prompts byte-identical.
 Acceptance: mock-transport tests; 9 (post-T3d); no live request.
 
+*T3d plan — backend, direct Gemini API* — **rev 2** (plan only, 2026-10-11, baseline
+`d075207`; PM messages "backend T3d: rencana prompt privat" and the T3d design correction
+of 2026-10-11). Implementation is authorized within this plan once the design findings
+are closed by an independent review (Codex); until then no backend source is changed.
+Rev 2 replaces the scoring rule of D3 (the "raise only for clear tampering" rule is
+withdrawn) and adds prompt acceptance 9-12. Supersedes the file list above: Langflow is FROZEN (its client is not
+changed; private requests never reach it).
+
+Source facts (read at `d075207`, not run):
+- `GeminiEvaluationClient._encode` builds one user turn: `_COMMON_RULES` with
+  `_DOMAIN_CONTEXT[request.domain]`, then per frame a text part `Frame i of 5,
+  t=±x.xx s` and the JPEG as `inlineData`; `generationConfig` holds only
+  `responseFormat.text{mimeType: APPLICATION_JSON, schema: ASSESSMENT_SCHEMA}` — no
+  thinking level, no `maxOutputTokens`, no temperature (model defaults; recorded as open
+  in `docs/references/gemini-generatecontent.md`). `_parse` accepts only `finishReason
+  STOP` and validates the assessment (score band ↔ status) unchanged.
+- The prompt is selected by DOMAIN only. Private candidates are also
+  `PARKING_MOTORCYCLE`, so today they would get the open-parking context ("a person
+  stayed near a parked motorcycle"). Private requests are recognisable by
+  `request.evidence` being `ProximityEvidence` (legacy: `ParkingCandidateEvidence`).
+- A private seal is always 5 frames in time order: 1 `CROSSING`, 3 `JOURNEY`, 1
+  `APPROACH` (`EvidenceFrame.role`), but the bundle's `SelectedFrame` carries no role, so
+  the client cannot label frames by role today.
+- Runtime: private mode builds the worker with `enabled=False` (T3c); the Langflow
+  transport has no private prompt.
+
+Design:
+- D1 Frame roles: add an optional `role: str | None = None` (last field, keyword
+  default) to `SelectedFrame`; the sampler's `wait_for_bundle` fills it from
+  `EvidenceFrame.role`; `EventFrameBuffer` keeps `None`. Legacy/retail bundles,
+  `_valid_bundle` and the worker are unchanged.
+- D2 Prompt selection: `_encode` uses the PRIVATE context only when `request.evidence` is
+  a `ProximityEvidence`, the domain is `PARKING_MOTORCYCLE` and the five frames carry
+  exactly the roles CROSSING, JOURNEY, JOURNEY, JOURNEY, APPROACH in this order;
+  a private request that does not satisfy this is `INVALID_REQUEST` (no HTTP, no fallback
+  to the open-parking context). Every other request keeps today's text byte for byte.
+- D3 Private context (rev 2; English instructions, Indonesian output, as the existing
+  prompt). Content, in this order:
+  - Scene and sequence: a private parking area with an access line; frame 1 = the person
+    crossing into the area (CROSSING), frames 2-4 = the walk inside (JOURNEY), frame 5 =
+    the approach to a parked motorcycle (APPROACH). Judge the visible ACTIONS across the
+    whole CROSSING → JOURNEY → APPROACH sequence, not a single frame.
+  - What is NOT evidence of theft: crossing the line, the missing authorization gesture,
+    looking around, walking through the area and approaching or standing next to a
+    motorcycle — alone or together. Owners, family, staff and visitors often do all of
+    this without a gesture.
+  - What to describe when visible, exactly as far as the frames show it: hands on or
+    interaction with the lock or the handlebar, handling of components (ignition, cables,
+    seat, body panels), and movement of the motorcycle (pushed, lifted, rolled). Weigh
+    these in the score as the visible evidence supports them; repeated or forceful
+    handling of the lock/ignition or moving a parked motorcycle away weighs more than a
+    brief touch.
+  - Never infer identity, ownership or permission ("izin") from the images, nor intent or
+    a crime from appearance, clothing or presence.
+  - Ambiguous, occluded or low-quality evidence is stated as ambiguous ("tidak terlihat
+    jelas" / "ambigu") and must not be turned into certainty in either direction.
+  - The local access warning was issued by a separate rule (no gesture seen); this
+    assessment is independent of it and neither confirms nor cancels it.
+  Frame labels: `Frame i of 5 (crossing|journey|approach), t=±x.xx s` with the actual
+  offsets. The score bands, status rule and output fields are the existing ones (D4).
+- D4 Output and validation unchanged: the same `ASSESSMENT_SCHEMA` (shared by all
+  domains, so it is not edited), `_parse`, `ThreatAssessment.validate`, single acceptance
+  path through `EvaluationWorker.accept_callback`. The private CRITICAL clip path and
+  dedup with the local warning stay as implemented.
+- D5 Cost (UMKM): no change to model, thinking level, `maxOutputTokens` or temperature
+  (open decisions below). Within the prompt only: "reasoning at most two short
+  sentences; clothing/observedAction a few words; lists only visible items, at most a
+  few" (private context only; legacy text unchanged). Existing budget rules stay: one
+  evaluation in flight, 10 s spacing, 2 per 60 s, candidate TTL 2 s (O6), no retry,
+  optional `SENTINEL_EVALUATION_MAX_DISPATCHES` per process.
+- D6 Enabling private dispatch (runtime): the private worker is enabled only when ALL
+  hold — mode `private` with a valid config; new flag
+  `SENTINEL_PRIVATE_PARKING_EVALUATION=true` (default unset/false; any other value →
+  off with a generic warning); `SENTINEL_EVALUATION_TRANSPORT=gemini`; the existing
+  Gemini readiness (`evaluation_enabled`: key/model/timeout below the result deadline,
+  callback timeout, dispatch limit valid). Langflow selected → private dispatch stays off
+  with the warning "Private parking evaluation disabled: the selected transport has no
+  private prompt". Legacy and disabled modes ignore the flag. Enabling the flag is a
+  configuration change only; a LIVE request still needs an explicit owner permission
+  per run (RELIABILITY live-test protocol, `SENTINEL_EVALUATION_MAX_DISPATCHES=1`).
+
+Files: `backend/app/services/gemini_evaluation_client.py` (D2, D3, D5),
+`backend/app/models/event_frame.py` (D1, one optional field),
+`backend/app/services/private_parking_evidence_sampler.py` (D1, fill the role),
+`backend/app/services/runtime.py` (D6 rule), `backend/.env.example` (the new flag,
+commented); new `backend/tests/test_gemini_private_prompt.py`; new
+`backend/tests/test_private_parking_evaluation_enable.py`; this plan. Not changed:
+`langflow_evaluation_client.py` (frozen), `evaluation_worker.py`, `ASSESSMENT_SCHEMA`,
+API, frontend, `AGENTS.md`, `PLAN.md` (shared; status update only after PM
+coordination), `ARCHITECTURE.md`/`RELIABILITY.md` (proposed after implementation, with PM
+coordination).
+Configuration changes: one new variable `SENTINEL_PRIVATE_PARKING_EVALUATION`
+(`true` | `false`, default off). Effective private dispatch additionally needs
+`SENTINEL_PARKING_MODE=private`, a valid `SENTINEL_PRIVATE_PARKING_CONFIG_FILE`,
+`SENTINEL_EVALUATION_TRANSPORT=gemini` and the existing Gemini variables. No model,
+thinking or token variable is added.
+
+Acceptance (fakes and `httpx.MockTransport` only; no live request, device or speaker):
+1. Private request (ProximityEvidence + roles) → the payload has the private context, the
+   "missing gesture is not evidence of theft" statement, the brevity rule and role labels
+   in order with the actual offsets; `generationConfig` equals today's (same schema, no
+   thinking/token/temperature keys).
+2. Legacy parking and retail payloads are byte-identical to `d075207` (golden payloads
+   built in the test from fixed requests; any diff fails).
+3. A private request with missing roles, wrong order, wrong count or another domain →
+   `INVALID_REQUEST`, zero HTTP calls, no fallback to the open-parking context.
+4. Response handling unchanged: valid JSON → accepted callback; band mismatch, extra
+   field, non-STOP finish, blocked prompt → the existing rejections; private and legacy
+   share them.
+5. Sampler bundles carry the roles CROSSING, JOURNEY×3, APPROACH; `EventFrameBuffer`
+   bundles carry `None`; `_valid_bundle` still accepts both.
+6. Enable matrix (D6): flag unset/false/invalid, Langflow selected, Gemini not ready →
+   private worker disabled (warning without values); flag true + Gemini ready → enabled;
+   legacy/disabled modes unaffected by the flag.
+7. End to end with fakes: private stack, worker enabled by the D6 rule, Gemini client over
+   a MockTransport → at most one dispatch per episode, the bundle passes `_valid_bundle`,
+   a CRITICAL result after the local warning for the same event is NOT granted a second
+   time (dedup), a failed dispatch is not retried, expired candidates are never sent.
+8. Logs carry no prompt text, images, base64, key or response body (existing rule).
+9. Prompt case "owner without a gesture": a fixture describing an ordinary entry and
+   approach — the request carries the D3 statement that crossing, a missing gesture and
+   approaching are not evidence of theft, and a mocked NORMAL response is accepted.
+10. Prompt case "ordinary approach": a mocked response with NORMAL/WARNING and a
+   reasoning that mentions looking around passes validation unchanged; no client-side
+   rule raises or lowers the model's score.
+11. Prompt case "ambiguous interaction": the request carries the ambiguity instruction;
+   a mocked WARNING response stating "tidak terlihat jelas" is accepted as is.
+12. Prompt case "visible manipulation": the request carries the lock/handlebar/
+   component/movement instruction; a mocked CRITICAL response is accepted and goes
+   through the existing CRITICAL path (audio dedup with the local warning unchanged).
+   Acceptance 9-12 test the REQUEST TEXT and the unchanged handling of fixed MOCKED
+   responses only. They are not evidence of model accuracy; real model behaviour on
+   these cases is unproven until an owner-authorized live evaluation.
+Kept unchanged (rev 2): model, thinking level, `maxOutputTokens`, temperature, image
+quality/size, `ASSESSMENT_SCHEMA`, the legacy and retail prompts (byte-identical), and the
+frozen Langflow client.
+Open decisions for the PM (no change without an explicit decision): thinking level and
+`maxOutputTokens` for cost (currently model defaults); image size/quality sent per frame
+(currently the captured JPEG, ≤ 12 MiB per bundle); whether the private prompt may add a
+schema-level length limit (would change the shared schema, so not proposed).
+Dependencies not finished: gesture source (O1); the first live private evaluation needs
+owner permission; the local warning clip asset; T3e device checks.
+
+**T3d results (agent run, 2026-10-11, HEAD `d075207`, working tree; implemented — at that time awaiting independent review; see "T3d independent review")**
+Design review (Codex via PM, 2026-10-11): **PASS WITH LIMITATIONS** for rev 2; the plan
+blob matched the reviewed version (`098dcf22f21d1502451e8fcf711fe264f19d083d`) before any
+source change. Implementation authorized within this plan by the same PM message.
+Files: `backend/app/models/event_frame.py` (`SelectedFrame.role: str | None = None`),
+`backend/app/services/private_parking_evidence_sampler.py` (bundle frames carry
+`role=frame.role.value`), `backend/app/services/gemini_evaluation_client.py`
+(`PRIVATE_FRAME_ROLES`, `_PRIVATE_PARKING_CONTEXT`, private selection and role labels in
+`_encode`), `backend/app/services/runtime.py` (`_private_parking_evaluation_requested`,
+`evaluation_worker_enabled`, used for the production worker), `backend/.env.example`
+(`SENTINEL_PRIVATE_PARKING_EVALUATION`, commented, default false); new
+`backend/tests/test_gemini_private_prompt.py` (15) and
+`backend/tests/test_private_parking_evaluation_enable.py` (13); this plan. Not changed:
+`langflow_evaluation_client.py`, `evaluation_worker.py`, `ASSESSMENT_SCHEMA`,
+`generationConfig`, model/thinking/token/temperature/image handling, API, frontend,
+`AGENTS.md`, `PLAN.md`, `ARCHITECTURE.md`, `RELIABILITY.md`.
+- Behaviour: a request whose evidence is `ProximityEvidence` gets the private context
+  (sequence CROSSING → JOURNEY → APPROACH; crossing / no gesture / looking around /
+  approaching are not evidence of theft; lock, handlebar, component handling and
+  motorcycle movement described and weighed as visible; no identity, ownership or
+  permission inferred; ambiguity stated; independent of the local access warning;
+  brevity rule) and labels `Frame i of 5 (crossing|journey|approach), t=±x.xx s`. It must
+  be `PARKING_MOTORCYCLE` with the roles in exactly that order, otherwise
+  `INVALID_REQUEST` before HTTP, never the open-parking context. Legacy and retail
+  payloads are byte-identical (SHA-256 captured from the client at `d075207` before the
+  change and asserted in the tests). Private dispatch: legacy keeps the evaluation
+  configuration; disabled mode never; private only with
+  `SENTINEL_PRIVATE_PARKING_EVALUATION=true` + transport `gemini` + the existing Gemini
+  readiness; Langflow → off with a warning; invalid flag → off with a warning (no value).
+- Tests: private payload text, labels and unchanged `generationConfig`; golden legacy and
+  retail payloads (also with roles on non-private evidence); 5 invalid private requests
+  rejected with zero HTTP calls; shared response validation; buffer bundles carry no role;
+  prompt cases 9-12 (owner without gesture, ordinary approach, ambiguous interaction,
+  visible manipulation) — request text + unchanged handling of fixed MOCKED responses,
+  NOT evidence of model accuracy; logs free of prompt, image and key; activation matrix
+  (7 private cases, legacy/disabled ignore the flag); the real `runtime` module (subprocess)
+  enables the private worker only with the flag; end to end with fakes (private wiring,
+  real Gemini client over `MockTransport`): local LOCAL-clip warning first, one dispatch
+  with role labels CROSSING, JOURNEY×3, APPROACH from the sampler bundle, the CRITICAL
+  result for the same event dropped as a duplicate (one grant in total), no second
+  dispatch for the same episode, a failed (HTTP 500) dispatch not retried, an expired
+  candidate never sent.
+- Mutations (agent run, scratch script, sources restored): private evidence with the
+  open-parking context, role order not validated, invalid private request falling back,
+  sampler not filling the role, flag ignored, Langflow allowed — each fails the tests.
+  Stability: both new files passed 3 consecutive runs.
+- Tests (serial, fakes only, unique `--basetemp`): private prompt 15, activation 13,
+  Gemini client 117, Gemini worker transport 40, event frame buffer 21, runtime wiring 23,
+  audio factory 6, runtime integration 83, evaluation worker 119, all
+  `test_private_parking_*` 277 — all passed; full backend suite **1209 passed**, 1
+  Starlette `DeprecationWarning`; `pip check` clean; `git diff --check` clean; changed and
+  new files: no control byte except LF, no trailing whitespace, final newline.
+- Limitations: no live request was made — the model's behaviour on the four prompt cases
+  is unproven; the first live private evaluation needs the owner's permission
+  (`SENTINEL_EVALUATION_MAX_DISPATCHES=1`); no gesture source (every unauthorized approach
+  still raises the local warning); no local clip asset; thinking level, `maxOutputTokens`
+  and image size remain open PM decisions; Langflow stays frozen without a private prompt.
+
+**T3d independent review (Codex via PM message "delta penutupan T3d", 2026-10-11)**
+- Verdict: **PASS WITH LIMITATIONS**. Reviewer's own run (relayed, not re-run by this
+  agent): 291 target tests and the full backend suite of 1,209 tests passed, one
+  Starlette `DeprecationWarning`; `pip check` clean; diff/whitespace checks clean.
+- Not reproduced by the reviewer: the agent's mutation and stability runs above (agent
+  runs only).
+- Not proven (by the review or the agent): model accuracy on the prompt cases, gesture
+  authorization, latency, real devices, speaker or provider behaviour.
+- Closure delta (agent run, same day): only this plan's status lines and the module
+  docstring of `runtime.py` changed — the docstring now describes the private evaluation
+  gate (`evaluation_worker_enabled`); the module AST without docstrings is identical, so
+  no behaviour changed and the full suite was not re-run. Status now: implemented,
+  independently reviewed, awaiting closure verification; not committed.
+
+**T3d closure (PM authorization "penutupan dan commit T3d", 2026-10-11)**
+- Final delta after the independent review: two docstrings in `runtime.py` only — the
+  module docstring and the `build_parking_wiring` docstring now describe the private
+  evaluation gate (`evaluation_worker_enabled`) instead of "disabled until the private
+  prompt". Each delta was verified by the agent as docstring-only (module AST without
+  docstrings identical before/after: `623dd96` → `4cd7512` → `99ec59a`); Codex's read-only
+  closure check (via PM): **PASS, no blocker**, runtime behaviour identical to the reviewed
+  version, plan status consistent. The full suite was not re-run (no behaviour change);
+  the last full run is the reviewer's 1,209 passed.
+- Committed paths and blobs (hashes matched before staging): `backend/.env.example`
+  `bbddcc9`, `backend/app/models/event_frame.py` `eb643cf`,
+  `backend/app/services/gemini_evaluation_client.py` `60c86a6`,
+  `backend/app/services/private_parking_evidence_sampler.py` `afc0b08`,
+  `backend/app/services/runtime.py` `99ec59a`, `backend/tests/test_gemini_private_prompt.py`
+  `601c585`, `backend/tests/test_private_parking_evaluation_enable.py` `91470b4`, and this
+  plan. Not included: frontend/F1, `AGENTS.md`, `PLAN.md`, root reference files.
+- T3d is completed for the backend prompt and dispatch gate with fakes only; no live
+  provider request was made. T3 remains open.
+
 **T3e — real gesture and device checks** (each step needs explicit owner permission)
 Scope: gesture `AuthorizationSignalSource` (dependency decision); local clip asset
 (separate task, O5); device latency and clip identity by ear; one live provider check
@@ -2087,8 +2321,14 @@ evidence was not included in the relay). Acceptance 24 and 30 finalised.
   sampler is the private bundle source; `DisabledParkingTrigger` for invalid
   modes/configs; audio factory validates the local clip without affecting the CRITICAL
   clip. The preview → line/zone → Play operator flow is a separate UI/API work item.
-- **T3d, T3e: not started, not authorized** — each waits for its own owner
-  authorization (`docs/PLANS.md`).
+- **T3d (private prompt, private dispatch gate): completed** — independent review PASS WITH
+  LIMITATIONS and closure check PASS without blocker (Codex via PM, 2026-10-11); committed
+  as "feat: enable direct Gemini evaluation for private parking" (see "T3d results", "T3d
+  independent review" and "T3d closure"). Not proven: model accuracy, gesture, latency,
+  real devices. T3 as a whole is NOT complete (gesture source, local clip asset,
+  configuration UI and T3e remain).
+- **T3e: not started, not authorized** — waits for its own owner authorization
+  (`docs/PLANS.md`).
 - Open for review: the deviations and limitations listed under "T3a1 results", the
   worker identity extension in "T3a1 delta 1", the episode-instance contract in
   "T3a1 delta 2", and the audio point in §4.7.
