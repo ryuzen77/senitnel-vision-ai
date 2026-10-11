@@ -1,8 +1,9 @@
 # P1 — Private parking: file upload → preview → line/zone configuration → Play
 
-Status: **rev 4.3 — P1a completed (core only, §15.4); P1 as a whole is not complete:
-P1b-P1d (VideoService, API/runtime incl. the leftover recovery action, UI) remain and are
-not authorized.** Author: Claude
+Status: **rev 4.3 — P1a completed (core only, §15.4); P1b completed — lifecycle core
+verified with fakes (§17.2); P1 as a whole is not complete: P1c (API/runtime incl. the
+leftover recovery action) and P1d (UI) remain and are not authorized; no real device.**
+Author: Claude
 (implementing agent), 2026-10-11, from source read at `a45c986`. Review history: rev 1
 (`2fc0a08`) BLOCKED (five gaps), rev 2 (`53e27c1`) BLOCKED (R1-R4), rev 3 (`413c5ae`)
 BLOCKED (R5-R7), all by Codex read-only, recorded in
@@ -739,6 +740,8 @@ uncommitted documentation of other authors was left untouched.
    record can carry it (D6); §7.5 names only `(lease, session_ref)`.
 2. A size mismatch is reported by `report_geometry_unstable(ticket_id, lease)` before the
    end hook (same lease check as hooks); P1b calls it from the per-frame check.
+   *Superseded in P1b:* the mismatch travels only through the lease-bound end hook
+   (`frame_size_changed`, §16.2 item 7); the method was removed (§17.1).
 3. A refusal before any reservation (e.g. VideoService busy) is recorded as attempt
    outcome `REFUSED` with that reason, not answered as `409 video_busy` before the CAS: the
    store cannot know it without starting. The attempt number is used. **Confirmed by the
@@ -908,3 +911,450 @@ startup-leftover recovery action is P1c work (§0.2.2). Durations are PM initial
 not calibrated. Same-size view changes are not detected. Two sweeper tests use a 0.1 s
 real-time window. Documents shared with other authors (`ARCHITECTURE.md`, `PLAN.md`,
 reliability) are not updated in this commit; they follow at the end of P1c (§14).
+
+## 16. P1b delta plan against the P1a baseline (design rev 3; implemented, §17)
+
+Author: Claude, 2026-10-12. **P1b was authorized by the owner on design rev 3
+(`417efbd`) and is implemented (§17), awaiting independent review.** This section
+only fixes what P1b would change relative to the committed P1a core and to the §7.5/§14
+text, so the owner and Codex can review it before any authorization. Design rev 1 was
+BLOCKED by Codex (through the owner/PM) on three points; rev 2 answered them in 16.2
+items 4, 6 and 7 and added the reviewer's acceptance cases (16.3). Rev 2 (`5aad9e5`) was
+BLOCKED on three further points (Codex through the owner/PM; the three earlier findings
+closed); rev 3 answers them: the cleanup handoff after the hook (item 5, acceptance 10),
+an owner for preview captures (item 11, 16.4) and the reused-id acceptance that respects
+the T3a2 lifecycle guard (acceptance 2).
+
+### 16.1 Preflight
+
+- Baseline: HEAD `1d13095` (`docs: correct P1a closure attribution and draft
+  references`), on top of P1a `b3b7f3a`; pushed, `origin/main` = HEAD; nothing staged;
+  `backend/` clean. The source facts below are unchanged since `b3b7f3a` (the last
+  commit touched only this plan).
+- Uncommitted files of other authors, left untouched: `ARCHITECTURE.md`, `PLAN.md`,
+  `docs/FRONTEND.md`, `docs/design-docs/private-parking-mode.md`,
+  `docs/exec-plans/active/t3-private-parking-integration.md`,
+  `docs/exec-plans/completed/history.md`, `docs/exec-plans/tech-debt-tracker.md`,
+  `docs/product-specs/index.md`, the F1 plan move, the untracked
+  `camera-health-monitoring.md` and `private-parking-configuration-ui.md` (Codex), and the
+  root reference files (`geminiService.ts`, `package.json`, `screenshot/`).
+- References from this plan to the two untracked plans are plain text ("draft lokal, belum dipublikasikan"), not
+  links, until their owners publish them.
+
+Source facts read at `b3b7f3a` (no execution):
+
+| Fact | Where |
+|---|---|
+| Reservation: one `_lock` section checks `IDLE`, creates token, `session_id` (factory, default `uuid4`) and the `_CaptureSession`, sets `STARTING`; sinks start afterwards under `_lifecycle_lock`; a required refusal rolls back through the cleanup runner and raises `VideoStartRefusedError` | `video_service.py:695-732`, `:376-397`, `:326` |
+| Sink end fan-out under `_lifecycle_lock`, same lease on every attempt; a failing sink stays pending | `video_service.py:399-414` |
+| One cleanup runner per attempt; `cleanup_ok` from facts (`None` while a capture release is deferred); a capture-only pass by the exiting capture thread or the opener finishes a deferred release; each explicit `stop()` resumes a failed cleanup once | `video_service.py:432-496`, `:582-592`, `:628-641` |
+| `abort_start(token)` rolls back only a current `STARTING` reservation | `video_service.py:823-844` |
+| File start: `start_file` attaches `upload_path` (deleted by cleanup), opens `cv2.VideoCapture(str(path))`, single-owner capture | `video_service.py:899-945`, `:524-538` |
+| File loop: `cap.read()` then `imencode` then `_publish` (packet slot, then buffer/detector/scene offers) | `video_service.py:1088-1110`, `:1027-1042`, `:779-808` |
+| `get_status()` returns `{state, source, error}` in one `_lock` section | `video_service.py:988-994` |
+| Trigger: one config fixed at construction; `start_session` resets per session and never raises | `private_parking_trigger.py:139-185` |
+| Coordinator: `start_session` calls the trigger through `_call`, which logs and swallows failures | `private_parking_coordinator.py:123-131`, `:186` |
+| Detector: a component start failure raises `DetectorStartError`, a required sink refusal for VideoService | `detector_service.py:192-245` |
+| Runtime: private mode builds `PrivateParkingTrigger(config)` from the startup file or the disabled path | `runtime.py:329-364` (P1c) |
+
+### 16.2 Contract deltas for P1b (relative to §7.5 and the P1a code)
+
+1. **Ticket consume.** Inside the existing reservation `_lock` section of a new
+   `_atomic_reserve(ticket=...)` path: if not `IDLE`, raise `PlaybackRefused("video_busy")`
+   **without** consuming (the store cancels the open ticket, outcome `REFUSED`, §0.2.1);
+   otherwise create token, `session_id` and a new `session_ref` (`uuid4`) and call
+   `ticket.try_consume(token, session_ref, session_id)` **before** any state change; on
+   `False` (cancelled or past its deadline) return `False` with no reservation. Consume
+   and the creation of the `_CaptureSession` happen in the same `_lock` section, so every
+   later call for that lease finds the session. Missing registry or configuration →
+   `PlaybackRefused("configuration_unavailable")` before the consume; never a fallback to
+   the startup file.
+2. **Return/raise contract of `start_prepared_file`.** Returns `True` only after `RUNNING`
+   was published for this session. `False` only for a stale ticket (nothing reserved).
+   After a consume, every way the start does not reach `RUNNING` raises, so the store never
+   keeps a `PENDING` outcome: required refusal → `PlaybackRefused("required_component_refused")`;
+   a Stop or `cancel_session` that won → `PlaybackRefused("stopped")` (the store keeps an
+   outcome a cancel already wrote, write-once); open, probe or thread-start failure →
+   `PreparedStartFailed` (store outcome `FAILED`, reason `start_failed`). In every case the
+   session's cleanup runs and sends its hook (item 5); the file stays in use until a clean
+   hook.
+3. **Binding (R3).** Inside `_start_sinks`, under `_lifecycle_lock`, after the per-call alive
+   check and before the first sink: `registry.bind(session_id, token, config)`; a
+   `BindingConflict` is a required refusal (no sink starts, rollback, hook `refused`). In
+   `_end_sinks`, after the sink loop: `registry.unbind(session_id, token)` (lease-bound,
+   idempotent on Stop retries). The registry is a new optional constructor argument of
+   VideoService; legacy paths never bind. A session invalidated before the alive check
+   binds nothing and starts no sink.
+4. **Capture ownership (blocker 1).** The decoder never owns a capture:
+   `video_decoder.create_capture(path)` only constructs `cv2.VideoCapture(str(path))` and
+   returns it; `video_decoder.probe(capture) -> fps` does `isOpened()`/`get()`. The
+   prepared start does, in order: `_begin_open_locked(session)` (returns without creating
+   anything if a Stop/cancel already released the session); `cap = create_capture(path)`;
+   **immediately** `_adopt_capture(session, cap)` under `_lock` (before `isOpened()`/`get()`);
+   then `probe(cap)`, `_attach`, `_start_capture`. Consequences:
+   - constructor raises → no capture object exists, nothing to release; session ends
+     `error`, cleanup runs, hook sent;
+   - `isOpened()` false or `get()` raises → the adopted capture is released by this
+     session's cleanup; a failing `release()` leaves `cap_released` false, so `cleanup_ok`
+     is `False`, the hook reports it, the store keeps the file use (`ENDING`), and each
+     explicit Stop retries the release (existing resumable cleanup) until a clean hook;
+   - a Stop/cancel during the open: `opening` defers the release to the opener, which
+     hands it to exactly one owner in `_end_open` (existing single-owner handoff); the
+     opener never attaches a thread to a released session.
+   No store-owned file is ever deleted by VideoService (no `upload_path`).
+5. **Hook = a cleanup step, lease-bound (part of blocker 3).** For a session that consumed
+   a ticket, every cleanup attempt (full pass, capture-only pass by the capture thread or
+   the opener, Stop retry, refusal rollback) ends like this: compute the facts under
+   `_lock` **while `cleanup_running` is still true** (state not `IDLE`, so no new
+   reservation can start); release the lock; call
+   `on_finished(ticket_id, token, end_reason, cleanup_ok)` outside every VideoService lock;
+   then, in **one** `_lock` section, record the delivery and **re-check the handoff before
+   giving up ownership**: if a release is still deferred and the capture is no longer in
+   use (the capture thread exited or the opener finished while the hook ran — their own
+   exit path saw `cleanup_running` true and correctly did not take over), the runner keeps
+   ownership, clears `deferred`, runs the capture-only pass and sends one more hook with
+   the new facts (the final one); only when nothing is left to take over does it clear
+   `cleanup_running`, set `cleanup_ok` and finalize. If the capture is still in use at that
+   point, ownership is released in the same section and the later exit path takes it over
+   (existing handoff), which ends with its own hook. Either way exactly one owner finishes
+   the release and a final hook follows it; the loop runs at most one extra pass, because
+   a capture-only pass after the exit leaves nothing deferred. If the hook raises, the delivery counts as a failed cleanup
+   step: `hook_pending = True`, `cleanup_ok = False`, state `ERROR` ("cleanup failed; Stop
+   retries it"); the next explicit Stop resumes the cleanup (all steps idempotent) and sends
+   the same lease-bound hook again. The store side keeps its ownership meanwhile (the ticket
+   still holds the file; Play/DELETE/admission refused), so a lost hook fails closed.
+   `end_reason`: `refused`, `cancelled`, `stop`, `eof`, `frame_size_changed`, else `error`;
+   it is fixed on the session under `_lock` when the end is decided and repeated on every
+   later hook of that session. The store's `on_finished` never calls VideoService
+   (P1a §15.2) and does not raise for any input (unknown ticket, wrong lease or bad type →
+   counted stale).
+6. **`cancel_session(lease)` — one atomic point (blocker 2).** In **one** `_lock` section:
+   the current session must have `token == lease` and not be released (else `False`,
+   counted; a reused `session_id` never matches because the check is by token); then
+   `cancel_requested = True`, `stop_requested = True`, `end_reason = "cancelled"` (unless an
+   end was already decided), `_start_token = None`, `_invalidate_locked(session)`
+   (`released = True`, `stop_event` set), state `STOPPING`. This is the linearization point:
+   it does not look at `STARTING` vs `RUNNING` and does not call `abort_start` separately,
+   so no transition can slip between a state check and the action. Outside the lock the
+   caller is the cleanup runner (`_run_cleanup(full=True)`, then finalize). Every later step
+   of that reservation already re-checks `released` under `_lock` and stops: `_start_sinks`
+   (per-sink alive check), `_attach` (no thread), `_start_capture` (never publishes
+   `RUNNING`), `_publish` (own `stop_event`). P1b tightens the offer boundary: the
+   `_packet_is_active` check becomes `self._current is session and not session.released
+   and state RUNNING` (session object, not `session_id`), so a frame of a cancelled session
+   can never be offered to a newer session that reuses its id. If the session was already
+   released by another invalidator (EOF, error, Stop), `cancel_session` records nothing new
+   and returns `False`; that runner's hook reports the end.
+7. **Geometry failure delivery (blocker 3).** On a size mismatch the capture thread, under
+   `_lock` in `_finish_from_capture`, sets `end_reason = "frame_size_changed"` **before**
+   anything else and ends the session (`ERROR "frame size changed"`); the mismatching frame
+   and every later one reach no packet slot, buffer, tee, detector or classifier. The
+   authoritative delivery to the store is the lease-bound hook of item 5, which carries
+   `end_reason = "frame_size_changed"` on every attempt, including Stop retries and a
+   redelivery after a failed hook. The store, in `on_finished` and before applying
+   `cleanup_ok`, marks the generation `geometry_unstable` for that `end_reason`; the flag is
+   sticky for the generation: a later clean hook releases the file use but `ready` stays
+   false and Play answers `409 source_geometry_unstable` (only a new upload has a new
+   generation). If no hook is delivered at all, the ticket still holds the file, so the
+   source is not playable either. The separate `on_geometry_unstable` callback of rev 1 is
+   **dropped**: no correctness depends on a best-effort callback. The approved scope
+   extension on `prepared_source.py` and the P1a test fake is used instead for this store
+   change (`end_reason` handling in `on_finished`), not for a new protocol keyword.
+8. **Status identity (D6).** `_CaptureSession` gets `session_ref`; a new
+   `get_session_identity() -> (state, session_ref, session_id)` reads all three in one
+   `_lock` section. The identity stays visible while the current session's cleanup is not
+   successful (`STOPPING`/`ERROR`) and is `None` only once the state is `IDLE`.
+   `get_status()` and `models/video.py` stay unchanged in P1b; the wire fields are P1c.
+9. **Trigger per session.** `PrivateParkingTrigger(config=None, *, session_config=None,
+   ...)`: exactly one of the two. With `session_config`, `start_session(session_id)` reads
+   the bound `OperatorConfiguration` and uses its `config` (line with `inside`, zones,
+   thresholds) for that session only; none bound → raises a new
+   `PrivateParkingAdmissionError` (sanitized, no ids); never falls back to a startup
+   configuration. `end_session` and `close` unchanged. The startup-file constructor stays
+   for the current composition until P1c.
+10. **Coordinator re-raise.** `start_session` re-raises a trigger start failure as
+    `SessionAdmissionError` (sanitized; held alerts of older sessions still cleared), so
+    the required detector refuses and VideoService rolls back — never a session without
+    configuration. `end_session` behaviour unchanged.
+11. **Decoder.** New `video_decoder.py` with functions that never own a capture:
+    `create_capture(path)` and `probe(capture)` (item 4) and
+    `read_first_frame(capture)`, which only reads from a capture its caller already gave an
+    owner (no release inside). No resize, crop or rotation of its own. The preview owner
+    and its release retries are a store contract (16.4) used by the P1c preview route;
+    rev 2's `read_first_frame(path)` with a logged `try/finally` release is withdrawn,
+    because a failed release left the capture without an owner and a file deletion is no
+    substitute for a capture release.
+
+### 16.3 Files, tests and acceptance
+
+| Files | Tests |
+|---|---|
+| `video_service.py`, new `video_decoder.py`, `private_parking_trigger.py`, `private_parking_coordinator.py`; approved extension: `prepared_source.py` (`frame_size_changed` handling in `on_finished`; hook input hardening) | new `test_video_prepared_playback.py` (real VideoService, fake capture via the `cv2` monkeypatch of `conftest.py`, a fake decoder with gates, real `HandoffTicket` and `PreparedSourceStore` with fake files and clock), new `test_private_session_config.py` (trigger per session, coordinator re-raise, registry under `_lifecycle_lock` with a forced reused `session_id`); adapted: `test_video_session_lifecycle.py`, `test_video_required_sinks.py`, `test_video_service.py`, `test_private_parking_trigger.py`, `test_private_parking_coordinator.py` (swallowed start → re-raised), `test_private_parking_contracts_integration.py`, `test_private_parking_evidence_sampler.py` (config type); approved extension: `test_prepared_source.py` (store geometry and hook-input cases) |
+
+Acceptance (gates are `threading.Event`s with timeouts; no sleeps):
+
+1. **Capture ownership (blocker 1).** (a) constructor raises → no capture, hook `error`,
+   store `FAILED`; (b) `isOpened()` false and (c) `get()` raises → capture released once
+   by the session's cleanup, hook `True`; (d) (b)/(c) with `release()` failing → hook
+   `False`, store `ENDING` with the file use, a Stop retry releases and sends hook `True`
+   → `PREPARED`; (e) Stop gated during `create_capture`, during `probe` and between
+   `_attach` and `_start_capture` → exactly one release by exactly one owner, no thread
+   started, never `RUNNING`, hook `stop`, `start_prepared_file` raises
+   `PlaybackRefused("stopped")`.
+2. **Cancel atomicity (blocker 2).** `cancel_session(lease)` gated at: after consume before
+   bind/sink start (nothing bound, no sink started, registry empty); during a sink start;
+   between `_attach` and `_start_capture` (thread never started); right after `RUNNING` was
+   published (capture thread stops, cleanup once). In every case: one cleanup runner, no
+   `RUNNING` after the cancel, hook `cancelled`. **Reused `session_id`, lifecycle guard
+   first (T3a2):** A cancelled while its capture thread is gated holding a decoded frame
+   (join times out, release deferred, state not `IDLE`). Two refusal levels, aligned with
+   the owner (2026-10-12): (i) **in the one-store composition** the source is `ENDING`
+   (A's ticket holds the file), so the store refuses Play **before the CAS** with
+   `409 session_cleanup_pending`; no attempt is used and no ticket reaches VideoService —
+   an `ENDING` source never reaches a new reservation; (ii) VideoService's own guard is
+   tested directly (a ticket handed to `start_prepared_file` while A is still not `IDLE`):
+   `PlaybackRefused("video_busy")` without consuming, so in a store this is an accepted
+   CAS whose attempt is used with outcome `REFUSED` (§0.2.1). Then:
+   releasing A's frame publishes no packet and offers nothing (A's own `stop_event`); A's
+   thread exits, its capture-only pass releases once and sends the final hook `True`,
+   state `IDLE`. Only then is B reserved with the same id and runs; afterwards a late hook
+   of A, `cancel_session(lease A)` and a stale unbind of A are counted no-ops and B's
+   binding, attempt and slot state are unchanged. The tightened offer guard (item 6) is
+   additionally checked as a unit with a stale session object while B is current, as
+   defence in depth; no test reserves B before A's cleanup succeeded.
+3. **Geometry failure (blocker 3).** Size mismatch with (a) a store hook that raises on the
+   first delivery → VideoService `ERROR`, store still holds the file (not ready), a Stop
+   retry redelivers `frame_size_changed` → store `geometry_unstable`, file use released,
+   `ready` false, Play `409 source_geometry_unstable`; (b) hook `cleanup_ok False` then a
+   clean hook → flag kept, never ready; (c) no hook delivered → Play refused (ticket holds).
+   The mismatching frame reaches no consumer (spies).
+4. **Registry/configuration missing.** No registry or no configuration →
+   `configuration_unavailable` before the consume (ticket open, store `REFUSED`, nothing
+   reserved); a trigger start without a binding → `PrivateParkingAdmissionError` →
+   coordinator re-raise → required refusal → rollback, hook `refused`; never the startup
+   configuration as a fallback (spy).
+5. **Rollback after consume.** Open failure and `thread.start()` failure after the consume
+   (fake `thread_factory`) → session `ERROR`, cleanup releases what was adopted, hook with
+   the facts, `PreparedStartFailed` → store `FAILED`; with a failing release → `ENDING`
+   until a Stop retry.
+6. **Snapshots of the cleanup result.** At each gate of 1-5: `get_session_identity()` shows
+   the reservation's `session_ref`/`session_id` until `IDLE` and `None`s after it; the
+   store's `/current` snapshot shows `ENDING` with `cleanup_ok` `False`/`None` until a
+   clean hook, then `PREPARED`; never a mix of A's ref with B's id.
+7. **Hook failed or late.** Store hook raising (fake) → item 5 path and Stop redelivery;
+   hook after the `PLAY_PENDING` deadline with the real VideoService → `TIMED_OUT` kept
+   (P1a §15.2); hook after store `close()` → recorded, no deletion, no exception in the
+   cleanup runner; a hook with a stale lease → counted, no effect.
+8. **Earlier parts.** §9.4 with the real VideoService; §9.5 real cleanup failures (join
+   timeout, sink end failure, deferred release → hooks `None` then `True`); §9.6 forced
+   reused `session_id` (late bind/unbind/hook of A never changes B); §9.7 frame part; §9.13
+   status identity and the default factory (two reservations → distinct `uuid4` ids).
+9. **Legacy and retail regressions.** `start_webcam`, `claim_start`/`start_file`,
+   `abort_start` and `stop()` behave as before (existing suites green; the only intended
+   assertion change is the coordinator start re-raise); a legacy session never binds, never
+   calls a hook and never consults the registry; retail mode and the legacy parking
+   trigger unchanged. The tightened offer boundary (item 6) is checked against the
+   existing T3a2 reused-id tests.
+10. **Cleanup handoff while the hook runs (rev 3).** Capture thread gated in a read so the
+    join times out and the release is deferred; the runner's hook (`cleanup_ok None`) is
+    gated in the store; the capture thread is released and exits while the hook is held
+    (its exit path sees `cleanup_running` and does not run); the hook is released → the
+    runner re-checks, runs the capture-only pass, releases the capture **once** and sends
+    the final hook `True`; hooks seen by the store: `None` then `True`; the store ends in
+    `PREPARED` with the file use released; no second release, no orphaned deferred
+    release, `_on_capture_exit` ran no cleanup. Mirror case: the capture still in use when
+    the gated hook returns → ownership released in the same section, the later exit takes
+    over and sends the final hook. Repeat with the opener (`opening`) instead of the capture
+    thread.
+
+Verification: the new and adapted files, then `test_video_*`, `test_private_parking_*`,
+`test_detector_*`, the full backend suite serial with a unique basetemp, `pip check`,
+`git diff --check`, control bytes; no server, real video, webcam, provider, TTS or
+speaker.
+
+### 16.4 Preview capture ownership (contract for the P1c preview; rev 3)
+
+The preview route (P1c) decodes the first frame outside VideoService. Its capture gets an
+owner the moment it exists and keeps it until a release is proven:
+
+- `begin_read` returns a `ReadHandle` (file user). The caller creates the capture with
+  `video_decoder.create_capture(path)` and immediately calls
+  `store.adopt_capture(handle, capture)` (under the store lock; no call on the capture
+  before it), then `probe`/`read_first_frame` outside the lock.
+- `store.end_read(handle)` releases the adopted capture outside the lock, single-flight
+  per handle; a probe or read failure after adoption also ends through `end_read`.
+  Success → the reader's file use ends. A failed release → the handle **stays a file user** with
+  a capture obligation: same bounded policy as file cleanup (retry every 60 s, single
+  flight, `CLEANUP_STALLED` after 10 attempts, explicit retry through the P1c recovery
+  action of §0.2.2), counted in `/current.cleanup`. The capture object stays referenced
+  only by the store.
+- While a capture obligation exists the file use is not released, so the file is never
+  deleted, a voided source stays in `DELETING`/`CLEANUP_PENDING`, and admission (`POST /`)
+  stays closed; a live source stays readable but cannot be deleted until the capture is
+  released. A file deletion that happens to succeed on the filesystem is never taken as
+  proof that the capture was released.
+- `close()` runs at most one final release per capture obligation (D11 rules), then the
+  file attempt only if no user remains; a remaining obligation is logged and the process
+  exit ends it (D12 handles the file at the next start).
+- Acceptance (P1c, with the store part testable earlier): decode/probe failure together
+  with a release failing once and repeatedly → the handle keeps the file use, retries are
+  spaced and single-flight, admission stays closed and the file is not deleted until a
+  release succeeded; a successful retry releases the file use and lets a pending
+  deletion run; concurrent `end_read`, sweeper and `close()` → one release in flight;
+  stalled capture obligation → explicit retry runs one attempt.
+- **Scope:** this adds `adopt_capture`, capture obligations and their tests to
+  `prepared_source.py` / `test_prepared_source*.py`, beyond the approved P1b extension
+  (which covers `frame_size_changed` in `on_finished`). Proposed placement: P1c, together
+  with the preview route; it needs the owner's approval of that extension. P1b itself
+  does not create preview captures.
+
+### 16.5 Risks and open points for the review
+
+- **H2 (highest):** reviewed T1/T3 contracts change (reservation path, cleanup runner hook
+  step, offer boundary, coordinator start). Mitigation: the hook step and binding exist
+  only for a ticketed reservation; legacy suites unchanged; the offer-boundary change is a
+  strict tightening.
+- The hook runs while `cleanup_running` is true, so a slow store hook delays the end of
+  that cleanup (never a VideoService lock is held). The store hook is in-memory only.
+- A hook that keeps failing keeps VideoService in `ERROR` until a Stop succeeds in
+  delivering it; the store stays fail-closed meanwhile.
+- A cleanup that never completes keeps `cleanup_ok` `None`: the store keeps the file
+  (recorded limitation, §8.4).
+- Open: whether `get_status()` should already return the identity in P1b (proposal: no,
+  P1c); approval of the 16.4 store extension for P1c.
+
+## 17. P1b implementation record (Claude, 2026-10-12) — completed, §17.2
+
+Authorization: owner, on design rev 3 (blob `417efbd`), with acceptance 2 aligned before
+the implementation (two refusal levels, §16.3 item 2). Preflight: HEAD `1d13095` =
+`origin/main`, nothing staged, `backend/` clean; the uncommitted documents of other
+authors and the root reference files untouched. Scope: §16.2 items 1-11 except the
+preview capture owner (§16.4, P1c), plus the approved P1a extension for the geometry
+end reason. Nothing wired into the runtime or API (P1c).
+
+**Files:**
+
+| File | Change |
+|---|---|
+| `backend/app/services/video_service.py` | `start_prepared_file` (ticket consumed in the reservation `_lock` section, `session_ref`, refusals, `PreparedStartFailed`); bind/unbind in the sink fan-outs under `_lifecycle_lock`; decoder capture adopted before any call; end hook as a cleanup step with the handoff re-check after it and redelivery through Stop; `cancel_session` (one atomic section); per-frame size check before publication (`frame_size_changed`); offer guard by session object; `get_session_identity`; end reason fixed once per session |
+| new `backend/app/services/video_decoder.py` | `create_capture`, `probe`, `read_first_frame`; never owns or releases a capture |
+| `backend/app/services/private_parking_trigger.py` | `session_config` lookup per session; `PrivateParkingAdmissionError` without a binding; no fallback |
+| `backend/app/services/private_parking_coordinator.py` | a trigger start failure is re-raised as `SessionAdmissionError` |
+| `backend/app/services/prepared_source.py` (approved extension) | `on_finished`: `frame_size_changed` marks the generation `geometry_unstable` before the cleanup result (sticky); hook input hardening (never raises) |
+| new tests | `test_video_prepared_playback.py` (32), `test_private_session_config.py` (9) |
+| `backend/tests/test_prepared_source.py` (approved extension) | 11 store cases: sticky geometry with `True`/`False`/`None` first hooks, stale lease, invalid hook identity and values |
+
+The adapted test files listed in §16.3 needed **no** change: the legacy, T3a2, T3c0.2,
+trigger, coordinator, evidence-sampler and contract suites pass unchanged (the existing
+coordinator tests do not assert the old swallowed start; the re-raise is covered in
+`test_private_session_config.py`).
+
+**Acceptance coverage (§16.3):**
+
+| # | Covered by | Not covered |
+|---|---|---|
+| 1 capture ownership | constructor raises, not opened, `get()` raises; release failing then Stop retry; Stop gated during `create_capture` and during `probe` (one release, never `RUNNING`, `PlaybackRefused("stopped")`, hooks `None` then `True`) | a gate *between* `_attach` and `_start_capture`: no seam without a test-only hook (`_start_capture` re-checks `released` in the same `_lock` section as `thread.start()`) |
+| 2 cancel atomicity, reused id | cancel with `_lifecycle_lock` held before bind/sink start; during a sink start; after `RUNNING`; another lease; reused id: (ii) VideoService `video_busy` without consuming, A's held frame not published, B only after A's clean hook, late `cancel_session(lease A)` no-op, offer guard with a stale session object; (i) composed: `ENDING` source → `session_cleanup_pending` before the CAS, `next_attempt` unchanged | cancel between `_attach` and `_start_capture` (same seam limit) |
+| 3 geometry | mismatch ends before publication (2 offers, none of the mismatching frame); composed with a failed first hook delivery → VideoService `ERROR`, store still holds (not ready, Play refused), Stop redelivers → `geometry_unstable`, `PREPARED`, Play `409 source_geometry_unstable`; store sticky flag for `True`/`False`/`None` | — |
+| 4 registry/config missing | no registry, no config, bad size → `configuration_unavailable`, ticket open; required refusal (detector start fails) → hook `refused`, bound then unbound; bind conflict → refusal, older binding kept; trigger without binding → `PrivateParkingAdmissionError`, coordinator re-raise, no fallback | the full chain through the real `DetectorService` (covered by its own required-sink contract, not re-composed here) |
+| 5 rollback after consume | thread-start failure with and without a release failure (Stop retry) | — |
+| 6 snapshots | `get_session_identity` while `RUNNING`, while the deferred cleanup keeps `ERROR` (ids kept) and after `IDLE` (`None`s); store snapshots in the composed cases | not asserted at every gate of 1-5 |
+| 7 hook failed or late | failed delivery + Stop redelivery; hook held while the store closes (recorded after close, no deletion) | — |
+| 8 earlier parts | composed EOF → `PREPARED` with the file kept; composed `PLAY_PENDING` deadline → `cancel_session` → `TIMED_OUT`, hook `cancelled`, `PREPARED`; composed busy → `REFUSED` with the attempt used, replay identical; default factory → distinct `uuid4` ids | composed `DELETE` with a consumed ticket, close in each handoff gate, sink end failure with the real fan-out |
+| 9 legacy/retail | full backend suite unchanged (legacy start paths, T3a2/T3c0.2, retail, legacy parking trigger) | — |
+| 10 handoff during the hook | capture exits while the hook is held → the runner releases once and sends the final hook; mirror (still in use → exit path takes over); opener variant | — |
+
+**Implementer evidence (Claude, not reviewer results):**
+
+- `test_video_prepared_playback.py` 32 passed; `test_private_session_config.py` 9 passed;
+  `test_prepared_source.py` 53 passed.
+- `test_video_prepared_playback.py`, `test_private_session_config.py`,
+  `test_prepared_source.py` and `test_prepared_source_races.py` repeated 30 times: 0
+  failures (run before the default-factory test was added).
+- Mutation runs (scratch pytest plugin outside the repository, no source change): handoff
+  re-check removed → 2 failures; per-frame size check disabled → 2; offer guard back to
+  `session_id` → 1; hook failure ignored → 1; geometry end reason not sticky in the store
+  → 4.
+- The full backend suite serial with a unique basetemp: 1401 passed, 1 warning
+  (Starlette deprecation, pre-existing). `pip check` clean; `git diff --check` clean;
+  no control bytes or trailing whitespace; final LF.
+- No server, provider, real video, webcam, TTS or speaker; nothing staged.
+
+**Integration limits:**
+
+- Nothing is wired: the runtime still builds the startup-file trigger and no store,
+  registry or decoder (P1c); `get_status()`/`models/video.py` unchanged (P1c).
+- After a required refusal, an open or thread-start failure or a size mismatch,
+  VideoService stays `ERROR` until an explicit Stop (existing T3c0.2 contract); in the
+  composed store the next Play is then an accepted CAS answered `REFUSED video_busy`
+  until the operator stops. P1c must surface this (Stop before the next Play).
+- A store hook that keeps failing keeps VideoService `ERROR` until a Stop delivers it;
+  the store stays fail-closed meanwhile.
+- The preview capture owner (§16.4) is P1c and not implemented; `read_first_frame` exists
+  but is unused.
+- The store's `report_geometry_unstable` (P1a) was removed in §17.1; the geometry failure
+  travels only through the lease-bound end hook.
+- Legacy `start_file` keeps its own `cv2` opener; only prepared files use the decoder.
+
+### 17.1 Fixes for the Codex review of P1b (owner instruction, 2026-10-12)
+
+| Finding | Fix | Tests |
+|---|---|---|
+| 1 Partial bind: the rollback obligation was recorded only after `registry.bind()` returned, so a bind that changed the registry and then raised was never undone | `binding_pending` is set **before** `bind()`; any bind exception is a required refusal and the cleanup unbinds with the session's token (lease-checked: another reservation's entry is never removed; `False` = nothing of ours). An unbind that raises stays pending, `cleanup_ok` is `False` until it succeeds (hook `False`, VideoService `ERROR`), and an explicit Stop retries it | a bind that stored then raised → entry removed, hook `refused`/`True`; unbind failing once (composed with the store) → hook `False`, registry entry kept, VideoService `ERROR`, store `ENDING` with the file use, Play `session_cleanup_pending` with `next_attempt` unchanged, `POST /` `slot_busy`; Stop → unbind retried, hook `True`, `PREPARED`, `IDLE`; a stale rollback (bind conflict with another lease's entry) → unbind with its own lease is ignored, the other binding kept |
+| 2 Hook input: `cleanup_ok not in (True, False, None)` ran the object's `__eq__`, and invalid values were coerced and applied | `on_finished` checks by exact type and identity only (`type(...) is int/str`, `cleanup_ok is True/False/None`) before any comparison, truthiness or lookup; anything else is rejected and counted (`invalid_hooks`) without an exception and without changing state; never a successful cleanup | 13 parametrized inputs (ticket id `str`/`bool`; lease `None`/`bytes`/a `str` subclass whose `__eq__` raises; end reason `None`/an object raising on every comparison, truthiness and hash; `cleanup_ok` `1`, `"yes"`, `[True]`, a numpy array, `numpy.bool_`, a hostile object): no exception, snapshot, attempt record, file users and hook summary unchanged, then a valid hook still applies |
+| 3 `report_geometry_unstable` unused in production | removed from `prepared_source.py`; its two test uses migrated to the end hook (`frame_size_changed` via the session's hook; the stale-lease case via `on_finished` with another lease) | sticky geometry and stale-lease coverage kept (`test_geometry_unstable_generation_cannot_be_reopened`, the P1b sticky and stale-lease cases) |
+
+**Test race found and fixed (implementer):** a repeat of the four files failed once in
+30 runs. Cause: the test `Hooks` recorder appends a call at the start of the hook, before
+the hook raises or forwards to the store and before VideoService writes the final state,
+so three tests that waited for "a hook was recorded" and then asserted `ERROR` (or the
+store state) could observe `STOPPING`. The product behaviour was correct; the tests now
+wait for the final state itself. The two affected tests of the previous round
+(`test_a_size_mismatch_ends_before_publication`,
+`test_composed_geometry_failure_with_a_failed_hook_delivery`) had the same latent race,
+so the earlier "30 repetitions, 0 failures" (§17) did not exclude it.
+
+**Implementer evidence after the fixes (Claude, not reviewer results):**
+
+- `test_video_prepared_playback.py` 35, `test_prepared_source.py` 59,
+  `test_private_session_config.py` 9 passed.
+- The four files repeated 60 times after the race fix: 0 failures.
+- Mutation runs against the pre-fix behaviour (scratch pytest plugin outside the
+  repository): unbind obligation recorded after `bind()` → 2 failures (partial bind,
+  stale rollback); the old hook validation → 9 failures (the hostile and non-exact
+  inputs). The unbind-retry test passes in both versions (that path already existed).
+- Full backend suite serial with a unique basetemp: 1410 passed, 1 warning (Starlette
+  deprecation, pre-existing); `pip check` clean; `git diff --check` clean; no control
+  bytes or trailing whitespace; final LF. Nothing staged; no server, provider, real video
+  or device.
+
+### 17.2 Closure of P1b — lifecycle core verified with fakes (owner instruction, 2026-10-12)
+
+**Independent review (Codex, through the owner/PM) on the §17.1 state:** 131 target tests
+passed, the full backend suite 1410 passed with one deprecation warning (Starlette),
+and the remaining checks (`pip check`, diff, whitespace, newline, control bytes) clean.
+The 60-fold repetition and the mutation runs of §17 and §17.1 are **implementer
+evidence** (Claude), not reviewer results.
+
+Hash check before the commit: the eight source and test files are unchanged since the
+reviewed round, so the suite was not re-run for the closure.
+
+| Path | Blob |
+|---|---|
+| `backend/app/services/video_service.py` | `7537ae8ddf111d9a52b5a0d1cec11861def7970c` |
+| `backend/app/services/video_decoder.py` | `b72590541fe90ee983f8ab7dc42107ca976d3067` |
+| `backend/app/services/private_parking_trigger.py` | `39c55e8903b8c4d80a7f6832affca3d1ed46065b` |
+| `backend/app/services/private_parking_coordinator.py` | `b53002c11434cf436b433724f6382f71278529c5` |
+| `backend/app/services/prepared_source.py` | `991b14e6089ea6a8c1bceca59397063cd4fb47eb` |
+| `backend/tests/test_prepared_source.py` | `ab4d6b917b5cdd0ff8158d149cf3b821c319b108` |
+| `backend/tests/test_video_prepared_playback.py` | `5a51bf2aebbca7131dcfd066679ee486efdaccee` |
+| `backend/tests/test_private_session_config.py` | `97bfe3ae83689a3f9b397e5395c6642d7af128b6` |
+
+This plan was reviewed at `45abc29`; only this closure record and the status lines were
+added after it.
+
+**Status:** completed — lifecycle core verified with fakes. Not proven: runtime and API
+wiring (P1c), the preview capture owner (§16.4, P1c), the leftover recovery action
+(§0.2.2, P1c), the status wire fields (P1c), UI (P1d), real video files, real devices.
+The integration limits of §17 stay open, in particular `ERROR` until an explicit Stop
+after a refusal, open failure or size mismatch.

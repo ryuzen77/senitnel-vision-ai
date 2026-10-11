@@ -79,7 +79,8 @@ class FrameSinkAdmissionError(RuntimeError):
 
 
 class SessionAdmissionError(RuntimeError):
-    """The coordinator refused a session start (closed); sanitized, no ids."""
+    """The coordinator refused a session start (closed, or the trigger refused it);
+    sanitized, no ids."""
 
 
 def _log_failure(component: str, step: str, error: BaseException) -> None:
@@ -128,7 +129,10 @@ class PrivateParkingCoordinator:
                 raise SessionAdmissionError("private parking coordinator is closed")
             self._resync_needed = False
             self._held.clear()                   # held alerts of an older session are void
-        self._call("trigger", "start_session", self._trigger.start_session, session_id)
+        if self._call("trigger", "start_session", self._trigger.start_session, session_id) is _FAILED:
+            # Re-raised (P1b): the required detector refuses and VideoService rolls back,
+            # so a session never runs without its configuration.
+            raise SessionAdmissionError("private parking trigger refused the session") from None
 
     def end_session(self, session_id: str) -> None:
         """Forwarded even after close() (cleanup is never refused). Raises

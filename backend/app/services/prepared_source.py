@@ -399,8 +399,8 @@ class PreparedSourceStore:
         self._deferred_obligations: list[_Obligation] = []   # claimed under the lock, run after it
         self._deferred_cancels: list[tuple[int, str]] = []   # (ticket_id, lease) to cancel after it
         self._counts = {name: 0 for name in (
-            "stale_hooks", "stale_returns", "cancel_session_calls", "cleanup_attempts",
-            "cleanup_failures", "startup_leftovers")}
+            "stale_hooks", "invalid_hooks", "stale_returns", "cancel_session_calls",
+            "cleanup_attempts", "cleanup_failures", "startup_leftovers")}
         self._startup_sweep()
 
     # ------------------------------------------------------------------ helpers
@@ -850,13 +850,28 @@ class PreparedSourceStore:
         ``TIMED_OUT`` (write-once) and the hook only records the session's cleanup. The
         cancel of that lease is scheduled, not run here (this thread is VideoService's
         cleanup runner): a clean hook drops it, a failed or unknown cleanup keeps it, and
-        the sweeper or the next store call sends it outside the lock."""
+        the sweeper or the next store call sends it outside the lock.
+
+        Input is checked by exact type and identity only (no comparison, truthiness or
+        other call that could run an object's own behaviour): ``ticket_id`` an ``int``,
+        ``lease`` and ``end_reason`` a ``str``, ``cleanup_ok`` exactly ``True``, ``False`` or
+        ``None``. Anything else is rejected and counted, without an exception and without
+        any change to the store's state; it never counts as a successful cleanup."""
+        if (type(ticket_id) is not int or type(lease) is not str or type(end_reason) is not str
+                or not (cleanup_ok is True or cleanup_ok is False or cleanup_ok is None)):
+            with self._lock:
+                self._counts["invalid_hooks"] += 1
+            return
         with self._lock:
             self._due_locked()
             run = self._tickets.get(ticket_id)
             if run is None or run.ticket.state is not TicketState.CONSUMED or run.ticket.lease != lease:
                 self._counts["stale_hooks"] += 1
                 return
+            if end_reason == "frame_size_changed" and not run.source.voided:
+                # Lease-bound geometry failure (P1b §16.2 item 7): sticky for the generation,
+                # applied before the cleanup result, so no clean hook makes it ready again.
+                run.source.geometry_unstable = True
             run.ticket.record_hook(end_reason, cleanup_ok)
             run.end_reason = end_reason
             if cleanup_ok is True:
@@ -871,16 +886,6 @@ class PreparedSourceStore:
             self._settle(run.source)
             if self._deferred_cancels or self._deferred_obligations:
                 self._cond.notify_all()                     # the sweeper sends them
-
-    def report_geometry_unstable(self, ticket_id: int, lease: str) -> None:
-        """A decoded frame of this session differed from the generation's size (P1b)."""
-        with self._lock:
-            run = self._tickets.get(ticket_id)
-            if run is None or run.ticket.lease != lease:
-                self._counts["stale_hooks"] += 1
-                return
-            if not run.source.voided:
-                run.source.geometry_unstable = True
 
     @_draining
     def attempt(self, source_id: str, attempt: int) -> AttemptRecord:

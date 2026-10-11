@@ -84,6 +84,30 @@ Required sinks, leases and safe publication (T3c0.2):
     like a capture thread that is still reading.
   * Lifecycle/rollback logs and public errors carry fixed labels and exception TYPE
     names only (no ids, tokens, paths or exception messages).
+
+Prepared playback (P1b, private-parking plan §16):
+
+  * start_prepared_file() consumes the store's handoff ticket inside the reservation
+    _lock section (token, session id and a public session_ref are created there); a
+    cancelled or expired ticket leaves no reservation. Not IDLE -> PlaybackRefused
+    ("video_busy") without consuming.
+  * The operator configuration is bound to (session_id, token) in the registry under
+    _lifecycle_lock before the first sink starts and unbound with the same token after
+    the sinks ended; a refused bind is a required refusal. The unbind obligation is
+    recorded BEFORE bind() is called, so a bind that changed the registry and then raised
+    is still rolled back; an unbind that fails stays pending (cleanup not successful, an
+    explicit Stop retries it). The registry's lease check keeps another reservation's
+    binding untouched.
+  * The capture is created by video_decoder and adopted by the session before any call
+    on it; the store owns the file (no upload_path).
+  * Every cleanup attempt of a prepared session ends with the end hook, called outside
+    every lock while cleanup_running is still true; the handoff is re-checked after the
+    hook, and a hook that raises is a failed cleanup step that Stop retries.
+  * cancel_session(token): one _lock section checks the token, records the cancel and
+    invalidates the session, whatever the state.
+  * Every decoded frame of a prepared session is size-checked before publication; a
+    mismatch ends the session with end reason "frame_size_changed".
+  * Offers go only to the current, unreleased session object.
 """
 
 from __future__ import annotations
@@ -103,7 +127,9 @@ import cv2
 
 from app.models.video import FramePacket, VideoStartResponse, VideoState, VideoStatusResponse
 from app.models.event_frame import BufferedFrame
+from app.services import video_decoder
 from app.services.event_frame_buffer import EventFrameBuffer
+from app.services.prepared_source import PlaybackRefused
 
 if TYPE_CHECKING:
     from app.services.detector_service import DetectorService
@@ -142,6 +168,8 @@ SINK_LABELS = ("event frame buffer", "detector", "scene classifier", "evaluation
 REQUIRED_START_REFUSED = "Required pipeline component refused the session"
 THREAD_START_FAILED = "Capture thread could not start"
 CAPTURE_FAILED = "Video capture failed"
+FRAME_SIZE_CHANGED = "Video frame size changed"
+_STALE = object()                           # a prepared start whose ticket could not be consumed
 
 
 class VideoStartRefusedError(Exception):
@@ -157,6 +185,23 @@ class StaleStartError(RuntimeError):
 
 class _CaptureUnavailable(Exception):
     """Internal: the capture opened without error but isOpened() is False."""
+
+
+class PreparedStartFailed(RuntimeError):
+    """A prepared start failed after its ticket was consumed (open, probe or thread
+    start); the session was rolled back through its cleanup, which sent the end hook."""
+
+
+def _frame_size(frame) -> tuple[int, int] | None:
+    shape = getattr(frame, "shape", None)
+    if shape is None or len(shape) < 2:
+        return None
+    return int(shape[1]), int(shape[0])
+
+
+def _valid_size(size: object) -> bool:
+    return (isinstance(size, tuple) and len(size) == 2
+            and all(type(side) is int and side > 0 for side in size))
 
 
 def _log_failure(what: str, error: BaseException) -> None:
@@ -275,6 +320,16 @@ class _CaptureSession:
     pending_sinks: set = dataclasses.field(default_factory=set)
     start_refused: bool = False         # a required sink refused this reservation
     opening: bool = False               # the opener may still create/use the capture
+    # Prepared playback (P1b). ``on_finished`` is set only for a consumed ticket.
+    session_ref: str | None = None      # public, never reused name of this reservation
+    ticket_id: int | None = None
+    on_finished: Callable | None = None
+    config: object | None = None        # operator configuration bound for this session
+    expected_size: tuple[int, int] | None = None
+    binding_pending: bool = False       # bound in the registry and not yet unbound
+    cancel_requested: bool = False
+    hook_reason: str | None = None      # end reason, fixed once when the end is decided
+    hook_pending: bool = False          # the last end-hook delivery raised
 
 
 class VideoService:
@@ -304,6 +359,8 @@ class VideoService:
         required_sinks: frozenset[str] | set[str] = frozenset(),
         session_id_factory: Callable[[], str] | None = None,
         thread_factory: Callable[..., threading.Thread] | None = None,
+        session_config_registry: object | None = None,
+        decoder: object | None = None,
     ) -> None:
         self._join_timeout = _positive_seconds("capture_join_timeout_seconds", capture_join_timeout_seconds)
         self._cleanup_wait = (
@@ -325,8 +382,12 @@ class VideoService:
         # Tests only: force a reused session id / a failing thread start.
         self._session_id_factory = session_id_factory or (lambda: str(uuid.uuid4()))
         self._thread_factory = thread_factory or threading.Thread
+        # Prepared playback: lease-bound configuration registry and the one decoder.
+        self._registry = session_config_registry
+        self._decoder = decoder if decoder is not None else video_decoder
         self._counts = dict.fromkeys(("required_start_refusals", "thread_start_failures",
-                                      "aborted_starts", "stale_aborts"), 0)
+                                      "aborted_starts", "stale_aborts", "stale_cancels",
+                                      "hook_failures"), 0)
         self._startup_timing_enabled = (_startup_timing_enabled() if startup_timing_enabled is None
                                         else startup_timing_enabled)
         self._startup_timing: _StartupTimingRecorder | None = None
@@ -381,6 +442,18 @@ class VideoService:
         and released _lifecycle_lock (non-reentrant; the cleanup runner takes it).
         """
         with self._lifecycle_lock:
+            if session.config is not None:       # prepared: bind before the first sink
+                with self._lock:
+                    alive = self._current is session and not session.released
+                if not alive:
+                    return None                  # cancelled/stopped: nothing bound, nothing started
+                # Rollback obligation first: a bind may change the registry and still raise.
+                session.binding_pending = True
+                try:
+                    self._registry.bind(session.session_id, session.token, session.config)
+                except Exception as error:
+                    _log_failure("Unable to bind the session configuration", error)
+                    return "configuration binding"   # a required refusal: no sink starts
             for label, sink in self._sinks_in_start_order():
                 with self._lock:
                     alive = self._current is session and not session.released
@@ -412,6 +485,14 @@ class VideoService:
                     _log_failure(f"Unable to end {label} session", error)
                 else:
                     session.pending_sinks.discard(label)
+            if session.binding_pending:          # same token as the bind; idempotent on retries
+                try:
+                    # Lease-checked: removes only this token's entry; False = nothing of ours.
+                    self._registry.unbind(session.session_id, session.token)
+                except Exception as error:
+                    _log_failure("Unable to unbind the session configuration", error)   # stays pending
+                else:
+                    session.binding_pending = False
 
     def _invalidate_locked(self, session: _CaptureSession) -> bool:
         """Caller holds _lock. Immediate, O(1); True only for the first caller, which
@@ -470,8 +551,18 @@ class VideoService:
         otherwise the runner releases ownership and the exiting thread, which takes the
         same lock afterwards, finds the deferred release unowned and takes it over.
         Either way exactly one owner finishes it; releases never run under ``_lock``.
+
+        Prepared session (consumed ticket): the end hook is part of the attempt. Its facts
+        are computed while ``cleanup_running`` is still true (the state is not IDLE, so
+        nothing new can be reserved); the hook runs outside every lock; then ONE ``_lock``
+        section records the delivery and re-checks the handoff before ownership is given
+        up: a capture that stopped being in use while the hook ran (its exit path saw
+        ``cleanup_running`` and did not take over) is released by this runner, followed by
+        the final hook. A hook that raises makes the attempt a failed cleanup (ERROR; an
+        explicit Stop resumes it and sends the hook again).
         """
         passes = 0
+        current = threading.current_thread()
         while True:
             try:
                 if full and passes == 0:
@@ -482,18 +573,61 @@ class VideoService:
                 session.unexpected_failure = True
                 _log_failure("Video session cleanup failed", error)
             passes += 1
+            hook = None
             with self._lock:
                 resume = (session.deferred and passes < 2
-                          and not self._capture_in_use_locked(session, threading.current_thread()))
+                          and not self._capture_in_use_locked(session, current))
                 if resume:
                     session.deferred = False     # still the owner: release now, outside the lock
                 else:
+                    ok = None if session.deferred else self._cleanup_complete(session)
+                    if session.on_finished is None:
+                        session.cleanup_running = False
+                        session.cleanup_ok = ok
+                        self._finalize_locked(session)
+                    else:
+                        hook = (session.on_finished, session.ticket_id, session.token,
+                                self._hook_reason_locked(session), ok)
+            if resume:
+                continue
+            if hook is None:
+                break
+            delivered = self._deliver_hook(hook)
+            with self._lock:
+                session.hook_pending = not delivered
+                again = (session.deferred and passes < 3
+                         and not self._capture_in_use_locked(session, current))
+                if again:
+                    session.deferred = False     # released by its user while the hook ran
+                else:
                     session.cleanup_running = False
-                    session.cleanup_ok = None if session.deferred else self._cleanup_complete(session)
+                    session.cleanup_ok = ok if delivered else False
                     self._finalize_locked(session)
-            if not resume:
+            if not again:
                 break
         session.cleanup_done.set()
+
+    def _deliver_hook(self, hook: tuple) -> bool:
+        """Outside every lock: the store's end hook; False if it raised (type logged)."""
+        on_finished, ticket_id, token, reason, ok = hook
+        try:
+            on_finished(ticket_id, token, reason, ok)
+        except Exception as error:
+            with self._lock:
+                self._counts["hook_failures"] += 1
+            _log_failure("Prepared session end hook failed", error)
+            return False
+        return True
+
+    @staticmethod
+    def _hook_reason_locked(session: _CaptureSession) -> str:
+        return session.hook_reason or ("stop" if session.stop_requested else "error")
+
+    @staticmethod
+    def _decide_end_locked(session: _CaptureSession, reason: str) -> None:
+        """Caller holds _lock. The end reason is fixed once, by the first decision."""
+        if session.hook_reason is None:
+            session.hook_reason = reason
 
     def _cleanup_full_pass(self, session: _CaptureSession) -> None:
         if session.timing is not None:
@@ -550,7 +684,8 @@ class VideoService:
     def _cleanup_complete(session: _CaptureSession) -> bool:
         return ((session.cap is None or session.cap_released)
                 and (session.upload_path is None or session.upload_removed)
-                and not session.pending_sinks and not session.unexpected_failure)
+                and not session.pending_sinks and not session.binding_pending
+                and not session.unexpected_failure)
 
     def _finalize_locked(self, session: _CaptureSession) -> None:
         """Caller holds _lock. Writes the state only for the current session.
@@ -609,6 +744,7 @@ class VideoService:
             if self._current is not session or session.released:
                 return                           # a stop() won; it owns the transition
             session.end_reason, session.capture_error = "error", message
+            self._decide_end_locked(session, "error")
             self._state = VideoState.STOPPING    # ERROR is written once the cleanup attempt ended
         self._release_session(session)
 
@@ -666,6 +802,7 @@ class VideoService:
                 failure = error
                 session.thread = None            # never started: cleanup must not join it
                 session.end_reason, session.capture_error = "error", THREAD_START_FAILED
+                self._decide_end_locked(session, "error")
                 self._counts["thread_start_failures"] += 1
                 self._state = VideoState.STOPPING    # ERROR is written once the cleanup ended
             else:
@@ -675,15 +812,19 @@ class VideoService:
         self._release_session(session)           # outside _lock; this session's runner
         return False
 
-    def _finish_from_capture(self, session: _CaptureSession, state: VideoState, error: str | None) -> None:
-        """EOF (state IDLE) or capture error (state ERROR), called by the capture thread."""
+    def _finish_from_capture(self, session: _CaptureSession, state: VideoState, error: str | None,
+                             *, reason: str | None = None) -> None:
+        """EOF (state IDLE) or capture error (state ERROR), called by the capture thread.
+        ``reason`` names a specific end for the hook (``frame_size_changed``)."""
         with self._lock:
             if session.released or self._current is not session:
                 return                           # the invalidator owns the transition
             if state is VideoState.ERROR:
                 session.end_reason, session.capture_error = "error", error
+                self._decide_end_locked(session, reason or "error")
             else:
                 session.end_reason = "eof"
+                self._decide_end_locked(session, "eof")
             # Transitional; the cleanup attempt writes the final IDLE/ERROR when it ends.
             self._state = VideoState.STOPPING
         self._release_session(session)
@@ -699,12 +840,30 @@ class VideoService:
         None if state was not IDLE.
         This is the single gate for both start_webcam() and start_file().
         """
+        reserved = self._reserve()
+        return None if reserved is None else reserved[0]
+
+    def _reserve(self, prepared: dict | None = None):
+        """The reservation section. ``prepared`` (a handoff ticket and its session data):
+        not IDLE raises PlaybackRefused("video_busy") without consuming; the ticket is
+        consumed in this same _lock section before any state change, and a failed
+        consume returns ``_STALE`` with nothing reserved. Returns (token, session)."""
         with self._lock:
             if self._state != VideoState.IDLE:
+                if prepared is not None:
+                    raise PlaybackRefused("video_busy")
                 return None
             token = str(uuid.uuid4())
             session_id = self._session_id_factory()
-            session = _CaptureSession(session_id, token)
+            session_ref = str(uuid.uuid4())
+            if prepared is not None and not prepared["ticket"].try_consume(token, session_ref, session_id):
+                return _STALE                    # cancelled or past its deadline: no reservation
+            session = _CaptureSession(session_id, token, session_ref=session_ref)
+            if prepared is not None:
+                session.ticket_id = prepared["ticket"].ticket_id
+                session.on_finished = prepared["on_finished"]
+                session.config = prepared["config"]
+                session.expected_size = prepared["expected_size"]
             self._current = session
             self._start_token = token
             self._session_id = session_id
@@ -718,12 +877,13 @@ class VideoService:
             session.timing = self._startup_timing
         refused = self._start_sinks(session)     # _lifecycle_lock released on return
         if refused is None:
-            return token
+            return token, session
         with self._lock:
             run = self._current is session and not session.released
             if run:                              # otherwise a stop()/abort won and owns cleanup
                 session.end_reason, session.capture_error = "error", REQUIRED_START_REFUSED
                 session.start_refused = True
+                self._decide_end_locked(session, "refused")
                 self._counts["required_start_refusals"] += 1
                 self._start_token = None
                 self._state = VideoState.STOPPING    # ERROR (until Stop) once the cleanup ended
@@ -771,15 +931,20 @@ class VideoService:
             milestone, token=token, session_id=session_id, at=at,
         ))
 
-    def _packet_is_active(self, packet: FramePacket) -> bool:
+    def _packet_is_active(self, packet: FramePacket, session: _CaptureSession | None = None) -> bool:
+        """``session`` (the publishing session object) narrows the check to that object:
+        a frame of a released session never reaches a newer one that reuses its id."""
         with self._lock:
+            if session is not None and (self._current is not session or session.released):
+                return False
             return (self._session_id == packet.session_id
                     and self._state is VideoState.RUNNING and not self._stop_event.is_set())
 
-    def _offer_consumers(self, packet: FramePacket, *, lease: str | None = None) -> None:
+    def _offer_consumers(self, packet: FramePacket, *, lease: str | None = None,
+                         session: _CaptureSession | None = None) -> None:
         """Keep capture alive if either optional asynchronous consumer fails. ``lease``
         (the capture session's token) is passed to a lease-aware detector only."""
-        if not self._packet_is_active(packet):
+        if not self._packet_is_active(packet, session):
             return
         if self._event_frame_buffer is not None:
             try:
@@ -797,7 +962,7 @@ class VideoService:
         for label, consumer in (("detector", self._detector), ("scene classifier", self._scene_classifier)):
             if consumer is None:
                 continue
-            if not self._packet_is_active(packet):
+            if not self._packet_is_active(packet, session):
                 return
             try:
                 if lease is not None and getattr(consumer, "accepts_lifecycle_lease", False) is True:
@@ -944,6 +1109,96 @@ class VideoService:
         if self._start_capture(session, thread):
             self._emit_startup_milestone(state_running_entry)
 
+    def start_prepared_file(self, path: Path, *, ticket, session_config, expected_size,
+                            on_finished) -> bool:
+        """Start analysing a store-owned prepared file (P1 plan §7.5, §16.2).
+
+        Returns True once RUNNING was published for this session; False when the ticket
+        was cancelled or expired before the consume (nothing reserved). Raises
+        PlaybackRefused for "configuration_unavailable" (before the consume),
+        "video_busy" (not IDLE; not consumed), "required_component_refused" (rolled
+        back) and "stopped" (a Stop or cancel won after the consume); raises
+        PreparedStartFailed when the open, probe or thread start failed after the
+        consume. Every consumed start ends through this session's cleanup and hook.
+        """
+        if (self._registry is None or session_config is None or not callable(on_finished)
+                or not _valid_size(expected_size)):
+            raise PlaybackRefused("configuration_unavailable")
+        try:
+            reserved = self._reserve({"ticket": ticket, "config": session_config,
+                                      "expected_size": expected_size, "on_finished": on_finished})
+        except VideoStartRefusedError:
+            raise PlaybackRefused("required_component_refused") from None
+        if reserved is _STALE:
+            return False
+        _token, session = reserved
+        with self._lock:
+            opening = self._begin_open_locked(session)
+        if not opening:
+            raise PlaybackRefused("stopped")     # its cleanup already sent the hook
+        try:
+            cap = self._decoder.create_capture(path)
+        except Exception as error:
+            _log_failure("Prepared video open failed", error)
+            self._end_open(session)
+            self._fail_start(session, "Unable to open video file")
+            raise self._prepared_failure(session) from None
+        self._adopt_capture(session, cap)        # owner before any call on the capture
+        try:
+            fps = self._decoder.probe(cap)
+            thread = self._attach(session, "prepared file", self._run_capture_file, (cap, fps))
+        except Exception as error:
+            if not isinstance(error, video_decoder.CaptureUnavailable):
+                _log_failure("Prepared video probe failed", error)
+            self._end_open(session)
+            self._fail_start(session, "Unable to open video file")
+            raise self._prepared_failure(session) from None
+        if thread is None:
+            self._end_open(session)              # a stop won during the open: its cleanup releases
+            raise PlaybackRefused("stopped")
+        if self._start_capture(session, thread):
+            return True
+        raise self._prepared_failure(session)
+
+    def _prepared_failure(self, session: _CaptureSession) -> Exception:
+        with self._lock:
+            stopped = session.hook_reason in ("stop", "cancelled")
+        return PlaybackRefused("stopped") if stopped else PreparedStartFailed("prepared start failed")
+
+    def cancel_session(self, lease: str) -> bool:
+        """End the reservation whose token is ``lease``, whatever its state.
+
+        One _lock section is the linearization point: the token check, the cancel
+        record and the invalidation (released, stop_event) happen together, so no
+        STARTING -> RUNNING transition can slip between a check and the action; every
+        later step of that reservation re-checks ``released`` and stops. Another or an
+        already released token: False (counted), nothing changes. The caller then runs
+        this session's cleanup (with its end hook)."""
+        with self._lock:
+            session = self._current
+            if session is None or session.token != lease or session.released:
+                self._counts["stale_cancels"] += 1
+                return False
+            session.cancel_requested = True
+            session.stop_requested = True
+            self._decide_end_locked(session, "cancelled")
+            self._start_token = None
+            self._invalidate_locked(session)
+            self._state = VideoState.STOPPING
+        self._run_cleanup(session, full=True)
+        with self._lock:
+            self._finalize_locked(session)
+        return True
+
+    def get_session_identity(self) -> tuple[VideoState, str | None, str | None]:
+        """(state, session_ref, session_id) of the current reservation in one _lock
+        section; the ids stay visible until the state is IDLE."""
+        with self._lock:
+            session = self._current
+            if session is None or self._state is VideoState.IDLE:
+                return self._state, None, None
+            return self._state, session.session_ref, session.session_id
+
     # ------------------------------------------------------------------
     # Stop / reset
     # ------------------------------------------------------------------
@@ -975,6 +1230,7 @@ class VideoService:
                 self._source = None
                 return
             session.stop_requested = True
+            self._decide_end_locked(session, "stop")
 
         self._release_session(session)
 
@@ -1039,7 +1295,7 @@ class VideoService:
             self._packet = packet
             self._packet_cond.notify_all()
         self.record_startup_milestone("first_packet_published", session_id=session.session_id)
-        self._offer_consumers(packet, lease=session.token)
+        self._offer_consumers(packet, lease=session.token, session=session)
 
     def _run_capture_webcam(self, cap: cv2.VideoCapture, *, session: _CaptureSession) -> None:
         """Capture loop for webcam source; bound to its own session."""
@@ -1103,6 +1359,13 @@ class VideoService:
                         return  # Stop requested right at the EOF boundary: clean.
                     # Normal EOF — transition to IDLE, not ERROR.
                     self._finish_from_capture(session, VideoState.IDLE, None)
+                    return
+
+                # Prepared: every frame must have the configured size BEFORE publication;
+                # a mismatching frame reaches no packet slot, buffer, tee or model.
+                if session.expected_size is not None and _frame_size(frame) != session.expected_size:
+                    self._finish_from_capture(session, VideoState.ERROR, FRAME_SIZE_CHANGED,
+                                              reason="frame_size_changed")
                     return
 
                 ok, buf = cv2.imencode(".jpg", frame)

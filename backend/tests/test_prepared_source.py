@@ -543,16 +543,15 @@ def test_geometry_unstable_generation_cannot_be_reopened(env):
     source_id, generation, revision = configured(store)
     store.play(source_id, generation, revision, 1, op())
     session = env.video.sessions[0]
-    store.report_geometry_unstable(session.ticket.ticket_id, session.lease)
-    session.finish("error", True)
+    session.finish("frame_size_changed", True)                            # lease-bound end hook
     current = store.snapshot()
     assert current.state is SourceState.PREPARED and current.geometry_unstable and not current.config_ready
     assert category(store.play, source_id, generation, revision, 2, op()) == "source_geometry_unstable"
     assert category(store.save_configuration, source_id, generation, revision,
                     operator_config()) == "source_geometry_unstable"
     assert store.begin_read(source_id, generation) is not None             # still readable (decision 6)
-    store.report_geometry_unstable(session.ticket.ticket_id, "lease-other")
-    assert store.count("stale_hooks") == 1
+    session.on_finished(session.ticket.ticket_id, "lease-other", "frame_size_changed", True)
+    assert store.count("stale_hooks") == 1                                # stale lease: no effect
 
 
 # --------------------------------------------------------------------------- idle TTL (D5)
@@ -862,3 +861,90 @@ def test_store_numeric_parameters_with_extreme_integers(env, value):
     handle = snap_store.begin_write(snap.source_id, snap.generation, ".mp4")
     assert category(snap_store.finish_write, handle, value, 48) == "not_decodable"
     assert snap_store.snapshot() is None
+
+
+# --------------------------------------------------------------------------- P1b: lease-bound geometry failure
+
+
+@pytest.mark.parametrize("first_cleanup", [True, False, None])
+def test_frame_size_changed_hook_is_sticky_for_the_generation(env, first_cleanup):
+    store = env.store()
+    source_id, generation, revision = configured(store)
+    store.play(source_id, generation, revision, 1, op())
+    session = env.video.sessions[0]
+    session.finish("frame_size_changed", first_cleanup)
+    assert store.snapshot().geometry_unstable and not store.snapshot().config_ready
+    session.finish("frame_size_changed", True)                            # later clean hook
+    current = store.snapshot()
+    assert current.state is SourceState.PREPARED and current.geometry_unstable
+    assert not current.config_ready and store.file_users() == 0
+    assert category(store.play, source_id, generation, revision, 2, op()) == "source_geometry_unstable"
+    assert category(store.save_configuration, source_id, generation, revision,
+                    operator_config()) == "source_geometry_unstable"
+
+
+def test_frame_size_changed_from_a_stale_lease_changes_nothing(env):
+    store = env.store()
+    source_id, generation, revision = configured(store)
+    store.play(source_id, generation, revision, 1, op())
+    session = env.video.sessions[0]
+    session.on_finished(session.ticket.ticket_id, "lease-other", "frame_size_changed", True)
+    assert not store.snapshot().geometry_unstable and store.count("stale_hooks") == 1
+
+
+class _Hostile:
+    """Raises on every comparison, truthiness and hash (must never be evaluated)."""
+
+    def _boom(self, *_args):
+        raise RuntimeError("evaluated")
+
+    __eq__ = __ne__ = __lt__ = __le__ = __gt__ = __ge__ = __hash__ = __bool__ = __len__ = _boom
+
+
+class _HostileStr(str):
+    def __eq__(self, other):
+        raise RuntimeError("evaluated")
+
+    __hash__ = str.__hash__
+
+
+KEEP = object()                                  # placeholder: use the session's own value
+
+
+def _hostile_inputs():
+    import numpy as np
+    return [
+        ("ticket_id str", ("1", KEEP, "eof", True)),
+        ("ticket_id bool", (True, KEEP, "eof", True)),
+        ("lease None", (KEEP, None, "eof", True)),
+        ("lease bytes", (KEEP, b"lease-1", "eof", True)),
+        ("lease str subclass", (KEEP, _HostileStr("lease-1"), "eof", True)),
+        ("end_reason None", (KEEP, KEEP, None, True)),
+        ("end_reason hostile", (KEEP, KEEP, _Hostile(), True)),
+        ("cleanup_ok 1", (KEEP, KEEP, "eof", 1)),
+        ("cleanup_ok str", (KEEP, KEEP, "eof", "yes")),
+        ("cleanup_ok list", (KEEP, KEEP, "eof", [True])),
+        ("cleanup_ok array", (KEEP, KEEP, "eof", np.array([True, False]))),
+        ("cleanup_ok numpy bool", (KEEP, KEEP, "eof", np.bool_(True))),
+        ("cleanup_ok hostile", (KEEP, KEEP, "eof", _Hostile())),
+    ]
+
+
+@pytest.mark.parametrize("label, args", _hostile_inputs(), ids=[label for label, _ in _hostile_inputs()])
+def test_invalid_hook_input_is_rejected_without_exception_or_state_change(env, label, args):
+    store = env.store()
+    source_id, generation, revision = configured(store)
+    store.play(source_id, generation, revision, 1, op())
+    session = env.video.sessions[0]
+    ticket_id, lease, end_reason, cleanup_ok = args
+    ticket_id = session.ticket.ticket_id if ticket_id is KEEP else ticket_id
+    lease = session.lease if lease is KEEP else lease
+    before = (store.snapshot(), store.attempt(source_id, 1), store.file_users(),
+              store.ticket_summary(session.ticket.ticket_id))
+    store.on_finished(ticket_id, lease, end_reason, cleanup_ok)          # never raises
+    after = (store.snapshot(), store.attempt(source_id, 1), store.file_users(),
+             store.ticket_summary(session.ticket.ticket_id))
+    assert after == before and before[0].state is SourceState.PLAYING
+    assert store.count("invalid_hooks") == 1 and store.count("stale_hooks") == 0
+    session.finish("stop", True)                                           # a valid hook still works
+    assert store.snapshot().state is SourceState.PREPARED

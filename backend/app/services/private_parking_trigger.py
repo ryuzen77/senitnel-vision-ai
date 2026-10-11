@@ -137,15 +137,32 @@ class _Candidate:
     crossed_in_at: float
 
 
+class PrivateParkingAdmissionError(RuntimeError):
+    """No operator configuration is bound for the session (sanitized: no ids)."""
+
+
 class PrivateParkingTrigger:
-    def __init__(self, config: PrivateParkingConfig, *, clock: Callable[[], float] = time.monotonic,
+    """``config``: one validated configuration for every session (startup file). Or
+    ``session_config``: a lookup (the lease-bound registry's ``get``) read at each
+    ``start_session``; the bound operator configuration is used for that session only,
+    and a session without one is refused (``PrivateParkingAdmissionError``), never served
+    by another configuration. Exactly one of the two."""
+
+    def __init__(self, config: PrivateParkingConfig | None = None, *,
+                 session_config: Callable[[str], object] | None = None,
+                 clock: Callable[[], float] = time.monotonic,
                  authorization: AuthorizationSignalSource | None = None) -> None:
-        if not isinstance(config, PrivateParkingConfig):
+        if (config is None) == (session_config is None):
+            raise ValueError("exactly one of config or session_config is required")
+        if config is not None and not isinstance(config, PrivateParkingConfig):
             raise ValueError("a validated PrivateParkingConfig is required")
+        if session_config is not None and not callable(session_config):
+            raise ValueError("session_config must be callable")
         if not callable(clock):
             raise ValueError("clock must be callable")
+        self._session_config = session_config
         self._config = config
-        self._t = config.thresholds
+        self._t = config.thresholds if config is not None else None
         self._clock = clock
         self._authorization = authorization
         self._lock = threading.Lock()
@@ -181,8 +198,19 @@ class PrivateParkingTrigger:
 
     def start_session(self, session_id: str) -> None:
         with self._lock:
-            if not self._closed:
-                self._reset_locked(session_id)
+            if self._closed:
+                return
+            if self._session_config is not None:
+                try:
+                    bound = self._session_config(session_id)
+                except Exception:
+                    bound = None
+                config = getattr(bound, "config", bound)      # OperatorConfiguration or a config
+                if not isinstance(config, PrivateParkingConfig):
+                    self._reset_locked(None)
+                    raise PrivateParkingAdmissionError("no operator configuration is bound for the session")
+                self._config, self._t = config, config.thresholds
+            self._reset_locked(session_id)
 
     def end_session(self, session_id: str) -> None:
         with self._lock:
