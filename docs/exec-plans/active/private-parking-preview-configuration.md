@@ -6,7 +6,7 @@ not authorized.** Author: Claude
 (implementing agent), 2026-10-11, from source read at `a45c986`. Review history: rev 1
 (`2fc0a08`) BLOCKED (five gaps), rev 2 (`53e27c1`) BLOCKED (R1-R4), rev 3 (`413c5ae`)
 BLOCKED (R5-R7), all by Codex read-only, recorded in
-[the frontend plan](private-parking-configuration-ui.md) §11-§14. Rev 4 closes R5-R7 with
+the frontend plan (`private-parking-configuration-ui.md`, draft lokal, belum dipublikasikan) §11-§14. Rev 4 closes R5-R7 with
 a single-use handoff ticket (§8.3) and generation-scoped operation IDs (§8.2); Codex
 review of rev 4 (`c6e9ee4`), rev 4.1 (`087c771`) and rev 4.2 (`2ade927`): PASS WITH
 LIMITATIONS. Rev 4.2 adds
@@ -86,8 +86,8 @@ Exact files of the implementation phase (after authorization):
 | adapted tests | `test_private_parking_runtime_wiring.py` (invalid startup ≠ disabled), `test_private_parking_evaluation_enable.py` (wiring), `test_private_parking_trigger.py` (side, per-session config), `test_private_parking_coordinator.py` (start refusal), `test_private_parking_contracts_integration.py` and `test_private_parking_evidence_sampler.py` (config type), `test_video_session_lifecycle.py`, `test_video_required_sinks.py`, `test_video_service.py` (status field, hook), `test_video_api.py`, `test_video_upload_rollback.py` (private-mode refusal of legacy routes), `test_evaluation_runtime_integration.py` (module composition) |
 | this plan; after implementation `ARCHITECTURE.md`, `docs/RELIABILITY.md`, `PLAN.md` | Contracts and status |
 
-Non-scope: frontend ([plan](private-parking-configuration-ui.md)); webcam/CCTV preview;
-gesture; camera health ([draft](camera-health-monitoring.md)); local voice asset; retail;
+Non-scope: frontend (`private-parking-configuration-ui.md`, draft lokal, belum dipublikasikan); webcam/CCTV preview;
+gesture; camera health (`camera-health-monitoring.md`, draft lokal, belum dipublikasikan); local voice asset; retail;
 legacy-mode behaviour; persistence across restarts; threshold editing; multi-camera;
 seek. No new dependency.
 
@@ -227,7 +227,7 @@ the next status read. Detection, domain and evaluation schemas stay unchanged in
   or for a later camera phase a moved camera — passes every check, and analysis then uses
   line and zones that no longer match the scene (wrong or missing warnings). P1 makes no
   claim that a valid configuration matches the physical scene. Detecting this depends on
-  the camera-health work ([C1H draft](camera-health-monitoring.md), signal "camera
+  the camera-health work (C1H, `camera-health-monitoring.md`, draft lokal, belum dipublikasikan; signal "camera
   shifted": comparison against a reference captured at configuration time); it is a
   prerequisite before any real CCTV use, not part of P1.
 - **Letterboxing** is a UI concern (contain transform in the frontend plan); the API sees
@@ -658,7 +658,7 @@ High risk first; every phase ends with tests, report and review before the next 
 | **P1a — core store and ownership** | new `prepared_source.py` (store, states, ticket, attempt CAS, ID binding set and cap, record retention, deadlines, sweeper, file users, single-flight cleanup); new `session_config_registry.py`; `models/private_parking.py` (inside side, operator config, template conversion); tests `test_prepared_source.py`, `test_prepared_source_races.py`, `test_session_config_registry.py`, `test_inside_side_geometry.py` | §9.3, §9.4 and §9.5 against a fake VideoService (ticket consume/cancel, hook before return, fake hooks); §9.6 registry part; §9.7 geometry part; §9.8, §9.9 store part, §9.11, §9.12; §9.13 `/current` snapshot | HEAD `a45c986` only; no runtime change, nothing wired |
 | **P1b — VideoService lifecycle and analysis contracts** | `video_service.py` (`start_prepared_file`, consume in the reservation section, hook incl. refusal rollback, `cancel_session`, per-frame size check, status snapshot with `session_ref`/`session_id`); new `video_decoder.py`; `private_parking_trigger.py` (per-session config); `private_parking_coordinator.py` (re-raise); adapted tests `test_video_session_lifecycle.py`, `test_video_required_sinks.py`, `test_video_service.py`, `test_private_parking_trigger.py`, `test_private_parking_coordinator.py`, `test_private_parking_contracts_integration.py`, `test_private_parking_evidence_sampler.py`; new `test_video_prepared_playback.py`, `test_private_session_config.py` | §9.4 with the real VideoService and fake capture/sinks; §9.5; §9.6; §9.7 frame part; §9.13 status snapshot and factory precondition; legacy start paths unchanged | P1a (ticket, registry, config model) |
 | **P1c — runtime and API** | new `api/sources.py`, `models/sources.py`; `api/video.py`, `models/video.py` (status fields, private-mode refusal of legacy starts); `runtime.py`, `main.py`, `.env.example`; new `test_sources_api.py`; adapted `test_private_parking_runtime_wiring.py`, `test_private_parking_evaluation_enable.py`, `test_video_api.py`, `test_video_upload_rollback.py`, `test_evaluation_runtime_integration.py` | §9.1, §9.2, §9.3 over HTTP, §9.9, §9.10, §9.11 over HTTP, §9.13 wire models; full backend suite; then docs (`ARCHITECTURE.md`, `docs/RELIABILITY.md`, `PLAN.md`) | P1b |
-| **P1d — UI** ([frontend plan](private-parking-configuration-ui.md), Codex) | frontend files of that plan | that plan's §9 against fakes of the P1c contract | P1c contract frozen (fakes may start after P1c review) |
+| **P1d — UI** (frontend plan `private-parking-configuration-ui.md`, draft lokal, belum dipublikasikan; Codex) | frontend files of that plan | that plan's §9 against fakes of the P1c contract | P1c contract frozen (fakes may start after P1c review) |
 
 **P1c additions from the PM decisions of §0.2 (proposals; not authorized yet):**
 
@@ -872,12 +872,13 @@ real video or device.
 
 **Review verdict: PASS WITH LIMITATIONS** — Codex, through the owner/PM, on the §15.3
 state (backend plan `519956c`, `prepared_source.py` `6578a2b`, race tests `4c184eb`).
-Reviewer results relayed earlier for the §15.2 round: the deadline finding closed
-(cleanup `True`/`False`/`None` reproduced), P1a target tests 138 passed, the full backend
-suite serial with a unique basetemp 1347 passed with one deprecation warning, `pip
-check`, diff, whitespace, newline and control-byte checks passed. The 30-fold repetition
-and the mutation runs against restored old behaviour are **implementer evidence**
-(Claude), not reviewer results.
+Reviewer results of the final round, relayed by Codex through the owner/PM: P1a target
+tests 140 passed, the full backend suite 1349 passed. Earlier round (§15.2), also relayed:
+the deadline finding closed (cleanup `True`/`False`/`None` reproduced), 138 target and
+1347 full-suite tests passed with one deprecation warning, `pip check`, diff, whitespace,
+newline and control-byte checks passed. The 30-fold repetition and the mutation runs
+against restored old behaviour are **implementer evidence** (Claude), not reviewer
+results.
 
 Hash check before the commit (full blob hashes, unchanged since the reviewed round):
 
@@ -895,8 +896,9 @@ The reviewer-quoted hashes cover the plan, the store and the race tests; the oth
 files were last changed in earlier reviewed rounds (§15, §15.1) and not since. One
 change after the review, found by `git diff --cached --check`: `prepared_source.py` ended
 with an extra blank line; only that final empty line was removed (verified: the reviewed
-blob equals the committed content plus one newline), hence the second hash. The full
-backend suite was re-run after it.
+blob equals the committed content plus one newline), hence the second hash.
+Implementer result after that change (Claude, not a reviewer result): full backend suite
+1349 passed, 1 warning (Starlette deprecation, pre-existing).
 
 **Scope limits of this closure:** core store, ownership, registry and geometry model
 only, tested with fakes. Nothing is wired: no VideoService change (P1b), no API, runtime
