@@ -5,11 +5,11 @@ interface Props {
 }
 
 const STATE_CONFIG: Record<VideoState, { label: string; tone: string }> = {
-  [VideoState.IDLE]: { label: 'IDLE', tone: 'idle' },
-  [VideoState.STARTING]: { label: 'STARTING', tone: 'starting' },
-  [VideoState.RUNNING]: { label: 'RUNNING', tone: 'running' },
-  [VideoState.STOPPING]: { label: 'STOPPING', tone: 'stopping' },
-  [VideoState.ERROR]: { label: 'ERROR', tone: 'error' },
+  [VideoState.IDLE]: { label: 'Belum berjalan', tone: 'idle' },
+  [VideoState.STARTING]: { label: 'Memulai', tone: 'starting' },
+  [VideoState.RUNNING]: { label: 'Video berjalan', tone: 'running' },
+  [VideoState.STOPPING]: { label: 'Menghentikan', tone: 'stopping' },
+  [VideoState.ERROR]: { label: 'Video bermasalah', tone: 'error' },
 }
 
 export function VideoStatusBadge({ state }: Props) {

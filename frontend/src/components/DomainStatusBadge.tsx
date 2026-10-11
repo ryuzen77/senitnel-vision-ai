@@ -10,11 +10,11 @@ export interface DomainUiState {
 
 export function getDomainUiState(videoState: VideoState, snapshot: DomainSnapshot | null, fetchError: string | null): DomainUiState {
   if (videoState !== VideoState.RUNNING) return { stage: 'Belum aktif', domain: 'Menunggu sumber video', detail: null, tone: 'idle', active: false }
-  if (fetchError) return { stage: 'Status domain tidak tersedia', domain: 'Status domain tidak tersedia', detail: null, tone: 'unavailable', active: false }
+  if (fetchError) return { stage: 'Belum tersedia', domain: 'Belum tersedia', detail: null, tone: 'unavailable', active: false }
   if (snapshot === null || snapshot.state === 'IDLE') return { stage: 'Menganalisis', domain: 'Mendeteksi lingkungan', detail: null, tone: 'probing', active: true }
   if (snapshot.state === 'PROBING') return { stage: 'Menganalisis', domain: 'Mendeteksi lingkungan', detail: `${Math.min(snapshot.observation_count, 5)}/5 sampel`, tone: 'probing', active: true }
-  if (snapshot.domain === 'PARKING_MOTORCYCLE') return lockedUi('Parkiran Motor', snapshot, 'active')
-  if (snapshot.domain === 'RETAIL_STORE') return lockedUi('Toko / Retail', snapshot, 'active')
+  if (snapshot.domain === 'PARKING_MOTORCYCLE') return lockedUi('Parkiran motor', snapshot, 'active')
+  if (snapshot.domain === 'RETAIL_STORE') return lockedUi('Toko', snapshot, 'active')
   return lockedUi('Lingkungan tidak dikenali', snapshot, 'unknown', 'Di luar domain')
 }
 

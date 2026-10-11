@@ -29,11 +29,11 @@ describe('App evaluation lifecycle', () => {
     expect(evaluationCalls).toHaveLength(1)
     const sessionARequest = evaluationCalls[0]
 
-    fireEvent.click(screen.getByRole('button', { name: 'Hentikan Video' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Hentikan video' }))
     expect(sessionARequest.signal?.aborted).toBe(true)
     await flush()
 
-    fireEvent.click(screen.getByRole('button', { name: 'Mulai Webcam' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Mulai kamera' }))
     await flush()
     // The new lifecycle issued its own evaluation request.
     expect(evaluationCalls).toHaveLength(2)
@@ -42,15 +42,15 @@ describe('App evaluation lifecycle', () => {
     sessionARequest.resolve(completedView('session-A', 'event-A', 'alasan sesi A'))
     await flush()
     expect(screen.queryByText('alasan sesi A')).toBeNull()
-    expect(screen.queryByText('Hasil analisis AI — perlu ditinjau')).toBeNull()
+    expect(screen.queryByText('Hasil penilaian — perlu ditinjau')).toBeNull()
 
     evaluationCalls[1].resolve(completedView('session-B', 'event-B', 'alasan sesi B'))
     await flush()
     screen.getByText('alasan sesi B')
-    screen.getByText('Hasil analisis AI — perlu ditinjau')
+    screen.getByText('Hasil penilaian — perlu ditinjau')
     expect(screen.queryByText('alasan sesi A')).toBeNull()
-    // Pipeline step reflects the backend process state, not the assessment level.
-    screen.getByText('Selesai')
+    // The panel reports process state separately from the assessment level.
+    screen.getByText('Status: Selesai')
   })
 
   it('hides the result as soon as Stop is clicked, before the backend answers', async () => {
@@ -60,8 +60,8 @@ describe('App evaluation lifecycle', () => {
     await flush()
     screen.getByText('alasan sesi A')
 
-    fireEvent.click(screen.getByRole('button', { name: 'Hentikan Video' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Hentikan video' }))
     expect(screen.queryByText('alasan sesi A')).toBeNull()
-    screen.getByText('Menunggu sumber video.')
+    screen.getByText('Mulai video untuk melihat penilaian AI.')
   })
 })

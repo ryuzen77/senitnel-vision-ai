@@ -17,6 +17,7 @@ interface HealthResponse {
 }
 
 function App() {
+  useEffect(() => { document.documentElement.lang = 'id' }, [])
   const [health, setHealth] = useState<HealthResponse | null>(null)
   const [pendingState, setPendingState] = useState<VideoState | null>(null)
   // Bumped when a Start/Stop action begins and again when it settles. Status and
@@ -70,60 +71,39 @@ function App() {
   const evaluation = useCurrentEvaluation(effectiveState === VideoState.RUNNING, lifecycleEpoch)
   const evaluationUi = getEvaluationUiState(effectiveState === VideoState.RUNNING, evaluation)
   const sourceLabel = status?.source
-    ? status.source === 'webcam' ? 'Webcam' : 'Uploaded Video'
+    ? status.source === 'webcam' ? 'Kamera' : 'File video'
     : 'Tidak ada'
 
   return (
     <main className="app-shell">
       <header className="dashboard-header">
-        <div><p className="eyebrow">MONITORING CONSOLE</p><h1>SENTINEL VISION AI</h1><p className="header-subtitle">Autonomous Video Analytics &amp; Real-Time Object Detection</p></div>
-        <span className={`backend-badge ${health?.status === 'online' ? 'is-online' : 'is-offline'}`}><span className="status-dot" aria-hidden="true" />Backend {health?.status === 'online' ? 'Online' : health ? 'Offline' : 'Menghubungkan'}</span>
+        <div><h1>Sentinel Vision AI</h1><p className="header-subtitle">Pemantauan video</p></div>
+        <span className="backend-badge" title="Koneksi diperiksa saat halaman dibuka; bukan status kesiapan AI atau audio.">Layanan {health?.status === 'online' ? 'terhubung saat membuka halaman' : health ? 'belum terhubung' : 'sedang diperiksa'}</span>
       </header>
-      <section className="pipeline-card" aria-labelledby="pipeline-heading">
-        <div className="section-heading"><div><p className="eyebrow">SYSTEM PIPELINE</p><h2 id="pipeline-heading">Status Analitik</h2></div></div>
-        <ol className="pipeline-list">
-          <PipelineStep label="Video Feed" detail={videoState === VideoState.RUNNING ? 'Aktif' : 'Menunggu'} active={videoState === VideoState.RUNNING} />
-          <PipelineStep label="Object Detection" detail={latestDetection ? 'Aktif' : 'Menunggu'} active={latestDetection !== null} />
-          <PipelineStep label="Domain Analysis" detail={domainUi.stage} active={domainUi.active} tone={domainUi.tone} />
-          <PipelineStep label="Response System" detail={evaluationUi.label} active={evaluationUi.pipelineActive} />
-        </ol>
-      </section>
-      <section className="monitoring-section">
-        <div className="section-heading source-heading"><div><p className="eyebrow">VIDEO INPUT</p><h2>Sumber Video</h2></div>
-          <VideoStatusBadge state={effectiveState} />
-        </div>
-
-        {fetchError && (
-          <p className="inline-error" role="status">
-            Status video tidak tersedia: {fetchError}
-          </p>
-        )}
-
+      <section className="monitoring-section" aria-label="Pemantauan video dan penilaian AI">
         <div className="video-workspace">
-          <div className="video-column">
+          <section className="video-column" aria-labelledby="video-heading">
+            <div className="section-heading source-heading"><h2 id="video-heading">Video aktif</h2><VideoStatusBadge state={effectiveState} /></div>
+            {fetchError && <p className="inline-error" role="status">Status video belum dapat dimuat.</p>}
             <VideoPreview state={effectiveState} />
-            <div className="video-status-strip" aria-label="Status video dan AI"><span><small>Sumber aktif</small><strong>{sourceLabel}</strong></span><span><small>Status AI detector</small><strong>{detectorStatus(videoState, latestDetection, detectionError)}</strong></span><span><small>Status domain</small><strong><DomainStatusBadge value={domainUi} /></strong>{domainUi.detail && <small className="domain-detail">{domainUi.detail}</small>}</span></div>
             <VideoSourceSelector
               state={videoState}
               pendingState={pendingState}
               onPendingStateChange={handlePendingStateChange}
               onActionSettled={handleActionSettled}
             />
-          </div>
-          <DetectionPanel
-            state={videoState}
-            result={latestDetection}
-            fetchError={detectionError}
-          />
+            <div className="video-status-strip" aria-label="Sumber dan lingkungan"><span>Sumber: <strong>{sourceLabel}</strong></span><span>Lingkungan: <DomainStatusBadge value={domainUi} /></span></div>
+          </section>
+          <EvaluationPanel ui={evaluationUi} />
         </div>
-        <EvaluationPanel ui={evaluationUi} />
+        <div className="secondary-details">
+          <details><summary>Detail objek</summary><DetectionPanel state={videoState} result={latestDetection} fetchError={detectionError} /></details>
+          <details><summary>Detail sistem</summary><dl className="system-details"><dt>Deteksi objek</dt><dd>{detectorStatus(videoState, latestDetection, detectionError)}</dd><dt>Lingkungan</dt><dd>{domainUi.stage}</dd>{domainUi.detail && <><dt>Rincian klasifikasi</dt><dd>{domainUi.detail}</dd></>}</dl></details>
+        </div>
+        <p className="access-help">Penilaian AI berbeda dari peringatan akses lokal. Status peringatan akses lokal belum tersedia di tampilan ini.</p>
       </section>
     </main>
   )
-}
-
-function PipelineStep({ label, detail, active, tone }: { label: string; detail: string; active: boolean; tone?: string }) {
-  return <li className={`${active ? 'pipeline-step is-active' : 'pipeline-step'} ${tone ? `is-${tone}` : ''}`}><span className="pipeline-marker" aria-hidden="true" /><span><strong>{label}</strong><small>{detail}</small></span></li>
 }
 
 function detectorStatus(state: VideoState, result: unknown, error: string | null): string {

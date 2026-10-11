@@ -3,7 +3,7 @@
  *
  * All backend communication for the /api/video/* endpoints lives here.
  * VIDEO_STREAM_URL is a plain constant — cache-busting is handled once
- * per RUNNING session inside VideoPreview (via useRef), not here.
+ * per RUNNING transition inside VideoPreview, not here. It is not a backend lease.
  */
 
 export enum VideoState {
@@ -112,6 +112,14 @@ export class VideoValidationError extends Error {
   }
 }
 
+/** Public HTTP status only: never retain or display an arbitrary response body. */
+export class ApiRequestError extends Error {
+  constructor(public readonly status: number) {
+    super(`HTTP ${status}`)
+    this.name = 'ApiRequestError'
+  }
+}
+
 export const VIDEO_STREAM_URL = '/api/video/stream'
 
 const ALLOWED_MIME_TYPES = ['video/mp4', 'video/webm']
@@ -121,8 +129,7 @@ const MAX_FILE_BYTES = 200 * 1024 * 1024 // 200 MB
 export async function startWebcam(): Promise<VideoStartResponse> {
   const res = await fetch('/api/video/webcam/start', { method: 'POST' })
   if (!res.ok) {
-    const body = await res.json().catch(() => ({}))
-    throw new Error(body?.detail ?? `HTTP ${res.status}`)
+    throw new ApiRequestError(res.status)
   }
   return res.json() as Promise<VideoStartResponse>
 }
@@ -152,8 +159,7 @@ export async function uploadVideo(file: File): Promise<VideoStartResponse> {
 
   const res = await fetch('/api/video/upload', { method: 'POST', body: form })
   if (!res.ok) {
-    const body = await res.json().catch(() => ({}))
-    throw new Error(body?.detail ?? `HTTP ${res.status}`)
+    throw new ApiRequestError(res.status)
   }
   return res.json() as Promise<VideoStartResponse>
 }
@@ -161,8 +167,7 @@ export async function uploadVideo(file: File): Promise<VideoStartResponse> {
 export async function stopVideo(): Promise<VideoStatusResponse> {
   const res = await fetch('/api/video/stop', { method: 'POST' })
   if (!res.ok) {
-    const body = await res.json().catch(() => ({}))
-    throw new Error(body?.detail ?? `HTTP ${res.status}`)
+    throw new ApiRequestError(res.status)
   }
   return res.json() as Promise<VideoStatusResponse>
 }
@@ -170,7 +175,7 @@ export async function stopVideo(): Promise<VideoStatusResponse> {
 export async function getVideoStatus(signal?: AbortSignal): Promise<VideoStatusResponse> {
   const res = await fetch('/api/video/status', { signal })
   if (!res.ok) {
-    throw new Error(`HTTP ${res.status}`)
+    throw new ApiRequestError(res.status)
   }
   return res.json() as Promise<VideoStatusResponse>
 }
@@ -182,8 +187,7 @@ export async function getLatestDetection(signal?: AbortSignal): Promise<Detectio
     return null
   }
   if (!res.ok) {
-    const body = await res.json().catch(() => ({}))
-    throw new Error(body?.detail ?? `HTTP ${res.status}`)
+    throw new ApiRequestError(res.status)
   }
   return res.json() as Promise<DetectionResult>
 }
@@ -192,7 +196,7 @@ export async function getLatestDetection(signal?: AbortSignal): Promise<Detectio
 export async function getCurrentEvaluation(signal?: AbortSignal): Promise<EvaluationCurrent> {
   const res = await fetch('/api/evaluation/current', { signal })
   if (!res.ok) {
-    throw new Error(`HTTP ${res.status}`)
+    throw new ApiRequestError(res.status)
   }
   return res.json() as Promise<EvaluationCurrent>
 }
@@ -201,8 +205,7 @@ export async function getCurrentEvaluation(signal?: AbortSignal): Promise<Evalua
 export async function getCurrentDomain(signal?: AbortSignal): Promise<DomainSnapshot> {
   const res = await fetch('/api/domain/current', { signal })
   if (!res.ok) {
-    const body = await res.json().catch(() => ({}))
-    throw new Error(body?.detail ?? `HTTP ${res.status}`)
+    throw new ApiRequestError(res.status)
   }
   return res.json() as Promise<DomainSnapshot>
 }

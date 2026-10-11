@@ -5,6 +5,7 @@ import {
   uploadVideo,
   VideoState,
   VideoValidationError,
+  ApiRequestError,
 } from '../api/videoApi'
 
 interface Props {
@@ -19,6 +20,17 @@ interface Props {
 }
 
 type Tab = 'webcam' | 'upload'
+
+function actionMessage(error: unknown): string {
+  if (error instanceof VideoValidationError) return error.message
+  if (error instanceof ApiRequestError) {
+    if (error.status === 409) return 'Sumber video masih aktif atau sedang dihentikan. Hentikan dahulu sebelum memulai lagi.'
+    if (error.status === 503) return 'Video belum bisa dimulai. Coba hentikan sesi, lalu mulai kembali.'
+    if (error.status === 422) return 'File belum dapat diputar. Gunakan MP4 atau WebM, maksimal 200 MB.'
+    return 'Permintaan belum berhasil. Periksa status video sebelum mencoba lagi.'
+  }
+  return 'Layanan tidak dapat dihubungi. Periksa koneksi ke aplikasi.'
+}
 
 export function VideoSourceSelector({ state, pendingState, onPendingStateChange, onActionSettled }: Props) {
   const [activeTab, setActiveTab] = useState<Tab>('webcam')
@@ -43,7 +55,7 @@ export function VideoSourceSelector({ state, pendingState, onPendingStateChange,
       const res = await (stopping ? stopVideo() : startWebcam())
       setPendingState(res.state)
     } catch (err: unknown) {
-      setActionError(err instanceof Error ? err.message : String(err))
+      setActionError(actionMessage(err))
     } finally {
       setIsActing(false)
       onActionSettled()
@@ -62,11 +74,7 @@ export function VideoSourceSelector({ state, pendingState, onPendingStateChange,
       const res = await uploadVideo(file)
       setPendingState(res.state)
     } catch (err: unknown) {
-      if (err instanceof VideoValidationError) {
-        setActionError(err.message)
-      } else {
-        setActionError(err instanceof Error ? err.message : String(err))
-      }
+      setActionError(actionMessage(err))
     } finally {
       setIsActing(false)
       onActionSettled()
@@ -76,23 +84,23 @@ export function VideoSourceSelector({ state, pendingState, onPendingStateChange,
   const webcamLabel =
     effectiveState === VideoState.RUNNING || effectiveState === VideoState.ERROR
       ? 'Hentikan'
-      : 'Mulai Webcam'
+      : 'Mulai kamera'
 
   return (
     <div className="source-controls">
-      {/* Tab bar */}
-      <div className="source-tabs" role="tablist" aria-label="Pilih sumber video">
+      <div className="source-tabs" role="group" aria-label="Pilih sumber video">
         {(['webcam', 'upload'] as Tab[]).map((tab) => (
           <button
             key={tab}
             disabled={sourceControlsDisabled}
+            aria-pressed={activeTab === tab}
             onClick={() => {
               setActiveTab(tab)
               setActionError(null)
             }}
             className={activeTab === tab ? 'source-tab is-active' : 'source-tab'}
           >
-            {tab === 'webcam' ? 'Webcam' : 'Upload Video'}
+            {tab === 'webcam' ? 'Kamera' : 'File video'}
           </button>
         ))}
       </div>
@@ -108,8 +116,8 @@ export function VideoSourceSelector({ state, pendingState, onPendingStateChange,
             {effectiveState === VideoState.STOPPING
               ? 'Menghentikan…'
               : effectiveState === VideoState.ERROR
-                ? 'Kembali ke Idle'
-                : 'Hentikan Video'}
+                ? 'Coba hentikan lagi'
+                : 'Hentikan video'}
           </button>
         ) : activeTab === 'webcam' ? (
           <button
@@ -121,13 +129,15 @@ export function VideoSourceSelector({ state, pendingState, onPendingStateChange,
           </button>
         ) : (
           <label className="file-input-label">
-            <span>Pilih file MP4 atau WebM (maks. 200 MB)</span>
+            <span>Pilih file dan mulai</span>
             <input
               type="file"
+              aria-label="Pilih file dan mulai"
               accept="video/mp4,video/webm"
               disabled={sourceControlsDisabled}
               onChange={handleFileChange}
             />
+            <small>MP4 atau WebM, maks. 200 MB. Setelah dipilih, file langsung diunggah dan diputar.</small>
             {effectiveState === VideoState.STARTING && <small>Memulai sumber video…</small>}
           </label>
         )}

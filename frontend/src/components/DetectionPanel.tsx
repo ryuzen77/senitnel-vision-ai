@@ -15,7 +15,6 @@ export function DetectionPanel({ state, result, fetchError }: Props) {
     return (
       <PanelShell status="Tidak tersedia">
         <p className="detection-error">Data deteksi sementara tidak tersedia</p>
-        <p className="detection-muted">{fetchError}</p>
       </PanelShell>
     )
   }
@@ -49,8 +48,8 @@ export function DetectionPanel({ state, result, fetchError }: Props) {
 
 function PanelShell({ children, result, status }: { children: React.ReactNode; result?: DetectionResult; status: string }) {
   return (
-    <aside className="detection-panel" aria-live="polite">
-      <div className="detection-heading"><div><p className="eyebrow">REAL-TIME ANALYSIS</p><h2>Live Detection</h2></div><span className="detector-state">{status}</span></div>
+    <div className="detection-panel">
+      <div className="detection-heading"><h3>Objek pada frame terbaru</h3><span className="detector-state">{status}</span></div>
       {result && (
         <div className="detection-meta">
           <span>Frame #{result.source_frame_seq}</span>
@@ -59,7 +58,7 @@ function PanelShell({ children, result, status }: { children: React.ReactNode; r
         </div>
       )}
       {children}
-    </aside>
+    </div>
   )
 }
 

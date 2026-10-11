@@ -1,4 +1,4 @@
-import { useMemo } from 'react'
+import { useMemo, useRef, useState } from 'react'
 import { VIDEO_STREAM_URL, VideoState } from '../api/videoApi'
 
 interface Props {
@@ -19,20 +19,24 @@ interface Props {
  * polling tick needed.
  */
 export function VideoPreview({ state }: Props) {
+  const streamGeneration = useRef(0)
+  const [failedStream, setFailedStream] = useState<string | null>(null)
   const streamUrl = useMemo(
-    () =>
-      state === VideoState.RUNNING
-        ? `${VIDEO_STREAM_URL}?sid=${Date.now()}`
-        : null,
+    () => {
+      if (state !== VideoState.RUNNING) return null
+      streamGeneration.current += 1
+      return `${VIDEO_STREAM_URL}?sid=${Date.now()}-${streamGeneration.current}`
+    },
     [state],
   )
 
-  if (streamUrl !== null) {
+  if (streamUrl !== null && streamUrl !== failedStream) {
     return (
       <div className="video-preview is-running">
         <img
           src={streamUrl}
           alt="Preview video langsung"
+          onError={() => setFailedStream(streamUrl)}
         />
       </div>
     )
@@ -41,8 +45,12 @@ export function VideoPreview({ state }: Props) {
   return (
     <div className="video-preview video-empty" role="status"><div>
       <span className="video-empty-icon" aria-hidden="true">▣</span>
-      <p>{state === VideoState.IDLE && 'Tidak ada sumber video aktif'}</p><p>{state === VideoState.STARTING && 'Memulai sumber video…'}</p><p>{state === VideoState.STOPPING && 'Menghentikan sumber video…'}</p><p>{state === VideoState.ERROR && 'Terjadi kesalahan pada sumber video'}</p>
-      {state === VideoState.IDLE && <small>Pilih Webcam atau upload video untuk memulai pemantauan.</small>}
+      <p>{state === VideoState.IDLE && 'Belum ada video aktif'}</p>
+      <p>{state === VideoState.STARTING && 'Memulai sumber video…'}</p>
+      <p>{state === VideoState.STOPPING && 'Menghentikan sumber video…'}</p>
+      <p>{state === VideoState.ERROR && 'Sumber video belum tersedia'}</p>
+      {state === VideoState.RUNNING && <><p>Preview tidak tersedia</p><small>Status video tetap diperiksa. Hentikan dan mulai kembali jika diperlukan.</small></>}
+      {state === VideoState.IDLE && <small>Pilih kamera atau file video untuk memulai pemantauan.</small>}
     </div>
     </div>
   )

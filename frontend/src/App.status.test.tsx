@@ -31,7 +31,7 @@ async function renderRunning(): Promise<void> {
   await flush()
   net.calls(STATUS)[0].respond(videoStatus('RUNNING'))
   await flush()
-  screen.getByRole('button', { name: 'Hentikan Video' })
+  screen.getByRole('button', { name: 'Hentikan video' })
 }
 
 beforeEach(() => {
@@ -52,7 +52,7 @@ describe('App video status lifecycle (real selector)', () => {
     const beforeStop = last(STATUS)
     expect(net.calls(STATUS)).toHaveLength(2)
 
-    fireEvent.click(screen.getByRole('button', { name: 'Hentikan Video' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Hentikan video' }))
     expect(beforeStop.signal?.aborted).toBe(true)
     const duringStop = last(STATUS)
     expect(duringStop).not.toBe(beforeStop)
@@ -62,17 +62,17 @@ describe('App video status lifecycle (real selector)', () => {
     expect(duringStop.signal?.aborted).toBe(true)
     last(STATUS).respond(videoStatus('IDLE'))
     await flush()
-    screen.getByRole('button', { name: 'Mulai Webcam' })
+    screen.getByRole('button', { name: 'Mulai kamera' })
     const evaluationRequests = net.calls(EVALUATION).length
 
     // Old RUNNING responses arrive after IDLE was confirmed.
     beforeStop.respond(videoStatus('RUNNING'))
     duringStop.respond(videoStatus('RUNNING'))
     await flush()
-    screen.getByText('IDLE')
-    screen.getByRole('button', { name: 'Mulai Webcam' })
-    expect(screen.queryByRole('button', { name: 'Hentikan Video' })).toBeNull()
-    screen.getByText('Menunggu sumber video.')
+    screen.getByText('Belum berjalan')
+    screen.getByRole('button', { name: 'Mulai kamera' })
+    expect(screen.queryByRole('button', { name: 'Hentikan video' })).toBeNull()
+    screen.getByText('Mulai video untuk melihat penilaian AI.')
     expect(net.calls(EVALUATION)).toHaveLength(evaluationRequests)
   })
 
@@ -81,7 +81,7 @@ describe('App video status lifecycle (real selector)', () => {
     await flush(1000)
     const beforeStop = last(STATUS)
 
-    fireEvent.click(screen.getByRole('button', { name: 'Hentikan Video' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Hentikan video' }))
     net.calls(STOP)[0].respond({ detail: 'Stop gagal' }, 500)
     await flush()
     screen.getByRole('alert')
@@ -95,8 +95,8 @@ describe('App video status lifecycle (real selector)', () => {
     const evaluationRequests = net.calls(EVALUATION).length
     last(STATUS).respond(videoStatus('RUNNING'))
     await flush()
-    screen.getByRole('button', { name: 'Hentikan Video' })
-    screen.getByText('RUNNING')
+    screen.getByRole('button', { name: 'Hentikan video' })
+    screen.getByText('Video berjalan')
     // A new lifecycle started for evaluation as well.
     expect(net.calls(EVALUATION).length).toBe(evaluationRequests + 1)
   })
@@ -109,22 +109,22 @@ describe('App video status lifecycle (real selector)', () => {
     await flush(1000)
     const beforeStart = last(STATUS)
 
-    fireEvent.click(screen.getByRole('button', { name: 'Mulai Webcam' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Mulai kamera' }))
     expect(beforeStart.signal?.aborted).toBe(true)
     net.calls(START)[0].respond({ detail: 'Webcam tidak tersedia' }, 500)
     await flush()
-    screen.getByText('Webcam tidak tersedia')
+    screen.getByText('Permintaan belum berhasil. Periksa status video sebelum mencoba lagi.')
     screen.getByRole('button', { name: 'Memulai…' })
 
     beforeStart.respond(videoStatus('RUNNING'))
     await flush()
-    expect(screen.queryByRole('button', { name: 'Hentikan Video' })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Hentikan video' })).toBeNull()
     expect(net.calls(EVALUATION)).toHaveLength(0)
 
     last(STATUS).respond(videoStatus('IDLE'))
     await flush()
-    screen.getByRole('button', { name: 'Mulai Webcam' })
-    screen.getByText('IDLE')
+    screen.getByRole('button', { name: 'Mulai kamera' })
+    screen.getByText('Belum berjalan')
     expect(net.calls(EVALUATION)).toHaveLength(0)
   })
 
@@ -138,7 +138,7 @@ describe('App video status lifecycle (real selector)', () => {
     last(STATUS).respond(videoStatus('IDLE'))
     await flush()
     expect(screen.queryByText('alasan sesi A')).toBeNull()
-    screen.getByText('Menunggu sumber video.')
+    screen.getByText('Mulai video untuk melihat penilaian AI.')
     const evaluationRequests = net.calls(EVALUATION).length
     expect(net.calls(EVALUATION).every((call) => call.signal?.aborted || call === net.calls(EVALUATION)[0])).toBe(true)
     await flush(5000)
@@ -151,11 +151,11 @@ describe('App video status lifecycle (real selector)', () => {
     await flush(1000)
     const beforeStop = last(STATUS)
 
-    fireEvent.click(screen.getByRole('button', { name: 'Hentikan Video' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Hentikan video' }))
     net.calls(STOP)[0].respond(videoStatus('IDLE'))
     await flush()
     // Start again before any status read confirmed IDLE.
-    fireEvent.click(screen.getByRole('button', { name: 'Mulai Webcam' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Mulai kamera' }))
     net.calls(START)[0].respond({ state: 'RUNNING', message: 'ok' })
     await flush()
     last(STATUS).respond(videoStatus('RUNNING'))
@@ -168,7 +168,7 @@ describe('App video status lifecycle (real selector)', () => {
     sessionAEvaluation.respond(completedView('session-A', 'event-A', 'alasan sesi A'))
     await flush()
     expect(screen.queryByText('alasan sesi A')).toBeNull()
-    screen.getByRole('button', { name: 'Hentikan Video' })
+    screen.getByRole('button', { name: 'Hentikan video' })
 
     sessionBEvaluation.respond(completedView('session-B', 'event-B', 'alasan sesi B'))
     await flush()

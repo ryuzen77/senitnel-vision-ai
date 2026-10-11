@@ -29,9 +29,9 @@ export interface EvaluationUiState {
 }
 
 const THREAT_LABELS: Record<ThreatStatus, string> = {
-  NORMAL: 'Normal',
+  NORMAL: 'Normal menurut AI',
   WARNING: 'Perlu perhatian',
-  CRITICAL: 'Kritis',
+  CRITICAL: 'Perlu segera ditinjau',
 }
 
 /** Only show an assessment that belongs to the session of this very response. */
@@ -44,24 +44,24 @@ function sessionResult(view: EvaluationCurrent): EvaluationLatestResult | null {
 export function getEvaluationUiState(videoRunning: boolean, evaluation: CurrentEvaluationState): EvaluationUiState {
   const base = { detail: null, pipelineActive: false, activeEventId: null, result: null }
   if (!videoRunning) {
-    return { ...base, kind: 'waiting-video', label: 'Belum aktif', message: 'Menunggu sumber video.', tone: 'idle' }
+    return { ...base, kind: 'waiting-video', label: 'Belum aktif', message: 'Mulai video untuk melihat penilaian AI.', tone: 'idle' }
   }
   if (evaluation.fetchError !== null) {
     return {
       ...base, kind: 'network-error', label: 'Tidak tersedia',
-      message: 'Status evaluasi tidak dapat dimuat. Dicoba lagi otomatis.',
-      detail: evaluation.fetchError, tone: 'unavailable',
+      message: 'Status penilaian belum dapat dimuat.',
+      detail: null, tone: 'unavailable',
     }
   }
   if (evaluation.rebinding) {
-    return { ...base, kind: 'rebinding', label: 'Memuat', message: 'Sesi video berganti; memuat status sesi terbaru…', tone: 'progress' }
+    return { ...base, kind: 'rebinding', label: 'Memuat', message: 'Memuat sesi video terbaru…', tone: 'progress' }
   }
   const view = evaluation.view
   if (view === null) {
-    return { ...base, kind: 'loading', label: 'Memuat', message: 'Memuat status evaluasi…', tone: 'progress' }
+    return { ...base, kind: 'loading', label: 'Memuat', message: 'Memuat status penilaian…', tone: 'progress' }
   }
   if (!view.enabled) {
-    return { ...base, kind: 'disabled', label: 'Nonaktif', message: 'Evaluasi AI eksternal tidak diaktifkan.', tone: 'idle' }
+    return { ...base, kind: 'disabled', label: 'Nonaktif', message: 'Penilaian AI belum diaktifkan.', tone: 'idle' }
   }
 
   const latest = sessionResult(view)
@@ -75,21 +75,21 @@ export function getEvaluationUiState(videoRunning: boolean, evaluation: CurrentE
 
   switch (view.process_state) {
     case 'IDLE':
-      return { ...common, kind: 'idle', label: 'Siaga', message: latest ? null : 'Belum ada kandidat untuk dievaluasi pada sesi ini.', tone: 'idle', pipelineActive: true }
+      return { ...common, kind: 'idle', label: 'Siaga', message: latest ? null : 'Belum ada penilaian pada sesi ini.', tone: 'idle', pipelineActive: true }
     case 'DISPATCHING':
-      return { ...common, kind: 'dispatching', label: 'Mengirim', message: 'Mengirim kandidat untuk dianalisis…', tone: 'progress', pipelineActive: true }
+      return { ...common, kind: 'dispatching', label: 'Mengirim', message: 'Mengirim untuk dinilai…', tone: 'progress', pipelineActive: true }
     case 'WAITING_CALLBACK':
-      return { ...common, kind: 'waiting-callback', label: 'Menunggu hasil', message: 'Menunggu hasil analisis AI…', tone: 'progress', pipelineActive: true }
+      return { ...common, kind: 'waiting-callback', label: 'Menunggu hasil', message: 'Menunggu hasil AI…', tone: 'progress', pipelineActive: true }
     case 'COMPLETED':
-      return { ...common, kind: 'completed', label: 'Selesai', message: latest ? null : 'Hasil evaluasi belum tersedia.', tone: 'active', pipelineActive: true }
+      return { ...common, kind: 'completed', label: 'Selesai', message: latest ? null : 'Hasil penilaian belum tersedia.', tone: 'active', pipelineActive: true }
     case 'FAILED':
-      return { ...common, kind: 'failed', label: 'Gagal', message: 'Evaluasi tidak dapat diselesaikan oleh layanan analisis.', tone: 'warning', pipelineActive: true }
+      return { ...common, kind: 'failed', label: 'Belum berhasil', message: 'Penilaian belum berhasil diselesaikan.', tone: 'warning', pipelineActive: true }
     case 'TIMED_OUT':
-      return { ...common, kind: 'timed-out', label: 'Waktu habis', message: 'Hasil analisis tidak diterima tepat waktu.', tone: 'warning', pipelineActive: true }
+      return { ...common, kind: 'timed-out', label: 'Waktu habis', message: 'Hasil AI belum diterima dalam batas waktu.', tone: 'warning', pipelineActive: true }
     case 'CANCELLED':
-      return { ...common, kind: 'cancelled', label: 'Dibatalkan', message: 'Evaluasi dibatalkan.', tone: 'idle', pipelineActive: false }
+      return { ...common, kind: 'cancelled', label: 'Dibatalkan', message: 'Penilaian dibatalkan.', tone: 'idle', pipelineActive: false }
     default:
-      return { ...common, kind: 'unknown', label: 'Tidak dikenal', message: 'Status evaluasi tidak dikenal.', tone: 'unavailable', pipelineActive: false }
+      return { ...common, kind: 'unknown', label: 'Belum dikenali', message: 'Status penilaian belum dikenali.', tone: 'unavailable', pipelineActive: false }
   }
 }
 
@@ -104,38 +104,31 @@ function listText(items: string[]): string {
 export function EvaluationPanel({ ui }: { ui: EvaluationUiState }) {
   const result = ui.result
   return (
-    <section className="evaluation-panel" aria-labelledby="evaluation-heading" aria-live="polite">
+    <section className="evaluation-panel" aria-labelledby="evaluation-heading">
       <div className="detection-heading">
-        <div><p className="eyebrow">RESPONSE SYSTEM</p><h2 id="evaluation-heading">Evaluasi AI</h2></div>
-        <span className={`evaluation-state is-${ui.tone}`}>Status: {ui.label}</span>
+        <h2 id="evaluation-heading">Penilaian AI</h2>
+        <span className={`evaluation-state is-${ui.tone}`} role="status">Status: {ui.label}</span>
       </div>
       {ui.message && <p className={ui.kind === 'network-error' ? 'detection-error' : 'detection-muted evaluation-message'}>{ui.message}</p>}
-      {ui.detail && <p className="detection-muted">{ui.detail}</p>}
-      {ui.activeEventId && (
-        <p className="evaluation-meta"><span title={ui.activeEventId}>Event diproses: {shortId(ui.activeEventId)}</span></p>
-      )}
       {result && (
         <article className="evaluation-result" aria-label={result.previous ? 'Hasil evaluasi sebelumnya' : 'Hasil analisis AI'}>
           {result.previous && (
             <p className="evaluation-previous">
-              Hasil evaluasi sebelumnya · <span title={result.latest.event_id}>Event {shortId(result.latest.event_id)}</span>
+              Hasil sebelumnya pada sesi ini
             </p>
           )}
-          <h3>Hasil analisis AI — perlu ditinjau</h3>
-          <p className="evaluation-meta">
-            <span title={result.latest.event_id}>Event {shortId(result.latest.event_id)}</span>
-            <span title={result.latest.source_session_id}>Sesi {shortId(result.latest.source_session_id)}</span>
-          </p>
+          <h3>Hasil penilaian — perlu ditinjau</h3>
           <div className="evaluation-score">
-            <span>Skor AI <strong>{result.latest.assessment.threatScore}</strong>/100</span>
             <span className={`threat-status is-${result.latest.assessment.status.toLowerCase()}`}>
               Status penilaian: {THREAT_LABELS[result.latest.assessment.status] ?? result.latest.assessment.status}
             </span>
           </div>
           <p className="evaluation-note">Penilaian otomatis, bukan bukti pelanggaran. Perlu ditinjau oleh petugas.</p>
-          <h4>Alasan</h4>
+          <h4>Alasan dari AI</h4>
           <p className="evaluation-text">{result.latest.assessment.reasoning}</p>
-          <h4>Profil subjek teramati</h4>
+          <details className="assessment-details"><summary>Detail pengamatan</summary>
+          <p>Skor penilaian AI <strong>{result.latest.assessment.threatScore}</strong>/100</p>
+          <p className="evaluation-meta"><span title={result.latest.event_id}>Event {shortId(result.latest.event_id)}</span><span title={result.latest.source_session_id}>Sesi {shortId(result.latest.source_session_id)}</span></p>
           <dl className="evaluation-profile">
             <dt>Orang terdeteksi</dt><dd>{result.latest.assessment.suspectProfile.personDetected ? 'Ya' : 'Tidak'}</dd>
             <dt>Pakaian</dt><dd>{result.latest.assessment.suspectProfile.clothing || '—'}</dd>
@@ -143,8 +136,10 @@ export function EvaluationPanel({ ui }: { ui: EvaluationUiState }) {
             <dt>Objek terlihat</dt><dd>{listText(result.latest.assessment.suspectProfile.visibleObjects)}</dd>
             <dt>Ciri pembeda</dt><dd>{listText(result.latest.assessment.suspectProfile.distinguishingFeatures)}</dd>
           </dl>
+          </details>
         </article>
       )}
+      {ui.activeEventId && <details className="assessment-details"><summary>Detail proses</summary><p className="evaluation-meta" title={ui.activeEventId}>Event diproses: {shortId(ui.activeEventId)}</p></details>}
     </section>
   )
 }

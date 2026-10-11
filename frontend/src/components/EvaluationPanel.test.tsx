@@ -96,14 +96,14 @@ describe('EvaluationPanel rendering', () => {
 
   it('renders a completed assessment as a review prompt with process and assessment status separated', () => {
     show(current({ process_state: 'COMPLETED', latest_result: latest('event-1') }))
-    screen.getByText('Hasil analisis AI — perlu ditinjau')
+    screen.getByText('Hasil penilaian — perlu ditinjau')
     screen.getByText('Status: Selesai')
-    screen.getByText('Status penilaian: Kritis')
-    screen.getByText('Profil subjek teramati')
+    screen.getByText('Status penilaian: Perlu segera ditinjau')
+    screen.getByText('Detail pengamatan')
     screen.getByText('72')
     screen.getByText('jaket gelap')
     screen.getByText('motor, helm')
-    expect(screen.queryByText(/Hasil evaluasi sebelumnya/)).toBeNull()
+    expect(screen.queryByText(/Hasil sebelumnya pada sesi ini/)).toBeNull()
   })
 
   it('shows the previous result with its own event identity during a new evaluation', () => {
@@ -112,31 +112,31 @@ describe('EvaluationPanel rendering', () => {
     }))
     screen.getByText('Status: Menunggu hasil')
     screen.getByText('Event diproses: event-new')
-    screen.getByText(/Hasil evaluasi sebelumnya/)
+    screen.getByText(/Hasil sebelumnya pada sesi ini/)
     expect(screen.getAllByText('Event event-old').length).toBeGreaterThan(0)
   })
 
   it('keeps the previous label after timeout', () => {
     show(current({ process_state: 'TIMED_OUT', latest_result: latest('event-old') }))
-    screen.getByText('Hasil analisis tidak diterima tepat waktu.')
-    screen.getByText(/Hasil evaluasi sebelumnya/)
+    screen.getByText('Hasil AI belum diterima dalam batas waktu.')
+    screen.getByText(/Hasil sebelumnya pada sesi ini/)
   })
 
   it('network error shows no stored result', () => {
     show(null, { fetchError: 'HTTP 503' })
-    screen.getByText('Status evaluasi tidak dapat dimuat. Dicoba lagi otomatis.')
-    expect(screen.queryByText('Hasil analisis AI — perlu ditinjau')).toBeNull()
+    screen.getByText('Status penilaian belum dapat dimuat.')
+    expect(screen.queryByText('Hasil penilaian — perlu ditinjau')).toBeNull()
   })
 
   it('renders disabled, loading and waiting-video states as text', () => {
     show(current({ enabled: false }))
-    screen.getByText('Evaluasi AI eksternal tidak diaktifkan.')
+    screen.getByText('Penilaian AI belum diaktifkan.')
     cleanup()
     show(null)
-    screen.getByText('Memuat status evaluasi…')
+    screen.getByText('Memuat status penilaian…')
     cleanup()
     show(current(), {}, false)
-    screen.getByText('Menunggu sumber video.')
+    screen.getByText('Mulai video untuk melihat penilaian AI.')
   })
 
   it('renders dangerous markup literally without creating elements', () => {
