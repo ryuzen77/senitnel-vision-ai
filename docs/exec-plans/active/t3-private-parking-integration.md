@@ -3,8 +3,8 @@
 Code baseline `36ffa20` (T2 sampler); plan HEAD `7c41672` (H1 docs). §4.1 records the
 facts before T3a1. §4.2, §4.4, §4.5, §4.6 and §4.7 describe trigger, sampler, worker and
 audio-gate contracts as implemented by T3a1 (completed, core only, not wired into runtime).
-§4.3 (`VideoService` lifecycle) is implemented by T3a2 (completed — lifecycle only). §4.2 alert sequence and §4.4 resync application are implemented by T3b (completed — core only: coordinator and tee, not wired); the rest of §4.8 is planned for T3c. T3c–T3e code does not exist.
-Status: see §8 — **rev 13: design PASS WITH LIMITATIONS (owner-reported); T3a1 completed — core only (reviewed PASS WITH LIMITATIONS, Codex via owner; committed as "feat: prepare private parking integration contracts"); T3a2 completed — lifecycle only (reviewed PASS; committed as "fix: isolate video session lifecycle and cleanup"); T3b completed — core only (coordinator and bounded tee; independent review PASS on the overflow delta; committed as "feat: add private parking coordinator and bounded frame tee"); private parking not wired into runtime; T3c–T3e not started, not authorized. T3 as a whole is not complete.**
+§4.3 (`VideoService` lifecycle) is implemented by T3a2 (completed — lifecycle only). §4.2 alert sequence and §4.4 resync application are implemented by T3b (completed — core only: coordinator and tee, not wired). The T3c lifecycle prerequisites are implemented and committed: T3c0.1 (`e50d9e2`, detector cleanup/lease/delivery) and T3c0.2 (`d479357`, VideoService required-sink/refusal capability, token-bound upload rollback, capture cleanup). The rest of §4.8 — private-mode configuration and runtime wiring — is planned for T3c; T3c wiring, T3d and T3e code does not exist.
+Status: see §8 — **rev 13: design PASS WITH LIMITATIONS (owner-reported); T3a1 completed — core only (reviewed PASS WITH LIMITATIONS, Codex via owner; committed as "feat: prepare private parking integration contracts"); T3a2 completed — lifecycle only (reviewed PASS; committed as "fix: isolate video session lifecycle and cleanup"); T3b completed — core only (coordinator and bounded tee; independent review PASS on the overflow delta; committed as "feat: add private parking coordinator and bounded frame tee"); T3c0.1 completed (`e50d9e2`) and T3c0.2 completed (`d479357`) — lifecycle prerequisites, reviewed PASS WITH LIMITATIONS; private parking not wired into runtime; T3c (wiring and mode), T3d and T3e not started, not authorized. T3 as a whole is not complete.**
 
 ## 1. Goal
 
@@ -380,7 +380,7 @@ even with a failed device start — blocks a later CRITICAL for that event. The 
 clip is never used for a local attempt. Open for review: whether busy/cooldown
 pre-grant rejections should also let a CRITICAL through (current rule: yes).
 
-### 4.8 Other rules (planned for T3b/T3c, not implemented)
+### 4.8 Other rules (core parts implemented in T3b — `FrameSinkTee`, lock-free coordinator calls; runtime use is T3c, not implemented)
 
 One `AudioAlertGate` owns the device; `FrameSinkTee` feeds `EventFrameBuffer` and the
 sampler; no fallback to `EventFrameBuffer` evidence; the coordinator holds no lock
@@ -896,17 +896,21 @@ unfinished cleanup obligation could disappear from the tee. Also D1/D2 doc corre
 - Limitations: the tee's latency still depends on the sinks' locks (start/end also wait
   on the tee lifecycle lock); a refused tee start does not stop the video (see above).
 
-**T3c0 — lifecycle prerequisites for T3c wiring** (plan only, **rev 4**; PM messages
+**T3c0 — lifecycle prerequisites for T3c wiring** (design rev 4/5; PM messages
 "rencana prasyarat T3c", "revisi rencana prasyarat T3c", "revisi desain T3c0 dari rev 2" and
-"revisi terarah T3c0 rev 3", 2026-10-11; baseline `ec9b8cb`)
+"revisi terarah T3c0 rev 3", 2026-10-11; baseline `ec9b8cb`). **Status: completed —
+T3c0.1 committed in `e50d9e2`, T3c0.2 committed in `d479357`.** The paragraphs below keep
+the design history as written at each step.
 
 Design review: **PASS WITH LIMITATIONS** (independent reviewer, Codex via PM message
 "finalisasi rencana dan implementasi T3c0.1", 2026-10-11), with three notes applied in
 rev 4 final: (1) the partial-start test expects cleanup only for attempted
 dependencies; (2) the Stop guarantee is mutual exclusion of delivery and invalidation,
 not a proven wait bound; (3) the delivery-versus-lifecycle test proves that end A is
-already waiting for the delivery before start B runs. Authorization: **only T3c0.1** is
-authorized (same message); T3c0.2, T3c wiring, prompt, gesture and frontend are not.
+already waiting for the delivery before start B runs. Authorization (historical, as of
+that message): **only T3c0.1** was authorized; T3c0.2, T3c wiring, prompt, gesture and
+frontend were not. T3c0.2 was authorized later (rev 5 final) and completed in `d479357`;
+T3c wiring, prompt, gesture and frontend remain unauthorized.
 
 Rev 4 delta: detector frame/job binding to a generation with an atomic
 delivery-versus-invalidation point (closes the detector blocker); standalone T3c0.1
@@ -919,8 +923,8 @@ aligned with the lease contract implemented and committed in T3c0.1 — see "T3c
 alignment with the implemented T3c0.1 contract". Runtime wiring is not part of it.
 
 Rev 5 final (PM message "finalisasi rencana dan implementasi T3c0.2", 2026-10-11):
-**T3c0.2 authorized**; T3c wiring NOT authorized. The DetectorService cleanup retry is
-done (T3c0.1, commit `e50d9e2`). Added rule A8 (sanitized lifecycle/rollback logging)
+**T3c0.2 authorized** (since completed in `d479357`); T3c wiring NOT authorized. The
+DetectorService cleanup retry is done (T3c0.1, commit `e50d9e2`). Added rule A8 (sanitized lifecycle/rollback logging)
 and acceptance 17 (synthetic id/token/path never logged or returned).
 
 PM decisions (recorded 2026-10-11, PM message "revisi desain T3c0 dari rev 2"):
@@ -1335,9 +1339,10 @@ rev 3"; TQ1 restated as the lease boundary above):
 - TQ4 The coordinator/tee closed-start change (F6) alters the reviewed T3b detail "start
   ignored after close" into a sanitized refusal; end/retry after close unchanged.
 
-**T3c0.1 — completed** (independent review PASS WITH LIMITATIONS; committed on the PM
-instruction "penutupan dan commit T3c0.1", 2026-10-11, as "fix: preserve detector cleanup
-and isolate stale delivery"). T3c0.2 and runtime wiring are NOT done.
+**T3c0.1 — completed, commit `e50d9e2`** (independent review PASS WITH LIMITATIONS;
+committed on the PM instruction "penutupan dan commit T3c0.1", 2026-10-11, as "fix:
+preserve detector cleanup and isolate stale delivery"). At that time T3c0.2 was not done
+(historical; completed later in `d479357`); runtime wiring is NOT done.
 - Independent review (Codex via PM, 2026-10-11): **PASS WITH LIMITATIONS**; 74 target
   tests and 1,110 full backend tests passed; `pip check` and diff/whitespace checks
   clean; the mutation testing and the stability repetitions below were NOT reproduced by
@@ -1415,9 +1420,14 @@ Files: `backend/app/services/detector_service.py`,
   for a lifecycle change behind an in-flight delivery. No runtime, video, device or
   provider run.
 
-**T3c0.2 — completed** (independent review PASS WITH LIMITATIONS; committed on the PM
-instruction "finalisasi dan commit T3c0.2", 2026-10-11, as "fix: isolate video start
-rollback and retain capture cleanup"). T3c runtime wiring is NOT done.
+**T3c0.2 — completed, commit `d479357`** (independent review PASS WITH LIMITATIONS;
+committed on the PM instruction "finalisasi dan commit T3c0.2", 2026-10-11, as "fix:
+isolate video start rollback and retain capture cleanup"). Completed here: the
+required-sink/refusal CAPABILITY of VideoService (`required_sinks`, refusal → ERROR until
+Stop, HTTP 503), leases, safe RUNNING publication, token-bound upload rollback and
+single-owner capture cleanup. NOT done (T3c): private-mode configuration (passing
+`required_sinks={"event frame buffer", "detector"}`), tee/coordinator wiring and mode
+selection in runtime.
 - Independent review (Codex via PM, 2026-10-11): **PASS WITH LIMITATIONS**; 216 target
   tests passed; full backend 1,152 passed. Limitations kept open: a `cv2.VideoCapture`
   constructor that never returns keeps the session in ERROR ("still opening") with no
@@ -1603,19 +1613,20 @@ Files: `backend/app/services/runtime.py`, `backend/app/main.py`, `backend/.env.e
 integration tests.
 Scope: mode/config/local-clip variables, worker `enabled=False` in private mode until
 T3d, tee wiring, shutdown order.
-**Blocker before wiring (from T3b review delta 1, not fixed):** `DetectorService.end_session`
-clears its active session before calling the parking-trigger slot: the first failure
-gives ERROR, but the Stop retry finds the session forgotten and VideoService writes IDLE
-although the coordinator/trigger never ended. The coordinator must
-not be wired into the detector until a separately scoped fix in `detector_service.py`
-keeps that slot pending and retries it (PM: own scope before T3c wiring) — **resolved by
-T3c0.1** (commit `e50d9e2`).
-**Prerequisite before private-mode start (from T3b review delta 2, not done):** VideoService
-treats a refused `FrameSinkTee.start_session` (`FrameSinkAdmissionError`) as an optional
-sink failure and keeps the video running without buffer/evidence. In private mode that
-refusal must propagate and fail the start (or block private mode) instead of running
-silently without evidence. Planned as T3c0.2 (rev 4); PM decided O-P1: detector and tee
-are both required in private mode.
+**Former blocker — DetectorService cleanup retry: resolved by T3c0.1 (commit `e50d9e2`).**
+History (from T3b review delta 1): `DetectorService.end_session` cleared its active
+session before calling the parking-trigger slot; the first failure gave ERROR, but the
+Stop retry found the session forgotten and VideoService wrote IDLE although the
+coordinator/trigger never ended. T3c0.1 keeps every dependency obligation pending and
+retries only the failed ones.
+**Required sinks in private mode — capability done in T3c0.2 (commit `d479357`);
+configuration and wiring remain in T3c.** History (from T3b review delta 2): VideoService
+treated a refused `FrameSinkTee.start_session` as an optional sink failure and kept the
+video running without buffer/evidence. T3c0.2 added `VideoService(required_sinks=...)`: a
+refusal by a required sink fails the start (ERROR until Stop, HTTP 503). Still to do in
+T3c: in private mode, pass `required_sinks={"event frame buffer", "detector"}` (PM
+decision O-P1), wire the tee and the coordinator, and select the mode. Legacy/open mode
+keeps `required_sinks` empty.
 Acceptance: 1, 2, 6, 8, 9 (pre-T3d), 11, 12, 14 with `FakeCapture`, fake dispatcher and
 fake audio device.
 
@@ -1684,23 +1695,26 @@ evidence was not included in the relay). Acceptance 24 and 30 finalised.
   - Not proven: runtime wiring, real video, webcam, speaker, provider requests.
   - The 2026-10-09 re-review of delta 1 was a self-review by the implementing agent
     (PASS WITH LIMITATIONS, findings D1/D2, both corrected), not an independent review.
-  - Open prerequisites for T3c (see T3c): (1) `DetectorService` cleanup retry for a
-    failed parking-trigger `end_session` (separate scope); (2) a refused tee start must
-    propagate to the private-mode start.
+  - Prerequisites for T3c as recorded at T3b closure (historical): (1) `DetectorService`
+    cleanup retry — resolved by T3c0.1 (`e50d9e2`); (2) a refused tee start must fail the
+    private-mode start — capability done in T3c0.2 (`d479357`), private-mode
+    configuration and wiring remain in T3c.
 - **T3c0 (lifecycle prerequisites): design rev 4 final, reviewed PASS WITH LIMITATIONS**
   (Codex via PM, 2026-10-11). **T3c0.1 completed** — independent review PASS WITH
   LIMITATIONS (Codex via PM: 74 target + 1,110 full tests passed, `pip check` and
   diff/whitespace clean; mutation and stability runs not reproduced by the reviewer);
   committed as "fix: preserve detector cleanup and isolate stale delivery". Limitations:
   scene classifier not covered, id-only calls unprotected, lifecycle can be held by a
-  consumer. **T3c0.2 not authorized; runtime wiring not done.** T3c0.2 plan aligned with
-  the implemented lease contract (rev 5, 2026-10-11). **T3c0.2 authorized** (rev 5 final,
-  PM 2026-10-11) and **completed** — independent review PASS WITH LIMITATIONS (Codex via
+  consumer. Commit `e50d9e2`. (Historical, at T3c0.1 closure: T3c0.2 was not yet
+  authorized.) T3c0.2 plan aligned with the implemented lease contract (rev 5,
+  2026-10-11). **T3c0.2 authorized** (rev 5 final, PM 2026-10-11) and **completed, commit
+  `d479357`** — independent review PASS WITH LIMITATIONS (Codex via
   PM: 216 target tests, 1,152 full backend); committed as "fix: isolate video start
   rollback and retain capture cleanup". Limitations: a hanging capture constructor or a
-  permanently failing release keeps ERROR (no timeout / restart needed). **T3c wiring not
-  authorized and not done.**
-- **T3c, T3d, T3e: not started, not authorized** — each waits for its own owner
+  permanently failing release keeps ERROR (no timeout / restart needed). T3c0.2 delivers
+  the required-sink/refusal capability only; **private-mode configuration and runtime
+  wiring (T3c) are not authorized and not done.**
+- **T3c (runtime wiring and mode), T3d, T3e: not started, not authorized** — each waits for its own owner
   authorization (`docs/PLANS.md`).
 - Open for review: the deviations and limitations listed under "T3a1 results", the
   worker identity extension in "T3a1 delta 1", the episode-instance contract in
