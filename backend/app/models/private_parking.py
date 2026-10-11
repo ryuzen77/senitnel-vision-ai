@@ -27,7 +27,14 @@ _ZONE_NAME = re.compile(r"[a-z0-9_-]{1,32}")
 
 
 def _is_number(value: object) -> bool:
-    return not isinstance(value, bool) and isinstance(value, (int, float)) and math.isfinite(value)
+    """Finite real number. An int too large for a float (``math.isfinite`` raises
+    OverflowError) is not a number here, so validation fails closed instead of raising."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
 
 
 def _unit(value: object, name: str) -> float:
@@ -36,21 +43,41 @@ def _unit(value: object, name: str) -> float:
     return float(value)
 
 
+class InsideSide(str, enum.Enum):
+    """Inside side seen from P1 towards P2 on screen (x right, y down):
+    ``left`` <=> ``raw_side < 0``, ``right`` <=> ``raw_side > 0``."""
+
+    LEFT = "left"
+    RIGHT = "right"
+
+
 @dataclasses.dataclass(frozen=True)
 class AccessLine:
-    """Segment P1-P2 in normalized frame coordinates; the inside side is the side
-    that contains ``inside_point`` (explicit, never inferred)."""
+    """Segment P1-P2 in normalized frame coordinates. The inside side is explicit,
+    never inferred: either the side that contains ``inside_point`` (startup file) or
+    ``inside`` left/right relative to P1 -> P2 (operator configuration); exactly one."""
 
     x1: float
     y1: float
     x2: float
     y2: float
-    inside_x: float
-    inside_y: float
+    inside_x: float | None = None
+    inside_y: float | None = None
+    inside: InsideSide | None = None
 
     def __post_init__(self) -> None:
-        for name in ("x1", "y1", "x2", "y2", "inside_x", "inside_y"):
+        for name in ("x1", "y1", "x2", "y2"):
             object.__setattr__(self, name, _unit(getattr(self, name), name))
+        has_point = self.inside_x is not None or self.inside_y is not None
+        if has_point == (self.inside is not None):
+            raise ValueError("exactly one of inside_point or inside side is required")
+        if has_point:
+            for name in ("inside_x", "inside_y"):
+                object.__setattr__(self, name, _unit(getattr(self, name), name))
+        else:
+            if not isinstance(self.inside, str):
+                raise ValueError("inside must be left or right")
+            object.__setattr__(self, "inside", InsideSide(self.inside))
         if self.length < MIN_LINE_LENGTH:
             raise ValueError("access line is degenerate")
 
@@ -63,8 +90,13 @@ class AccessLine:
 
     def signed_distance(self, x: float, y: float) -> float:
         """Distance to the infinite line; positive on the inside."""
-        sign = 1.0 if self.raw_side(self.inside_x, self.inside_y) > 0 else -1.0
-        return sign * self.raw_side(x, y)
+        return (1.0 if self.inside_side is InsideSide.RIGHT else -1.0) * self.raw_side(x, y)
+
+    @property
+    def inside_side(self) -> InsideSide:
+        if self.inside is not None:
+            return self.inside
+        return InsideSide.RIGHT if self.raw_side(self.inside_x, self.inside_y) > 0 else InsideSide.LEFT
 
     def segment_parameter(self, x: float, y: float) -> float:
         """Projection of a point on the segment: 0 at P1, 1 at P2."""
@@ -171,9 +203,10 @@ class PrivateParkingConfig:
                 or len({zone.name for zone in zones}) != len(zones)):
             raise ValueError("between 1 and 8 uniquely named zones are required")
         object.__setattr__(self, "zones", zones)
-        inside = abs(self.line.signed_distance(self.line.inside_x, self.line.inside_y))
-        if inside <= 2 * self.thresholds.line_hysteresis or inside < 0.02:
-            raise ValueError("inside_point is too close to the access line")
+        if self.line.inside is None:
+            inside = abs(self.line.signed_distance(self.line.inside_x, self.line.inside_y))
+            if inside <= 2 * self.thresholds.line_hysteresis or inside < 0.02:
+                raise ValueError("inside_point is too close to the access line")
 
 
 def parse_private_parking_config(raw: object) -> PrivateParkingConfig | None:
@@ -216,6 +249,101 @@ def parse_private_parking_config(raw: object) -> PrivateParkingConfig | None:
         return PrivateParkingConfig(AccessLine(*line, *inside), tuple(parsed_zones), make_thresholds(**thresholds))
     except (ValueError, TypeError, RecursionError):
         return None
+
+
+MAX_FRAME_SIDE = 16384
+
+
+class InvalidGeometry(ValueError):
+    """Operator configuration rejected; ``field`` is a safe path (no values)."""
+
+    def __init__(self, field: str) -> None:
+        super().__init__("invalid_geometry")
+        self.field = field
+
+
+@dataclasses.dataclass(frozen=True)
+class OperatorConfiguration:
+    """A configuration drawn by the operator on a decoded frame of ``frame_width`` x
+    ``frame_height`` pixels (coordinates normalized to that frame). Inside is left/right
+    relative to P1 -> P2; there is no ``inside_point``."""
+
+    frame_width: int
+    frame_height: int
+    config: PrivateParkingConfig
+
+    def canonical(self) -> dict:
+        line = self.config.line
+        return {
+            "frame_width": self.frame_width,
+            "frame_height": self.frame_height,
+            "line": {"p1": [line.x1, line.y1], "p2": [line.x2, line.y2]},
+            "inside": line.inside_side.value,
+            "zones": [{"name": zone.name, "rect": [zone.x1, zone.y1, zone.x2, zone.y2]}
+                      for zone in self.config.zones],
+        }
+
+
+def _point(value: object, field: str) -> tuple[float, float]:
+    if (not isinstance(value, (list, tuple)) or len(value) != 2
+            or not all(_is_number(item) and 0.0 <= item <= 1.0 for item in value)):
+        raise InvalidGeometry(field)
+    return float(value[0]), float(value[1])
+
+
+def build_operator_configuration(*, frame_width: object, frame_height: object, line: object,
+                                 inside: object, zones: object,
+                                 thresholds: PrivateParkingThresholds | None = None) -> OperatorConfiguration:
+    """Validate an operator configuration (fail-closed, field path on error).
+
+    ``line`` is ``{"p1": [x, y], "p2": [x, y]}``; ``zones`` is a list of
+    ``{"name", "rect": [x1, y1, x2, y2]}``. Thresholds are not operator-editable:
+    the template's thresholds or the defaults."""
+    for field, side in (("frame_width", frame_width), ("frame_height", frame_height)):
+        if type(side) is not int or not 1 <= side <= MAX_FRAME_SIDE:
+            raise InvalidGeometry(field)
+    if not isinstance(line, dict) or set(line) != {"p1", "p2"}:
+        raise InvalidGeometry("line")
+    (x1, y1), (x2, y2) = _point(line["p1"], "line.p1"), _point(line["p2"], "line.p2")
+    if not isinstance(inside, str) or inside not in {side.value for side in InsideSide}:
+        raise InvalidGeometry("inside")
+    try:
+        access_line = AccessLine(x1, y1, x2, y2, inside=InsideSide(inside))
+    except ValueError:
+        raise InvalidGeometry("line") from None
+    if not isinstance(zones, list) or not 1 <= len(zones) <= MAX_ZONES:
+        raise InvalidGeometry("zones")
+    parsed: list[MotorZone] = []
+    for index, zone in enumerate(zones):
+        field = f"zones[{index}]"
+        if not isinstance(zone, dict) or set(zone) != {"name", "rect"}:
+            raise InvalidGeometry(field)
+        name, rect = zone["name"], zone["rect"]
+        if not isinstance(name, str) or _ZONE_NAME.fullmatch(name) is None:
+            raise InvalidGeometry(f"{field}.name")
+        if any(existing.name == name for existing in parsed):
+            raise InvalidGeometry(f"{field}.name")
+        if (not isinstance(rect, list) or len(rect) != 4
+                or not all(_is_number(item) and 0.0 <= item <= 1.0 for item in rect)):
+            raise InvalidGeometry(f"{field}.rect")
+        try:
+            parsed.append(MotorZone(name, *rect))
+        except ValueError:
+            raise InvalidGeometry(f"{field}.rect") from None
+    result = OperatorConfiguration(frame_width, frame_height, PrivateParkingConfig(
+        access_line, tuple(parsed), thresholds if thresholds is not None else make_thresholds()))
+    if len(json.dumps(result.canonical()).encode("utf-8")) > MAX_CONFIG_BYTES:
+        raise InvalidGeometry("configuration")
+    return result
+
+
+def operator_template(config: PrivateParkingConfig) -> PrivateParkingConfig:
+    """A startup configuration as an unconfirmed operator template: ``inside_point``
+    becomes ``inside`` by the sign of ``raw_side`` (the parser already rejected points
+    too close to the line); zones and thresholds are kept."""
+    line = config.line
+    return PrivateParkingConfig(AccessLine(line.x1, line.y1, line.x2, line.y2, inside=line.inside_side),
+                                config.zones, config.thresholds)
 
 
 class EpisodeOrigin(str, enum.Enum):
