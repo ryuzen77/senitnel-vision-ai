@@ -521,13 +521,13 @@ def test_tee_in_the_video_buffer_slot_starts_first_and_ends_last(monkeypatch) ->
             log.append(("worker", "end"))
 
     class Recording(FrameSinkTee):
-        def start_session(self, session_id):
+        def start_session(self, session_id, *, lease=None):
             log.append(("tee", "start"))
-            super().start_session(session_id)
+            super().start_session(session_id, lease=lease)
 
-        def end_session(self, session_id):
+        def end_session(self, session_id, *, lease=None):
             log.append(("tee", "end"))
-            super().end_session(session_id)
+            super().end_session(session_id, lease=lease)
 
     tee = Recording(buffer, sampler)
     service = VideoService(event_frame_buffer=tee, evaluation_worker=Worker())

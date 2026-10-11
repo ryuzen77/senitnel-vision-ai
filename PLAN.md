@@ -8,7 +8,7 @@ Last reviewed at commit `36ffa20` (2026-10-04).
 
 | Plan | Status |
 |---|---|
-| [T3 — private parking integration](docs/exec-plans/active/t3-private-parking-integration.md) | **T3a1 completed — core only (reviewed PASS WITH LIMITATIONS; not wired into runtime); T3a2 completed — lifecycle only (reviewed PASS); T3b completed — core only (coordinator and bounded tee, reviewed PASS; not wired); T3c0 design rev 4 final (PASS WITH LIMITATIONS); T3c0.1 completed — detector cleanup/lease/generation-bound delivery (reviewed PASS WITH LIMITATIONS); T3c0.2 not authorized, runtime not wired; T3c–T3e not started, not authorized; T3 not complete** |
+| [T3 — private parking integration](docs/exec-plans/active/t3-private-parking-integration.md) | **T3a1 completed — core only (reviewed PASS WITH LIMITATIONS; not wired into runtime); T3a2 completed — lifecycle only (reviewed PASS); T3b completed — core only (coordinator and bounded tee, reviewed PASS; not wired); T3c0 design rev 4 final (PASS WITH LIMITATIONS); T3c0.1 completed — detector cleanup/lease/generation-bound delivery (reviewed PASS WITH LIMITATIONS); T3c0.2 completed — VideoService required sinks/leases/safe RUNNING/token-bound upload rollback/single-owner capture cleanup (reviewed PASS WITH LIMITATIONS); T3c runtime wiring not done; T3c–T3e not started, not authorized; T3 not complete** |
 
 ## Next candidates (not yet planned; order is a proposal for the owner)
 

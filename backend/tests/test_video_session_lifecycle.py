@@ -222,7 +222,8 @@ def test_stop_during_a_held_start_invalidates_at_once_and_ends_every_started_sin
     assert all(sink.active is None for sink in rig.sinks)
     assert rig.state() is VideoState.IDLE
     assert session.thread is None                  # never revived into RUNNING
-    assert [capture.release_count for capture in rig.opened] == [1]
+    # T3c0.2 delta 2: a start that was already stopped never opens a capture
+    assert rig.opened == []
 
 
 def test_lifecycle_lock_is_never_taken_while_holding_the_state_lock(rigs) -> None:

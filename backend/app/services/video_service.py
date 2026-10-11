@@ -64,6 +64,26 @@ Session lifecycle (Rev 5 — T3a2):
 
   * A stop() that wins during a slow webcam/file open is honoured: the opener
     releases its capture and nothing is revived.
+
+Required sinks, leases and safe publication (T3c0.2):
+
+  * required_sinks (default empty = legacy: every sink optional). A required sink whose
+    start_session raises refuses the reservation: no further sink starts, and AFTER the
+    start loop released _lifecycle_lock the normal cleanup runner ends every sink; the
+    state is ERROR until Stop and claim_start()/start_webcam() raise
+    VideoStartRefusedError. No capture is opened for a refused reservation.
+  * Lease-aware sinks (accepts_lifecycle_lease) receive lease=session.token on start,
+    every end attempt (Stop retries included) and, for the detector, on offer.
+  * RUNNING is published in the same _lock section as a successful thread.start(); a
+    failing thread.start() rolls back that session through the cleanup runner (ERROR
+    until Stop). abort_start(token) rolls back only the reservation it names.
+  * Single owner for every capture: the session adopts a capture the moment it is
+    created; only that session's cleanup releases it (failed releases stay pending and
+    each explicit Stop retries them). While the opener still uses it (``opening``) the
+    release is deferred and handed over atomically when the opener is done, exactly
+    like a capture thread that is still reading.
+  * Lifecycle/rollback logs and public errors carry fixed labels and exception TYPE
+    names only (no ids, tokens, paths or exception messages).
 """
 
 from __future__ import annotations
@@ -75,6 +95,7 @@ import os
 import threading
 import time
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
@@ -116,6 +137,36 @@ WEBCAM_MAX_CONSECUTIVE_FAILURES: int = 5
 UPLOAD_DIR: Path = Path(__file__).resolve().parent.parent / "storage" / "uploads"
 
 logger = logging.getLogger(__name__)
+
+SINK_LABELS = ("event frame buffer", "detector", "scene classifier", "evaluation worker")
+REQUIRED_START_REFUSED = "Required pipeline component refused the session"
+THREAD_START_FAILED = "Capture thread could not start"
+CAPTURE_FAILED = "Video capture failed"
+
+
+class VideoStartRefusedError(Exception):
+    """A required sink refused the session; the reservation was already rolled back."""
+
+
+class StaleStartError(RuntimeError):
+    """start_file() was called with a reservation that is no longer the current one (it
+    was stopped, aborted or replaced). Nothing was opened; the caller still owns its file.
+    A RuntimeError subclass for existing direct callers; the upload route catches THIS
+    class only, so a general RuntimeError follows the general-error path."""
+
+
+class _CaptureUnavailable(Exception):
+    """Internal: the capture opened without error but isOpened() is False."""
+
+
+def _log_failure(what: str, error: BaseException) -> None:
+    """Sanitized: a fixed description and the exception TYPE only (ERROR level, as the
+    logger.exception calls it replaces)."""
+    try:
+        logger.error("%s (%s)", what, type(error).__name__)
+    except Exception:
+        pass
+
 
 _STARTUP_MILESTONES = frozenset({
     "upload_handler_entered", "upload_copy_completed", "first_opencv_probe_completed",
@@ -188,8 +239,13 @@ class _CaptureSession:
 
     Every mutable field is guarded by ``VideoService._lock``, except the step results
     (``cap_released``, ``upload_removed``, ``pending_sinks``) which only the single
-    cleanup runner (``cleanup_running``) writes. Resources are attached only while
-    ``released`` is False, so after release they never change again.
+    cleanup runner (``cleanup_running``) writes. The capture thread and the upload are
+    attached only while ``released`` is False. One exception for the capture: an opener
+    that is still active (``opening``) when the session is invalidated adopts the capture
+    it just created into THIS (old) context, solely so that this context's cleanup
+    releases it (deferred and handed over by ``_end_open``); such a capture never
+    continues the session (no thread is created for a released session) and never moves
+    to another session.
 
     ``cleanup_done`` means "an attempt ended" (successfully or not); success is
     ``cleanup_ok is True``, computed from facts: capture released, upload removed, no
@@ -217,6 +273,8 @@ class _CaptureSession:
     cap_released: bool = False
     upload_removed: bool = False
     pending_sinks: set = dataclasses.field(default_factory=set)
+    start_refused: bool = False         # a required sink refused this reservation
+    opening: bool = False               # the opener may still create/use the capture
 
 
 class VideoService:
@@ -243,6 +301,9 @@ class VideoService:
         *,
         capture_join_timeout_seconds: float = CAPTURE_JOIN_TIMEOUT_SECONDS,
         cleanup_wait_timeout_seconds: float | None = None,
+        required_sinks: frozenset[str] | set[str] = frozenset(),
+        session_id_factory: Callable[[], str] | None = None,
+        thread_factory: Callable[..., threading.Thread] | None = None,
     ) -> None:
         self._join_timeout = _positive_seconds("capture_join_timeout_seconds", capture_join_timeout_seconds)
         self._cleanup_wait = (
@@ -255,6 +316,17 @@ class VideoService:
         self._scene_classifier = scene_classifier
         self._event_frame_buffer = event_frame_buffer
         self._evaluation_worker = evaluation_worker
+        configured = {label for label, sink in zip(SINK_LABELS, (
+            event_frame_buffer, detector, scene_classifier, evaluation_worker)) if sink is not None}
+        required = frozenset(required_sinks)
+        if not required <= configured:
+            raise ValueError("every required sink must be one of the configured sinks")
+        self._required_sinks = required
+        # Tests only: force a reused session id / a failing thread start.
+        self._session_id_factory = session_id_factory or (lambda: str(uuid.uuid4()))
+        self._thread_factory = thread_factory or threading.Thread
+        self._counts = dict.fromkeys(("required_start_refusals", "thread_start_failures",
+                                      "aborted_starts", "stale_aborts"), 0)
         self._startup_timing_enabled = (_startup_timing_enabled() if startup_timing_enabled is None
                                         else startup_timing_enabled)
         self._startup_timing: _StartupTimingRecorder | None = None
@@ -296,20 +368,33 @@ class VideoService:
             ("scene classifier", self._scene_classifier), ("event frame buffer", self._event_frame_buffer),
         ) if sink is not None)
 
-    def _start_sinks(self, session: _CaptureSession) -> None:
-        """Start every sink for ``session``; stop as soon as the session is invalidated."""
+    @staticmethod
+    def _lease_kwargs(sink: object, session: _CaptureSession) -> dict:
+        """The owner's lease, only for sinks that declare they check it."""
+        return {"lease": session.token} if getattr(sink, "accepts_lifecycle_lease", False) is True else {}
+
+    def _start_sinks(self, session: _CaptureSession) -> str | None:
+        """Start every sink for ``session``; stop as soon as the session is invalidated.
+
+        Returns None (all started or a stop() won) or the label of a REQUIRED sink that
+        refused. Never starts a cleanup itself: the caller rolls back after this returned
+        and released _lifecycle_lock (non-reentrant; the cleanup runner takes it).
+        """
         with self._lifecycle_lock:
             for label, sink in self._sinks_in_start_order():
                 with self._lock:
                     alive = self._current is session and not session.released
                 if not alive:
-                    return                       # a stop() already won: never start the rest
+                    return None                  # a stop() already won: never start the rest
                 try:
                     # In-memory slot switches only; model work stays in the sinks' workers.
-                    sink.start_session(session.session_id)
-                except Exception:
+                    sink.start_session(session.session_id, **self._lease_kwargs(sink, session))
+                except Exception as error:
+                    _log_failure(f"Unable to start {label} session", error)
+                    if label in self._required_sinks:
+                        return label             # no further sink starts
                     # Optional consumers must not make video start fail.
-                    logger.exception("Unable to start %s session", label)
+        return None
 
     def _end_sinks(self, session: _CaptureSession) -> None:
         """End every sink still pending for ``session``; a failing sink stays pending
@@ -319,10 +404,12 @@ class VideoService:
                 if label not in session.pending_sinks:
                     continue
                 try:
-                    sink.end_session(session.session_id)    # sinks ignore a non-matching id
-                except Exception:
+                    # Same lease on every attempt (Stop retries included); sinks ignore a
+                    # non-matching id or lease.
+                    sink.end_session(session.session_id, **self._lease_kwargs(sink, session))
+                except Exception as error:
                     # Lifecycle failures never stop the remaining cleanup steps.
-                    logger.exception("Unable to end %s session", label)
+                    _log_failure(f"Unable to end {label} session", error)
                 else:
                     session.pending_sinks.discard(label)
 
@@ -355,7 +442,8 @@ class VideoService:
         with self._lock:
             run = self._invalidate_locked(session)
             resumable = (session.cleanup_ok is False
-                         or (session.deferred and session.capture_exited))
+                         or (session.deferred
+                             and not self._capture_in_use_locked(session, threading.current_thread())))
             if not run and session.stop_requested and not session.cleanup_running and resumable:
                 session.cleanup_running = True
                 session.cleanup_done.clear()
@@ -390,12 +478,13 @@ class VideoService:
                     self._cleanup_full_pass(session)
                 else:
                     self._release_capture_and_upload(session)
-            except Exception:
+            except Exception as error:
                 session.unexpected_failure = True
-                logger.exception("Video session cleanup failed")
+                _log_failure("Video session cleanup failed", error)
             passes += 1
             with self._lock:
-                resume = session.deferred and session.capture_exited and passes < 2
+                resume = (session.deferred and passes < 2
+                          and not self._capture_in_use_locked(session, threading.current_thread()))
                 if resume:
                     session.deferred = False     # still the owner: release now, outside the lock
                 else:
@@ -417,11 +506,12 @@ class VideoService:
         if thread is not None and thread is not current and thread.ident is not None:
             thread.join(timeout=self._join_timeout)
         with self._lock:
-            # Never release a capture another thread may still be reading.
-            session.deferred = not (session.capture_exited or thread is None or thread is current
-                                    or thread.ident is None)
+            # Never release a capture the opener or the capture thread may still use.
+            session.deferred = self._capture_in_use_locked(session, current)
+            opening = session.opening
         if session.deferred:
-            self._log("Video capture thread did not stop in time; capture release deferred to its exit")
+            self._log("Video source is still opening; capture release deferred to the opener" if opening
+                      else "Video capture thread did not stop in time; capture release deferred to its exit")
         else:
             self._release_capture_and_upload(session)
         # Notify stream consumers; only this session's packet is ever cleared.
@@ -435,17 +525,26 @@ class VideoService:
         if session.cap is not None and not session.cap_released:
             try:
                 session.cap.release()
-            except Exception:
-                logger.exception("Unable to release video capture")
+            except Exception as error:
+                _log_failure("Unable to release video capture", error)
             else:
                 session.cap_released = True
         if session.upload_path is not None and not session.upload_removed:
             try:
                 session.upload_path.unlink(missing_ok=True)
-            except OSError:
-                logger.exception("Unable to delete uploaded video")
+            except OSError as error:
+                _log_failure("Unable to delete uploaded video", error)
             else:
                 session.upload_removed = True
+
+    @staticmethod
+    def _capture_in_use_locked(session: _CaptureSession, current: threading.Thread) -> bool:
+        """Caller holds _lock: True while the opener or the capture thread may still use
+        the capture, so its release must be deferred to them (single owner handoff)."""
+        if session.opening:
+            return True
+        thread = session.thread
+        return not (session.capture_exited or thread is None or thread is current or thread.ident is None)
 
     @staticmethod
     def _cleanup_complete(session: _CaptureSession) -> bool:
@@ -463,8 +562,12 @@ class VideoService:
             return
         if session.cleanup_running or session.cleanup_ok is None:
             self._state = VideoState.ERROR
-            self._error = ("Video capture did not stop; cleanup waits for it to exit" if session.deferred
-                           else "Video cleanup has not finished")
+            if session.deferred and session.opening:
+                self._error = "Video source is still opening; cleanup waits for it"
+            elif session.deferred:
+                self._error = "Video capture did not stop; cleanup waits for it to exit"
+            else:
+                self._error = "Video cleanup has not finished"
         elif not session.cleanup_ok:
             self._state = VideoState.ERROR
             self._error = "Video cleanup failed; Stop retries it"
@@ -489,14 +592,6 @@ class VideoService:
             self._run_cleanup(session, full=False)
 
     @staticmethod
-    def _release_capture(cap: object) -> None:
-        """Release a capture that was never attached to a session (the opener owns it)."""
-        try:
-            cap.release()
-        except Exception:
-            logger.exception("Unable to release video capture")
-
-    @staticmethod
     def _log(message: str) -> None:
         try:
             logger.warning(message)
@@ -517,24 +612,68 @@ class VideoService:
             self._state = VideoState.STOPPING    # ERROR is written once the cleanup attempt ended
         self._release_session(session)
 
-    def _attach(self, session: _CaptureSession, cap: object, source: str, target, args: tuple):
-        """Attach an opened capture and create its thread, only for a live session."""
+    def _begin_open_locked(self, session: _CaptureSession) -> bool:
+        """Caller holds _lock. Mark the opener active (defers any capture release to it)."""
+        if self._current is not session or session.released:
+            return False
+        session.opening = True
+        return True
+
+    def _adopt_capture(self, session: _CaptureSession, cap: object) -> None:
+        """From its creation on, the capture belongs to the session's cleanup (single
+        owner): released once, a failed release stays pending and Stop retries it."""
+        with self._lock:
+            session.cap = cap
+
+    def _end_open(self, session: _CaptureSession) -> None:
+        """The opener no longer uses the capture. If a stop() already deferred the release
+        to it, hand the release to exactly one owner (atomic, as _on_capture_exit)."""
+        with self._lock:
+            if not session.opening:
+                return
+            session.opening = False
+            run = session.released and session.deferred and not session.cleanup_running
+            if run:
+                session.deferred = False
+                session.cleanup_running = True
+                session.cleanup_done.clear()
+        if run:
+            self._run_cleanup(session, full=False)
+
+    def _attach(self, session: _CaptureSession, source: str, target, args: tuple):
+        """Create the capture thread for a live session (the capture is already the
+        session's). The state stays STARTING: RUNNING is published by _start_capture."""
         with self._lock:
             if self._current is not session or session.released:
                 return None                      # never revive a stopped start
-            session.cap = cap
-            thread = threading.Thread(target=target, args=args, kwargs={"session": session}, daemon=True)
+            thread = self._thread_factory(target=target, args=args, kwargs={"session": session}, daemon=True)
             session.thread = thread
             self._source = source
-            self._state = VideoState.RUNNING
+            session.opening = False              # the opener is done with the capture
         return thread
 
     def _start_capture(self, session: _CaptureSession, thread: threading.Thread) -> bool:
+        """One _lock section: re-check, thread.start(), then publish RUNNING. The capture
+        thread reports EOF/errors through _finish_from_capture (needs _lock), so it always
+        observes RUNNING; a released/finalized session is never made RUNNING again. If
+        thread.start() raises, this session is rolled back (ERROR until Stop)."""
         with self._lock:
             if self._current is not session or session.released:
                 return False                     # cleanup releases the attached capture
-            thread.start()                       # under _lock: cleanup sees it started or not
-            return True
+            try:
+                thread.start()                   # under _lock: cleanup sees it started or not
+            except Exception as error:
+                failure = error
+                session.thread = None            # never started: cleanup must not join it
+                session.end_reason, session.capture_error = "error", THREAD_START_FAILED
+                self._counts["thread_start_failures"] += 1
+                self._state = VideoState.STOPPING    # ERROR is written once the cleanup ended
+            else:
+                self._state = VideoState.RUNNING
+                return True
+        _log_failure("Unable to start the capture thread", failure)
+        self._release_session(session)           # outside _lock; this session's runner
+        return False
 
     def _finish_from_capture(self, session: _CaptureSession, state: VideoState, error: str | None) -> None:
         """EOF (state IDLE) or capture error (state ERROR), called by the capture thread."""
@@ -564,7 +703,7 @@ class VideoService:
             if self._state != VideoState.IDLE:
                 return None
             token = str(uuid.uuid4())
-            session_id = str(uuid.uuid4())
+            session_id = self._session_id_factory()
             session = _CaptureSession(session_id, token)
             self._current = session
             self._start_token = token
@@ -577,8 +716,20 @@ class VideoService:
                 except Exception:
                     self._startup_timing = None
             session.timing = self._startup_timing
-        self._start_sinks(session)
-        return token
+        refused = self._start_sinks(session)     # _lifecycle_lock released on return
+        if refused is None:
+            return token
+        with self._lock:
+            run = self._current is session and not session.released
+            if run:                              # otherwise a stop()/abort won and owns cleanup
+                session.end_reason, session.capture_error = "error", REQUIRED_START_REFUSED
+                session.start_refused = True
+                self._counts["required_start_refusals"] += 1
+                self._start_token = None
+                self._state = VideoState.STOPPING    # ERROR (until Stop) once the cleanup ended
+        if run:
+            self._release_session(session)       # ends every sink; never under a held lock
+        raise VideoStartRefusedError(REQUIRED_START_REFUSED)
 
     def _prepare_startup_milestone(
         self, milestone: str, *, token: str | None = None,
@@ -625,8 +776,9 @@ class VideoService:
             return (self._session_id == packet.session_id
                     and self._state is VideoState.RUNNING and not self._stop_event.is_set())
 
-    def _offer_consumers(self, packet: FramePacket) -> None:
-        """Keep capture alive if either optional asynchronous consumer fails."""
+    def _offer_consumers(self, packet: FramePacket, *, lease: str | None = None) -> None:
+        """Keep capture alive if either optional asynchronous consumer fails. ``lease``
+        (the capture session's token) is passed to a lease-aware detector only."""
         if not self._packet_is_active(packet):
             return
         if self._event_frame_buffer is not None:
@@ -640,17 +792,20 @@ class VideoService:
                     frame_height=height,
                     jpeg=packet.jpeg,
                 ))
-            except Exception:
-                logger.exception("Unable to offer packet to event frame buffer")
+            except Exception as error:
+                _log_failure("Unable to offer packet to event frame buffer", error)
         for label, consumer in (("detector", self._detector), ("scene classifier", self._scene_classifier)):
             if consumer is None:
                 continue
             if not self._packet_is_active(packet):
                 return
             try:
-                consumer.offer(packet)
-            except Exception:
-                logger.exception("Unable to offer packet to %s", label)
+                if lease is not None and getattr(consumer, "accepts_lifecycle_lease", False) is True:
+                    consumer.offer(packet, lease=lease)
+                else:
+                    consumer.offer(packet)
+            except Exception as error:
+                _log_failure(f"Unable to offer packet to {label}", error)
 
     # ------------------------------------------------------------------
     # Public start methods
@@ -659,10 +814,46 @@ class VideoService:
     def claim_start(self) -> str | None:
         """
         Public wrapper around _atomic_reserve() for use by the upload route.
-        Returns a session token if reservation succeeded, None if not IDLE.
-        The caller must call start_file(token=...) or stop() (rollback) after this.
+        Returns a session token if reservation succeeded, None if not IDLE; raises
+        VideoStartRefusedError when a required sink refused (already rolled back, ERROR
+        until Stop). The caller must call start_file(token=...) or abort_start(token).
         """
         return self._atomic_reserve()
+
+    def abort_start(self, token: str) -> bool:
+        """Roll back the reservation ``token`` names, and nothing else.
+
+        Acts only while that reservation is current, not released and still STARTING
+        (not handed to a capture thread); its own cleanup runner releases its capture,
+        upload and sinks; IDLE after a successful cleanup, ERROR (Stop retries) otherwise.
+        Any other token is a no-op returning False, so an old upload never stops B.
+        """
+        with self._lock:
+            session = self._current
+            if (session is None or session.token != token or session.released
+                    or self._state is not VideoState.STARTING):
+                self._counts["stale_aborts"] += 1
+                return False
+            session.stop_requested = True        # a rollback by the reservation's owner
+            self._start_token = None
+            self._state = VideoState.STOPPING
+            self._counts["aborted_starts"] += 1
+        self._release_session(session)
+        with self._lock:
+            self._finalize_locked(session)
+        return True
+
+    def get_cleanup_diagnostics(self) -> dict:
+        """Labels and counts only (no ids, tokens or paths)."""
+        with self._lock:
+            session = self._current
+            released = session is not None and session.released
+            pending = sorted(session.pending_sinks) if released else []
+            capture_pending = released and session.cap is not None and not session.cap_released
+            upload_pending = released and session.upload_path is not None and not session.upload_removed
+            return dict(self._counts, state=self._state.value, pending_sinks=pending,
+                        capture_pending=int(capture_pending), upload_pending=int(upload_pending),
+                        required_sinks=sorted(self._required_sinks))
 
     def start_webcam(self) -> bool:
         """
@@ -679,28 +870,28 @@ class VideoService:
         if token is None:
             return False  # Not IDLE; caller should 409.
         session = self._session_for_token(token)
-        if session is None:
+        with self._lock:
+            opening = session is not None and self._begin_open_locked(session)
+        if not opening:
             return True   # stopped before the open: nothing to revive
 
-        cap: cv2.VideoCapture | None = None
+        # Single owner: the session adopts the capture at creation; only its cleanup
+        # releases it (deferred while this opener still uses it, see _end_open).
         try:
             cap = cv2.VideoCapture(0)
-            opened = cap.isOpened()
-        except Exception as exc:
-            # Constructor or isOpened() raised — release whatever we have.
-            if cap is not None:
-                self._release_capture(cap)
-            self._fail_start(session, f"Webcam open exception: {exc}")
+            self._adopt_capture(session, cap)
+            if not cap.isOpened():
+                raise _CaptureUnavailable()
+            thread = self._attach(session, "webcam", self._run_capture_webcam, (cap,))
+        except Exception as error:
+            unavailable = isinstance(error, _CaptureUnavailable)
+            if not unavailable:
+                _log_failure("Webcam open failed", error)
+            self._end_open(session)              # hands a deferred release over (a stop() won)
+            self._fail_start(session, "Unable to open webcam (index 0)" if unavailable else "Webcam open failed")
             return True  # Reservation was acquired; start was attempted.
-
-        if not opened:
-            self._release_capture(cap)
-            self._fail_start(session, "Unable to open webcam (index 0)")
-            return True  # Reservation was acquired; start was attempted.
-
-        thread = self._attach(session, cap, "webcam", self._run_capture_webcam, (cap,))
         if thread is None:
-            self._release_capture(cap)   # stop() won during the open: never revived
+            self._end_open(session)              # stop() won during the open: its cleanup releases
             return True
         self._start_capture(session, thread)
         return True
@@ -710,32 +901,41 @@ class VideoService:
         Start playing back a video file.
         Assumes claim_start() has already been called (service is in STARTING).
 
-        token — the session token returned by claim_start().  If it does not
-                match the current token (e.g. stop() was called between
-                claim_start() and start_file()), this call is a no-op and
-                raises RuntimeError so the caller can handle cleanup.
+        token — the session token returned by claim_start().  If it is no longer
+                the current reservation (stopped, aborted or replaced), nothing is
+                opened and StaleStartError is raised; the caller still owns its file.
+        Any failure while opening/preparing the capture (constructor, isOpened(),
+        get(), thread creation) follows the open-failure contract: the capture is
+        released exactly once, this reservation's cleanup deletes the upload, and the
+        state is ERROR "Unable to open video file" until Stop (returns normally).
         A stop() that wins during the open is honoured too: nothing is revived.
         """
         with self._lock:
             session = self._current
             if (self._start_token != token or session is None or session.token != token
                     or session.released):
-                raise RuntimeError("Session token mismatch: stop() was called before start_file()")
+                raise StaleStartError("Session token mismatch: the upload reservation is no longer current")
             session.upload_path = path
+            self._begin_open_locked(session)
 
-        cap = cv2.VideoCapture(str(path))
-        if not cap.isOpened():
-            self._release_capture(cap)
-            self._fail_start(session, f"Unable to open video file: {path.name}")
+        # Single owner as in start_webcam(): the session adopts the capture at creation.
+        try:
+            cap = cv2.VideoCapture(str(path))
+            self._adopt_capture(session, cap)
+            if not cap.isOpened():
+                raise _CaptureUnavailable()
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            if not fps > 0:
+                fps = DEFAULT_FILE_FPS
+            thread = self._attach(session, path.name, self._run_capture_file, (cap, fps))
+        except Exception as error:
+            if not isinstance(error, _CaptureUnavailable):
+                _log_failure("Video file open failed", error)
+            self._end_open(session)              # hands a deferred release over (a stop() won)
+            self._fail_start(session, "Unable to open video file")
             return
-
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        if fps <= 0:
-            fps = DEFAULT_FILE_FPS
-
-        thread = self._attach(session, cap, path.name, self._run_capture_file, (cap, fps))
         if thread is None:
-            self._release_capture(cap)   # stop() won during the open; it deleted the upload
+            self._end_open(session)              # stop() won during the open: its cleanup releases
             return
 
         state_running_entry = self._prepare_startup_milestone(
@@ -839,7 +1039,7 @@ class VideoService:
             self._packet = packet
             self._packet_cond.notify_all()
         self.record_startup_milestone("first_packet_published", session_id=session.session_id)
-        self._offer_consumers(packet)
+        self._offer_consumers(packet, lease=session.token)
 
     def _run_capture_webcam(self, cap: cv2.VideoCapture, *, session: _CaptureSession) -> None:
         """Capture loop for webcam source; bound to its own session."""
@@ -873,8 +1073,9 @@ class VideoService:
                 self._publish(session, seq, frame, buf)
                 seq += 1
 
-        except Exception as exc:
-            self._finish_from_capture(session, VideoState.ERROR, str(exc))
+        except Exception as error:
+            _log_failure(CAPTURE_FAILED, error)
+            self._finish_from_capture(session, VideoState.ERROR, CAPTURE_FAILED)
         # Clean exit (this session's stop_event): the invalidator owns the transition.
 
     def _run_capture_file(self, cap: cv2.VideoCapture, fps: float, *, session: _CaptureSession) -> None:
@@ -915,8 +1116,9 @@ class VideoService:
                 if remaining > 0:
                     session.stop_event.wait(remaining)
 
-        except Exception as exc:
-            self._finish_from_capture(session, VideoState.ERROR, str(exc))
+        except Exception as error:
+            _log_failure(CAPTURE_FAILED, error)
+            self._finish_from_capture(session, VideoState.ERROR, CAPTURE_FAILED)
 
 
 # ---------------------------------------------------------------------------

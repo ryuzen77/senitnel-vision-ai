@@ -162,7 +162,8 @@ class TestWebcamStart:
         svc = VideoService()
         svc.start_webcam()
         assert _wait_for_state(svc, VideoState.ERROR)
-        assert "hardware failure" in (svc.get_status().error or "")
+        # T3c0.2 (A8): the public error is a fixed text, never the exception message.
+        assert svc.get_status().error == "Webcam open failed"
         svc.stop()
 
 

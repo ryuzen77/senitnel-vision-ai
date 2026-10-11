@@ -25,7 +25,7 @@ from fastapi import APIRouter, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 
 from app.models.video import VideoStartResponse, VideoState, VideoStatusResponse
-from app.services.video_service import UPLOAD_DIR, video_service
+from app.services.video_service import UPLOAD_DIR, StaleStartError, VideoStartRefusedError, video_service
 
 router = APIRouter(prefix="/video", tags=["video"])
 
@@ -35,6 +35,19 @@ _ALLOWED_MIME_TYPES = {"video/mp4", "video/webm"}
 _ALLOWED_EXTENSIONS = {".mp4", ".webm"}
 _MAX_UPLOAD_BYTES = 200 * 1024 * 1024  # 200 MB
 _CHUNK_SIZE = 1024 * 1024  # 1 MB read chunks
+# A required pipeline component refused the session (private mode); the service already
+# rolled the reservation back and stays in ERROR until Stop.
+_REFUSED_DETAIL = "Required pipeline component is unavailable"
+
+
+def _delete_owned(path: Path | None) -> None:
+    """Delete an upload the handler still owns; failures are logged by type only."""
+    if path is None:
+        return
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as error:
+        logger.warning("Unable to delete rejected upload (%s)", type(error).__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -46,7 +59,10 @@ _CHUNK_SIZE = 1024 * 1024  # 1 MB read chunks
 async def start_webcam() -> VideoStartResponse:
     # start_webcam() atomically reserves the slot and returns False if not IDLE.
     # This avoids the non-atomic get_status() → start race.
-    acquired = video_service.start_webcam()
+    try:
+        acquired = video_service.start_webcam()
+    except VideoStartRefusedError:
+        raise HTTPException(status_code=503, detail=_REFUSED_DETAIL) from None
     if not acquired:
         status = video_service.get_status()
         raise HTTPException(
@@ -70,8 +86,11 @@ async def upload_video(file: UploadFile) -> VideoStartResponse:
     # FastAPI/Starlette has already received and parsed the multipart body here;
     # backend elapsed timing does not include the browser-to-server transfer.
     handler_entered_at = time.monotonic()
-    # ── 1. Atomic reservation BEFORE any file I/O ──────────────────────────
-    token = video_service.claim_start()
+    # ── 1. Atomic reservation (and sink admission) BEFORE any file I/O ─────
+    try:
+        token = video_service.claim_start()
+    except VideoStartRefusedError:
+        raise HTTPException(status_code=503, detail=_REFUSED_DETAIL) from None
     if token is None:
         raise HTTPException(
             status_code=409,
@@ -85,7 +104,8 @@ async def upload_video(file: UploadFile) -> VideoStartResponse:
     # All failure paths MUST guarantee:
     #   • The temporary file is removed if it exists.
     #   • The probe capture is released if it was created.
-    #   • The service returns to IDLE via video_service.stop().
+    #   • Only THIS reservation is rolled back: video_service.abort_start(token), never
+    #     a global stop() (a newer session B must survive an old upload's rollback).
     # Ownership handoff: before start_file() succeeds, the handler owns cleanup.
     # After start_file() succeeds, VideoService owns the file.
 
@@ -158,15 +178,17 @@ async def upload_video(file: UploadFile) -> VideoStartResponse:
         # ── 6. Hand off to service (already STARTING) ─────────────────────
         try:
             video_service.start_file(saved_path, token)
-        except RuntimeError:
-            # Token mismatch: stop() raced the upload; service is already IDLE.
-            # We own the file — delete it and return 409.
+        except StaleStartError:
+            # This reservation is no longer current (stopped, aborted or replaced);
+            # nothing was opened. We own the file — delete it and return 409.
             raise HTTPException(
                 status_code=409,
-                detail="Upload aborted: stop was called during upload",
-            )
-        except Exception as exc:
-            raise HTTPException(status_code=500, detail="Service start error") from exc
+                detail="Upload aborted: the reservation is no longer active",
+            ) from None
+        except Exception as error:
+            # A general error is not a stale reservation: roll back this one (500).
+            logger.warning("Upload hand-off failed (%s)", type(error).__name__)
+            raise HTTPException(status_code=500, detail="Service start error") from None
 
         # Handoff succeeded — VideoService now owns saved_path.
         file_owned_by_service = True
@@ -182,26 +204,19 @@ async def upload_video(file: UploadFile) -> VideoStartResponse:
         )
 
     except HTTPException:
-        # Roll back: stop the service (returns to IDLE) and delete the file
-        # if we still own it.
-        video_service.stop()
-        if saved_path is not None and not file_owned_by_service:
-            try:
-                saved_path.unlink(missing_ok=True)
-            except OSError:
-                pass
+        # Roll back only this reservation and delete the file if we still own it.
+        video_service.abort_start(token)
+        if not file_owned_by_service:
+            _delete_owned(saved_path)
         raise
 
-    except Exception:
-        # Unexpected exception — roll back without leaking filesystem paths.
-        logger.exception("Unexpected error in upload_video")
-        video_service.stop()
-        if saved_path is not None and not file_owned_by_service:
-            try:
-                saved_path.unlink(missing_ok=True)
-            except OSError:
-                pass
-        raise HTTPException(status_code=500, detail="Internal server error")
+    except Exception as error:
+        # Unexpected exception — roll back without leaking paths, ids or messages.
+        logger.warning("Unexpected error in upload_video (%s)", type(error).__name__)
+        video_service.abort_start(token)
+        if not file_owned_by_service:
+            _delete_owned(saved_path)
+        raise HTTPException(status_code=500, detail="Internal server error") from None
 
 
 # ---------------------------------------------------------------------------
