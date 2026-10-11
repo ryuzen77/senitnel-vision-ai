@@ -16,6 +16,7 @@ from app.services.private_parking_coordinator import (
     FrameSinkAdmissionError,
     FrameSinkTee,
     PrivateParkingCoordinator,
+    SessionAdmissionError,
     SessionCleanupError,
 )
 
@@ -254,9 +255,12 @@ def test_close_stops_new_work_is_idempotent_and_never_closes_dependencies() -> N
     coordinator.close()
     trigger.alerts = [_alert(1)]
     coordinator.observe("domain", "tracks")
-    coordinator.start_session("s2")
+    with pytest.raises(SessionAdmissionError) as refused:
+        coordinator.start_session("s2")                                # a refusal, never silent
+    assert "s2" not in str(refused.value)
     coordinator.end_session("s1")                                      # cleanup is still forwarded
     assert log == [("trigger.end", "s1")]
+    assert coordinator.get_counts()["starts_refused_closed"] == 1
     assert coordinator.get_counts()["observations_after_close"] == 1
 
 
@@ -353,11 +357,38 @@ def test_tee_close_stops_frames_and_starts_but_forwards_ends() -> None:
     tee.close()
     tee.close()
     assert tee.offer(object()) is False
-    tee.start_session("s2")                                            # ignored after close
+    with pytest.raises(FrameSinkAdmissionError):
+        tee.start_session("s2")                                        # a refusal, never silent
     tee.end_session("s1")                                              # cleanup still forwarded
     assert log == [("sampler", "end", "s1"), ("buffer", "end", "s1")]
     tee.end_session("s2")                                              # never started: no obligation
     assert len(log) == 2
+
+
+def test_tee_lease_binds_ends_to_their_own_operation() -> None:
+    log: list = []
+    healthy, failing = Sink("buffer", log), Sink("sampler", log)
+    tee = FrameSinkTee(healthy, failing)
+    tee.start_session("same", lease="op-a")
+    tee.end_session("same", lease="op-b")                              # wrong operation: no-op
+    tee.end_session("same")                                            # id-only caller: no-op
+    assert [entry for entry in log if entry[1] == "end"] == []
+    tee.end_session("same", lease="op-a")
+    tee.start_session("same", lease="op-b")                            # same id, new operation
+    log.clear()
+    tee.end_session("same", lease="op-a")                              # late end of A: B untouched
+    assert log == [] and tee.get_diagnostics()["stale_ends"] == 3
+    assert tee.get_diagnostics()["active_sessions"] == 1
+    failing.end_failures = 1
+    with pytest.raises(SessionCleanupError):
+        tee.end_session("same", lease="op-b")
+    with pytest.raises(FrameSinkAdmissionError):
+        tee.start_session("same", lease="op-c")                        # same id while pending
+    log.clear()
+    tee.end_session("same", lease="op-a")                              # stale lease: retry not taken
+    assert log == []
+    tee.end_session("same", lease="op-b")                              # the owner retries
+    assert log == [("sampler", "end", "same")] and tee.pending_cleanups() == 0
 
 
 def _fill(tee: FrameSinkTee, failing: "Sink", n: int) -> None:

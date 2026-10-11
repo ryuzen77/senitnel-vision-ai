@@ -896,21 +896,462 @@ unfinished cleanup obligation could disappear from the tee. Also D1/D2 doc corre
 - Limitations: the tee's latency still depends on the sinks' locks (start/end also wait
   on the tee lifecycle lock); a refused tee start does not stop the video (see above).
 
+**T3c0 — lifecycle prerequisites for T3c wiring** (plan only, **rev 4**; PM messages
+"rencana prasyarat T3c", "revisi rencana prasyarat T3c", "revisi desain T3c0 dari rev 2" and
+"revisi terarah T3c0 rev 3", 2026-10-11; baseline `ec9b8cb`)
+
+Design review: **PASS WITH LIMITATIONS** (independent reviewer, Codex via PM message
+"finalisasi rencana dan implementasi T3c0.1", 2026-10-11), with three notes applied in
+rev 4 final: (1) the partial-start test expects cleanup only for attempted
+dependencies; (2) the Stop guarantee is mutual exclusion of delivery and invalidation,
+not a proven wait bound; (3) the delivery-versus-lifecycle test proves that end A is
+already waiting for the delivery before start B runs. Authorization: **only T3c0.1** is
+authorized (same message); T3c0.2, T3c wiring, prompt, gesture and frontend are not.
+
+Rev 4 delta: detector frame/job binding to a generation with an atomic
+delivery-versus-invalidation point (closes the detector blocker); standalone T3c0.1
+acceptance; T3c0.2 acceptance for immediate EOF/error, Stop at the
+`thread.start`/RUNNING boundary and no RUNNING after finalization; lease opt-in boundary
+stated; TQ2–TQ4 kept as reviewed answers.
+
+PM decisions (recorded 2026-10-11, PM message "revisi desain T3c0 dari rev 2"):
+- **O-P1 — decided:** in private mode both the detector and the tee are REQUIRED. A
+  private start is refused when either core component does not start. This guarantees
+  only that the components started — not that anything is detected or played back.
+- **O-P2 — decided:** a component refusal leaves the video in ERROR until an explicit
+  Stop; the HTTP answer for a component refusal is 503. A session conflict keeps the
+  existing conflict contract (409 "not IDLE"). New admission opens only after a cleanup
+  that succeeded.
+- **O-P3 — decided:** `backend/app/api/video.py` is in scope for the refusal mapping and
+  for token-bound rollback on EVERY upload rollback path, legacy included. Rolling back
+  upload A never stops B.
+
+Facts at `ec9b8cb` (source read, not run):
+- F1 `DetectorService.end_session` clears `_active_session_id` under `_cond`, then calls
+  result consumer → tracker → parking trigger without isolation (the first exception
+  skips the rest). The first failure is reported (VideoService keeps "detector" pending →
+  ERROR). The defect is the retry: the detector already forgot the session, returns
+  early, VideoService counts the step as done and can write IDLE although the
+  coordinator/trigger never ended. `start_session` implicitly ends a different previous
+  session the same way; `close()` calls dependencies with no isolation before `join`.
+- F2 `VideoService._atomic_reserve` (used by `claim_start` and `start_webcam`) reserves
+  under `_lock`, then starts sinks under `_lifecycle_lock` (non-reentrant) before any
+  capture is opened, ignoring every start failure. `_end_sinks` (cleanup runner) takes
+  `_lifecycle_lock` too.
+- F3 Upload route order: `claim_start()` (reservation + sink starts) → MIME/extension
+  checks → chunked write → handler PROBE (`api.video.cv2.VideoCapture`) → `start_file`
+  (PLAYBACK capture, `video_service.cv2.VideoCapture`). Every failure path rolls back with
+  a global `video_service.stop()` without a token check (A can stop B).
+- F4 `_attach` writes RUNNING before `_start_capture` calls `thread.start()`; if
+  `thread.start()` raises, the exception escapes with the state RUNNING, the capture
+  attached and no cleanup.
+- F5 Sinks key their obligations by session id only; ids are `uuid4` strings in
+  VideoService, but nothing in the wrappers stops a caller from reusing an id, and a
+  late `end_session(id)` cannot be told apart from an end for a newer session with the
+  same id.
+- F6 `FrameSinkTee.start_session` and `PrivateParkingCoordinator.start_session` return
+  silently after `close()` (T3b K4); a caller cannot see that nothing started.
+- F7 Shutdown order (`runtime.shutdown_services`): `video.stop()` → … → `detector.close()`
+  → `parking_trigger.close()` (the coordinator closes after the detector).
+- F8 Detector worker: `offer` accepts a packet when `packet.session_id` equals the active
+  id; inference runs outside every lock; afterwards ONE `_cond` check
+  (`packet.session_id == _active_session_id`) publishes `latest_result`, then the result
+  consumer, tracker and parking trigger are called OUTSIDE `_cond`. With a reused id, a
+  late A result passes the check after B started; and between that check and the
+  consumer calls, Stop/Start can run, so an old result can reach B's consumer state.
+  `AudioAlertGate.offer_local` (reached through the coordinator) takes only its leaf
+  lock and never waits.
+
+**Lifecycle identity (closes Codex finding "identity")** — chosen mechanism: an
+operation LEASE passed and checked, not an id-reuse ban.
+- The lease is VideoService's per-reservation token (`_CaptureSession.token`, `uuid4`,
+  never reused). Lease-aware wrappers declare `accepts_lifecycle_lease = True` and take
+  `start_session(session_id, *, lease=None)` / `end_session(session_id, *, lease=None)`.
+  VideoService passes `lease=session.token` only to sinks that declare it (detector,
+  tee); every other sink keeps the id-only protocol.
+- A lease-aware wrapper records `(session_id, lease)` for the active and each pending
+  session. `end_session` acts only when BOTH match a record; a late end with the old
+  lease after B started (even with the same id) is a no-op and counted
+  (`stale_ends`). `start_session` is refused while ANY record (active or pending) has the
+  same session id, whatever the lease. A call with `lease=None` matches only records
+  created with `lease=None` (legacy callers keep today's id-only behaviour).
+- Inside the wrappers, dependency calls (coordinator/trigger, buffer/sampler) are made
+  only for the wrapper's own records under its lifecycle lock, so a dependency is never
+  asked to end a session the wrapper no longer owns; dependencies keep their own
+  generation checks (trigger/sampler session generation, candidate tokens).
+- VideoService: `abort_start(token)` and the cleanup runner act on one `_CaptureSession`
+  object; the session id factory is injectable for tests only (to force id reuse).
+- Boundary of the opt-in lease: it protects the lifecycle driven by the owner
+  (VideoService → detector/tee, and the wrappers' own dependency calls). It does NOT
+  protect direct external calls with `lease=None`, id-only sinks called by someone other
+  than VideoService (EventFrameBuffer, scene classifier, evaluation worker), or the
+  scene-classifier → `DomainService.apply_scene_decision` path, which stays id-only; in
+  production those ids are fresh `uuid4` values minted by VideoService.
+
+*T3c0.1 — DetectorService obligations, lease and close* (no API dependency)
+Files: `backend/app/services/detector_service.py`;
+`backend/app/services/private_parking_coordinator.py` (coordinator and tee: start after
+close raises, F6; tee lease support); new `backend/tests/test_detector_session_cleanup.py`;
+`backend/tests/test_private_parking_coordinator.py` (adapt the close tests, add lease and
+closed-start tests).
+Contract:
+- Fixed dependency labels `result consumer`, `tracker`, `parking trigger` (never ids).
+- Start: under `_lifecycle_lock`; refused with `DetectorAdmissionError` (sanitized,
+  before any dependency call) when closed, when any cleanup is pending, or when the same
+  id is active/pending. For each dependency, in order: under `_cond`, re-check `_closed`
+  and RECORD the label as an obligation of `(sid, lease)`, then call its
+  `start_session` outside `_cond`. The record precedes the call, so a dependency that
+  changes state and then raises is covered. A failure (or `_closed` seen at a record
+  point) stops further starts and raises `DetectorStartError`; the session stays active
+  with the recorded obligations.
+- End: active `(sid, lease)` → ending with all recorded obligations; pending → only those
+  still pending; anything else → no-op (`stale_ends`). Every target tried (isolated),
+  successes removed, failures kept together, then `DetectorCleanupError` (count only,
+  `from None`). Retry calls only what is still pending. At most one active + one pending
+  session.
+- Implicit switch (legacy `start_session(B)` while A active, no lease): ends A via
+  `_end_locked` while already holding `_lifecycle_lock` (no re-acquire); success → start
+  B; failure → A pending, B refused.
+- Close: (1) under `_cond`: `_closed = True`, notify the worker; (2) take
+  `_lifecycle_lock` — waits for an in-flight start, which stops at its next record point
+  — then snapshot the active and pending obligations under `_cond` and try each once
+  (isolated, never raises, failures counted/logged); (3) `join` the worker with no lock
+  held. Because recording happens under `_cond` with a `_closed` check, the snapshot in
+  (2) contains every dependency that was or will ever be started; no new start after (1).
+  The worker stop is requested in (1), so a raising dependency cannot prevent it.
+- Coordinator and tee after `close()`: `start_session` raises (sanitized
+  `FrameSinkAdmissionError` / coordinator `SessionAdmissionError`) instead of returning
+  silently; `end_session` stays allowed (cleanup never refused). This changes the T3b
+  K4 detail "start ignored after close" (recorded as a contract change).
+- Frame/job binding (closes the detector blocker, F8): every admitted session gets a
+  detector GENERATION (`int`, strictly increasing per instance, never reused, also for
+  the same id). `offer(packet, *, lease=None)` accepts a packet only when its session id
+  AND lease match the active record, and stores `(packet, generation)` in the
+  latest-frame slot. Inference runs with no detector lock held (CUDA gate only).
+- Atomic delivery versus invalidation: a new `D._delivery_lock` is held by the worker for
+  the whole delivery — the `_cond` check `generation == active generation and not
+  closed`, publishing `latest_result`, and the calls to result consumer, tracker and
+  parking trigger. Every lifecycle change (end, implicit switch, start, close) takes
+  `D._delivery_lock` and then `_cond` to change the active generation. So the check and
+  the consumer calls form one unit with respect to invalidation: a delivery either
+  completes entirely before the lifecycle change or is dropped afterwards (generation
+  mismatch, counted `stale_results`). A result of generation A is never delivered after A
+  was invalidated, even when B has the same session id; `latest_result` is cleared on
+  invalidation and set only by a current-generation delivery.
+- Delivery work is bounded and in-memory: domain observe, tracker observe, coordinator
+  observe (trigger, sampler, `offer_local` — leaf lock, never waits). No inference, HTTP
+  or audio-device operation runs under `D._delivery_lock` or `D._lifecycle_lock`
+  (evaluation HTTP stays on the evaluation worker; PlaySound on the audio device thread).
+  Consumers must never call back into the detector's lifecycle or take its locks.
+- Consequence for Stop: delivery and invalidation are mutually exclusive — a lifecycle
+  change waits while a delivery holds `D._delivery_lock` and a delivery never starts
+  for an invalidated generation. No wait bound is proven: the wait lasts as long as the
+  in-flight delivery's consumers run (in-memory by contract). A Stop never waits for
+  inference; an inference that finishes after the Stop is dropped at its delivery check. No consumer contract change is needed: consumers keep their session-id checks
+  and are reached only through this serialized delivery; therefore
+  `domain_service.py`, `tracker_service.py` and `private_parking_trigger.py` are not in
+  scope (an explicit consumer generation would be required only if a consumer were fed
+  by another path for the same session id — see the lease boundary).
+Diagnostics `get_lifecycle_diagnostics()` (counts/labels only): `active_sessions`,
+`pending_sessions`, `pending_dependency_ends`, pending per label, `start_failures`,
+`end_failures`, `stale_ends`, `stale_results`, `cleanups_completed`, `starts_refused`,
+`close_failures`.
+
+*T3c0.2 — VideoService required sinks, thread start, token-bound rollback, API*
+(depends on T3c0.1)
+Files: `backend/app/services/video_service.py`; `backend/app/api/video.py` (O-P3);
+new `backend/tests/test_video_required_sinks.py` and
+`backend/tests/test_video_upload_rollback.py`; `backend/tests/test_video_api.py` only
+where an assertion encodes the global-stop rollback.
+Contract:
+- `VideoService(..., required_sinks=frozenset())` (labels `event frame buffer`,
+  `detector`, `scene classifier`, `evaluation worker`). Empty = legacy. Private mode
+  (T3c runtime config) passes `{"event frame buffer", "detector"}` (O-P1).
+- Start, outcome then rollback: `_start_sinks` holds `_lifecycle_lock` only for the start
+  loop and returns `ok` | `stopped` | `refused(label)`; it never starts a cleanup.
+  Obligations are implicit: invalidation marks EVERY sink pending, so the cleanup ends
+  started sinks, the refusing sink and sinks that changed state before raising (no-op
+  for sinks that never started). After the loop (lock released), `_atomic_reserve` takes
+  `_lock`: session already released (a Stop/abort won) → return `stopped`, the winner's
+  runner owns cleanup; refused → `end_reason="error"`, `start_refused=True`, error
+  "Required pipeline component refused the session" (label only), STOPPING, release
+  `_lock`, `_release_session(session)` → runner → final ERROR (O-P2), or ERROR "Video
+  cleanup failed; Stop retries it" with the failed sinks pending if the rollback failed.
+- Refusal reporting (O-P2): `claim_start()` and `start_webcam()` raise
+  `VideoStartRefusedError` (not a `RuntimeError` subclass) after the rollback ran; the
+  routes answer 503 "Required pipeline component is unavailable". Not IDLE → `None` /
+  `False` → 409 as today. Legacy configuration never raises it.
+- Upload admission before write/probe (F3): reservation and sink starts happen in
+  `claim_start()` before MIME checks, the write and the handler PROBE; a refusal returns
+  503 before the file is created. After a successful `claim_start`, the handler owns the
+  reservation until `start_file` succeeds; EVERY failure path (validation 422, size 422,
+  write 500, probe 422/500, `start_file` mismatch 409, unexpected 500) calls
+  `video_service.abort_start(token)` and deletes only the file the handler still owns.
+  No global `stop()` remains in the upload handler.
+- `abort_start(token) -> bool`: under `_lock`, acts only when the CURRENT session's token
+  equals `token` and the session was not handed to a capture thread; sets
+  `stop_requested` (a rollback by its owner) and invalidates it; its runner releases that
+  session's capture/upload/sinks; final IDLE when the cleanup succeeded, ERROR (Stop
+  retries) when it failed. Any other token → `False`, nothing touched (`stale_aborts`).
+- Thread start (F4): `_attach` attaches the capture and creates the thread but keeps
+  STARTING; `_start_capture` holds `V._lock` for one section that re-checks "current and
+  not released", calls `thread.start()`, and publishes RUNNING only after it returned.
+  The capture thread can report EOF/error only through `_finish_from_capture`, which
+  needs `V._lock`, so it observes RUNNING (never STARTING) and its STOPPING transition
+  follows the publication. After finalization (IDLE/ERROR) nothing writes RUNNING for
+  that session again: `_start_capture`/`_attach` refuse a released session. If it raises: under `_lock` `end_reason="error"`, error "Capture
+  thread could not start" (sanitized), `session.thread = None`, STOPPING; after `_lock`,
+  `_release_session(session)` → runner releases this session's capture and upload and
+  ends its sinks → ERROR until Stop; cleanup failures stay pending. `start_webcam`
+  returns `True` (attempted; status ERROR); `start_file` returns normally (status ERROR;
+  the attached upload is deleted by the runner); the route reports the status as for an
+  open failure today.
+- Detector frames: `_offer_consumers` passes `lease=session.token` to a lease-aware
+  detector `offer` (the capture thread has its `_CaptureSession`).
+- Admission rule (O-P2): `_atomic_reserve` requires IDLE, and IDLE is written only by a
+  cleanup with every obligation done (capture, upload, every pending sink — including the
+  detector's and tee's own pending dependencies, which raise until done).
+Diagnostics `get_cleanup_diagnostics()` (labels/counts only): state, pending sink labels
+of the current session, `required_sinks`, `required_start_refusals`,
+`thread_start_failures`, `aborted_starts`, `stale_aborts`.
+
+Lock order (all locks non-reentrant; no path re-acquires a lock it holds):
+- Start success / required refusal: `V._lock` (reserve) → release → `V._lifecycle_lock`
+  → per sink: tee `_lifecycle_lock` → tee `_lock` | sink locks; detector
+  `_lifecycle_lock` → `D._cond` (record) → release → dependency locks → release
+  `V._lifecycle_lock` → `V._lock` (decide) → release → `_release_session`: `V._lock`
+  (invalidate) → release → runner (no `_lock` across steps): join, release capture/upload
+  → `V._packet_cond` → `V._lifecycle_lock` → sink ends (same chains) → release → `V._lock`
+  (finalize).
+- Stop during start: `V._lock` (stop_requested, invalidate) → release → runner blocks on
+  `V._lifecycle_lock` held by the start loop; the loop sees `released` at its next sink,
+  returns `stopped`, releases the lock; the runner ends every sink; the start path sees
+  `released` under `V._lock` and does not start a second cleanup.
+- Thread start failure: `V._lock` (thread.start, mark failure) → release → same runner
+  chain as above.
+- Abort: `V._lock` (token check, invalidate) → release → same runner chain.
+- Detector implicit switch: `D._lifecycle_lock` → `D._cond` → release → `_end_locked(A)`
+  dependency calls → `D._cond` (record B) → release → dependency starts; never calls
+  VideoService, never re-takes `D._lifecycle_lock`.
+- Detector close: `D._cond` (closed, notify) → release → `D._lifecycle_lock` →
+  `D._delivery_lock` → `D._cond` (invalidate generation, snapshot) → release `_cond`,
+  `_delivery_lock` → dependency ends → release `D._lifecycle_lock` → `join` with no lock.
+- Detector lifecycle change (end / start / switch): `D._lifecycle_lock` →
+  `D._delivery_lock` → `D._cond` (change generation, record) → release `_cond` and
+  `_delivery_lock` → dependency calls (holding only `D._lifecycle_lock`).
+- Detector worker: `D._cond` (take job) → release → inference (CUDA gate only) →
+  `D._delivery_lock` → `D._cond` (generation check, publish) → release `_cond` → consumer
+  calls (holding `D._delivery_lock`) → release. The worker never takes
+  `D._lifecycle_lock`; consumers never take detector locks. Global order:
+  `V._lifecycle_lock` → `D._lifecycle_lock` → `D._delivery_lock` → `D._cond`; consumer
+  locks are taken under `D._delivery_lock` only by the worker, and under
+  `D._lifecycle_lock` only by lifecycle calls (never both directions).
+
+Acceptance (fakes; `threading.Event`/`Barrier` gates; every wait bounded; every thread
+joined with a timeout and asserted finished; process `timeout`).
+
+T3c0.1 — standalone (DetectorService with a fake model, fake consumers, real
+coordinator where stated; no VideoService):
+1. Inference A held (gated fake model) → `end_session(A)` → `start_session(B)` with the
+   SAME id and another lease → release A's inference: `latest_result` stays B's (None),
+   result consumer, tracker and coordinator/trigger receive nothing from A
+   (`stale_results` = 1); B's next frame is delivered normally.
+2. Delivery A held exactly before the consumer calls (gated fake result consumer, after
+   the generation check) → `end_session(A)` in a thread; a deterministic gate proves it
+   is already waiting for `D._delivery_lock` (it has taken `D._lifecycle_lock` and its
+   end has not run) BEFORE `start_session(B, same id)` is issued; release → the A
+   delivery completes into A's state, then A ends, then B starts; B's consumer state holds
+   nothing from A, and an A result produced meanwhile is dropped (`stale_results`). No
+   timing bound is asserted beyond the test timeout.
+3. Partial start (result consumer ok, tracker changes state then raises; parking trigger
+   never attempted): the obligations are exactly result consumer and tracker. Both end
+   calls fail → `DetectorCleanupError`, both recorded; retry #1: only those two called,
+   one succeeds; retry #2: only the remaining one; the parking trigger is never ended
+   (never attempted). implicit switch with a gated dependency end; close while the worker
+   is inside a gated delivery and a dependency end raises → close returns, worker
+   joined, no thread left, no deadlock.
+4. Closed start is a refusal: after `close()`, detector, tee and coordinator
+   `start_session` raise the sanitized admission error (never a silent return); a
+   `end_session` / retry for a recorded session still runs after close and finishes its
+   obligations.
+5. Start versus close at the record boundary: a dependency start blocks after being
+   recorded; `close()` in a thread → close ends it, the next dependency is never started,
+   start raises, worker joined.
+6. Late lease-bound end: `end_session(id, lease=A)` after B (same id) started → no-op
+   (`stale_ends`), B intact (detector and tee).
+
+T3c0.2 — VideoService and API (uses T3c0.1):
+7. Required-start failure concurrently with Stop: exactly one cleanup runner, each sink
+   ended once, both threads finish.
+8. Refusal before write/probe/playback: required tee or detector refuses in
+   `claim_start` → 503; handler PROBE (`api.video.cv2.VideoCapture`) and PLAYBACK capture
+   (`video_service.cv2.VideoCapture`) counted separately — both 0; no file written;
+   webcam: `cv2.VideoCapture` 0 calls, 503; ERROR until Stop.
+9. Upload A held in `file.read` → Stop → Start B → A fails validation →
+   `abort_start(A)` False; B RUNNING, B's sinks never ended; A's file deleted by the
+   handler.
+10. Late operations with id reuse: forced same id for A and B with different tokens; late
+   `abort_start(A)`, late `start_file(A)` and late lease-bound ends → no effect on B; while
+   A is pending, B is refused by VideoService, tee and detector.
+11. `thread.start()` fails: RUNNING never published for that session; capture released,
+   upload deleted, sinks ended; ERROR until Stop; a failing sink end stays pending and
+   Stop retries it; another session untouched.
+12. Immediate EOF and immediate capture error: the fake capture returns EOF / raises on
+   the first read; the thread's report waits for the RUNNING publication, then STOPPING
+   → IDLE (EOF) or ERROR (error); no RUNNING after finalization; every sink ended once.
+13. Stop at the `thread.start`/RUNNING boundary: (a) Stop wins before `_start_capture`
+   takes `V._lock` (gate just before it) → the thread is never started, capture released,
+   IDLE; (b) Stop arrives while `thread.start()` runs under `V._lock` (gated start) → Stop
+   waits, then ends the RUNNING session normally; in both cases RUNNING is never written
+   after the session was finalized (state-transition log asserted).
+14. Publication under the state lock: the state-transition log shows RUNNING written in
+   the same `V._lock` section as the successful `thread.start()` and the current/released
+   check (instrumented lock, as in the T3a2 lifecycle tests).
+15. IDLE/admission only after every obligation: VideoService + DetectorService (fake
+   model) + real coordinator whose trigger `end_session` fails once → ERROR, new session
+   409; Stop reaches the coordinator again (only it) → IDLE; then admitted.
+16. Legacy regression and sanitization: `required_sinks` empty → an optional sink start
+   failure still leaves the video RUNNING; existing `test_video_*`, `test_detector_*`,
+   private parking and worker suites pass (only rollback assertions that encoded the
+   global stop change); new errors, response details and logs carry no session id,
+   token, path or exception message.
+Verification: targeted files serially, then the full backend suite, `pip check`, `git
+diff --check`, whitespace on new files; docs: this plan, `PLAN.md`, and after
+implementation `ARCHITECTURE.md` §7 and `RELIABILITY.md`.
+
+Risks (high → low):
+- H1 Deadlock between start, Stop, abort and close (F2) — outcome-then-rollback, record
+  points, join outside locks; acceptance 1, 5, 8.
+- H2 A late operation ends or stops a newer session (F3, F5) — leases + token-bound
+  `abort_start`; acceptance 3, 4.
+- H3 False IDLE after a forgotten obligation (F1, F4) — recorded obligations, thread-start
+  rollback; acceptance 6, 7, 9.
+- M1 A dependency blocking in `start_session`/`end_session` holds the detector/tee
+  lifecycle lock; Start/Stop/close wait (frames do not); join is bounded, the dependency
+  call is not.
+- M1b A consumer that blocks inside a delivery holds `D._delivery_lock`, so a Stop waits
+  for it (inference never). No bound is proven; it rests on the consumer contract
+  (in-memory, no HTTP/audio device/inference); acceptance 2 asserts the exclusion.
+- M2 Legacy behaviour changes on failure paths: detector start/end errors become
+  sanitized aggregate errors; implicit switch refuses B when A's end fails; upload
+  rollback is token-bound; a thread-start failure now gives ERROR instead of a stuck
+  RUNNING; tee/coordinator start after close raises.
+- M3 New 503 response for both start routes; the frontend may need a message (outside
+  this scope; to be reported).
+- L1 Diagnostics/errors must stay free of ids, tokens, paths and exception text.
+- L2 Thread tests can hang on a missed gate — every wait bounded, process timeout.
+Dependencies: T3b core (`ec9b8cb`) → T3c0.1 → T3c0.2 (uses detector/tee leases and
+closed-start refusal; acceptance 9 needs T3c0.1) → T3c (runtime passes
+`required_sinks={"event frame buffer", "detector"}` in private mode). No package, model or
+hardware dependency.
+Technical answers (TQ2–TQ4 kept as given in rev 3 per PM message "revisi terarah T3c0
+rev 3"; TQ1 restated as the lease boundary above):
+- TQ1 Lease opt-in by class attribute; its protection boundary is stated under
+  "Lifecycle identity". Changing every sink protocol is not part of T3c0.
+- TQ2 `abort_start` final state is IDLE after a successful rollback (owner rollback, not a
+  component refusal), ERROR if the rollback failed.
+- TQ3 A thread-start failure is reported like an open failure (200 with `state=ERROR`),
+  not 503 (not a component refusal) and not 500.
+- TQ4 The coordinator/tee closed-start change (F6) alters the reviewed T3b detail "start
+  ignored after close" into a sanitized refusal; end/retry after close unchanged.
+
+**T3c0.1 — completed** (independent review PASS WITH LIMITATIONS; committed on the PM
+instruction "penutupan dan commit T3c0.1", 2026-10-11, as "fix: preserve detector cleanup
+and isolate stale delivery"). T3c0.2 and runtime wiring are NOT done.
+- Independent review (Codex via PM, 2026-10-11): **PASS WITH LIMITATIONS**; 74 target
+  tests and 1,110 full backend tests passed; `pip check` and diff/whitespace checks
+  clean; the mutation testing and the stability repetitions below were NOT reproduced by
+  the reviewer (agent runs only).
+- Closure check (agent run, 2026-10-11): HEAD `ec9b8cb`, nothing staged; no source/test
+  file was modified after the agent's last verification run (the only later source
+  write was the mutation script's byte-identical restore, before the full run); blob
+  hashes at closure: `detector_service.py` `95e90f8`, `private_parking_coordinator.py`
+  `0b70737`, `test_detector_service.py` `d0ecef4`, `test_private_parking_coordinator.py`
+  `31d367f`, `test_detector_session_cleanup.py` `45629a3`.
+- Limitations kept open: the scene classifier and its `DomainService.apply_scene_decision`
+  path are not covered (id-only); id-only sinks and direct external calls with
+  `lease=None` are not lease-protected, and VideoService passes no lease until T3c0.2; a
+  lifecycle change can be held by an in-flight delivery's consumers (no proven wait
+  bound).
+
+**T3c0.1 results (agent run, 2026-10-11, HEAD `ec9b8cb`, working tree)**
+Files: `backend/app/services/detector_service.py`,
+`backend/app/services/private_parking_coordinator.py`, new
+`backend/tests/test_detector_session_cleanup.py`,
+`backend/tests/test_private_parking_coordinator.py`, and one assertion in the adjacent
+`backend/tests/test_detector_service.py` (see legacy changes); this plan and `PLAN.md`.
+- DetectorService: `_SessionRecord(session_id, lease, generation, obligations,
+  remaining)`; generation per admitted session; `offer(packet, *, lease=None)` stores
+  `(packet, generation)`; the worker holds `_delivery_lock` from the generation check
+  through every consumer call; `_end_record_locked` invalidates under `_delivery_lock` →
+  `_cond`; obligations recorded under `_cond` (with a `_closed` check) before each
+  dependency start; end/retry try only `remaining`; one pending session, start refused
+  while pending; implicit switch through the same helper; `close()` = closed+notify →
+  obligations once (failures stay pending, never raises) → join with no lock.
+  Errors `DetectorAdmissionError` / `DetectorStartError` / `DetectorCleanupError`
+  (sanitized, `from None`); logs: label, step, exception type.
+  `get_lifecycle_diagnostics()` counts/labels only.
+- Tee: `accepts_lifecycle_lease`; records `(session_id, lease)`; end acts only on an id
+  AND lease match (else `stale_ends`); start after close raises
+  `FrameSinkAdmissionError`. Coordinator: start after close raises
+  `SessionAdmissionError` (counted); end still forwarded after close. The coordinator is
+  not lease-aware: the detector calls it only for its own records under its lifecycle
+  lock.
+- Tests (`test_detector_session_cleanup.py`, 9; all with bounded gates, threads joined):
+  stale inference A never delivered to B with the same id; end A proven waiting for the
+  delivery lock (lifecycle lock held, no end call yet) before start B is issued, then A's
+  delivery → A's end → B's start; partial start with exactly the attempted obligations,
+  two failing ends, staged retry, never-attempted trigger never ended; implicit switch
+  with a gated end and a failing switch; close during a delivery with a raising end
+  (returns, worker joined, retry after close); closed start refused and forwarded from a
+  closed coordinator as `DetectorStartError`; close during a start ends only the
+  recorded dependency; late lease-bound end never touches B; sanitized errors/logs.
+  Coordinator file: lease test for the tee; closed-start tests updated (28 tests).
+- Mutations (agent run, scratch script, source restored): no generation check, invalidation
+  without the delivery lock, record after the start call, end ignoring the lease, retry
+  ending every obligation, closed start returning silently — each fails the new tests.
+  Stability: the new file passed 5 consecutive runs.
+- Tests (serial, fakes only, unique `--basetemp`): detector cleanup 9, detector service 9,
+  detector/tracker integration 10, coordinator 28, contracts integration 18, all
+  `test_private_parking_*` 241, video 100, detection API 5, domain API 6, evaluation
+  worker 119, audio 62 — all passed; full backend suite **1110 passed**, 1 Starlette
+  `DeprecationWarning`; `pip check` clean; `git diff --check` clean; the new test file has
+  no trailing whitespace and ends with a newline.
+- Legacy behaviour changes (reported): the implicit switch now ends EVERY obligation of
+  the previous session, including the result consumer (before: only tracker and parking
+  trigger) — one assertion in `test_detector_service.py` updated; a start for an id that
+  is already active is refused (before: restarted); dependency start/end errors are
+  re-raised as sanitized detector errors after isolation (before: the raw first error,
+  skipping the rest); start after close raises on detector, tee and coordinator (before:
+  silent return).
+- Deviation from acceptance 2 (rev 4 final): an A result "produced meanwhile" is not
+  part of test 2 — the single worker cannot hold a delivery and an inference at once, so
+  it is covered by test 1 (`stale_results`).
+- Limitations: VideoService does not pass leases yet (T3c0.2), so in the running app the
+  detector and tee are still driven id-only (`lease=None`); the generation binding and
+  the delivery exclusion apply already. Not covered: the scene classifier and its
+  `DomainService.apply_scene_decision` path (id-only, outside the lease), id-only sinks
+  called directly, and direct external calls with `lease=None`. No wait bound is proven
+  for a lifecycle change behind an in-flight delivery. No runtime, video, device or
+  provider run.
+
 **T3c — runtime wiring and mode**
 Files: `backend/app/services/runtime.py`, `backend/app/main.py`, `backend/.env.example`,
 integration tests.
 Scope: mode/config/local-clip variables, worker `enabled=False` in private mode until
 T3d, tee wiring, shutdown order.
 **Blocker before wiring (from T3b review delta 1, not fixed):** `DetectorService.end_session`
-clears its active session before calling the parking-trigger slot, so a failed
-coordinator `end_session` is never retried by VideoService's Stop. The coordinator must
+clears its active session before calling the parking-trigger slot: the first failure
+gives ERROR, but the Stop retry finds the session forgotten and VideoService writes IDLE
+although the coordinator/trigger never ended. The coordinator must
 not be wired into the detector until a separately scoped fix in `detector_service.py`
-keeps that slot pending and retries it (PM: own scope before T3c wiring).
+keeps that slot pending and retries it (PM: own scope before T3c wiring) — planned as T3c0.1 (rev 4).
 **Prerequisite before private-mode start (from T3b review delta 2, not done):** VideoService
 treats a refused `FrameSinkTee.start_session` (`FrameSinkAdmissionError`) as an optional
 sink failure and keeps the video running without buffer/evidence. In private mode that
 refusal must propagate and fail the start (or block private mode) instead of running
-silently without evidence.
+silently without evidence. Planned as T3c0.2 (rev 4); PM decided O-P1: detector and tee
+are both required in private mode.
 Acceptance: 1, 2, 6, 8, 9 (pre-T3d), 11, 12, 14 with `FakeCapture`, fake dispatcher and
 fake audio device.
 
@@ -982,6 +1423,13 @@ evidence was not included in the relay). Acceptance 24 and 30 finalised.
   - Open prerequisites for T3c (see T3c): (1) `DetectorService` cleanup retry for a
     failed parking-trigger `end_session` (separate scope); (2) a refused tee start must
     propagate to the private-mode start.
+- **T3c0 (lifecycle prerequisites): design rev 4 final, reviewed PASS WITH LIMITATIONS**
+  (Codex via PM, 2026-10-11). **T3c0.1 completed** — independent review PASS WITH
+  LIMITATIONS (Codex via PM: 74 target + 1,110 full tests passed, `pip check` and
+  diff/whitespace clean; mutation and stability runs not reproduced by the reviewer);
+  committed as "fix: preserve detector cleanup and isolate stale delivery". Limitations:
+  scene classifier not covered, id-only calls unprotected, lifecycle can be held by a
+  consumer. **T3c0.2 not authorized; runtime wiring not done.**
 - **T3c, T3d, T3e: not started, not authorized** — each waits for its own owner
   authorization (`docs/PLANS.md`).
 - Open for review: the deviations and limitations listed under "T3a1 results", the

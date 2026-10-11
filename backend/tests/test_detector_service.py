@@ -277,7 +277,8 @@ def test_result_consumer_receives_only_published_active_session_results() -> Non
         time.sleep(0.05)
         assert len(consumer.results) == 1
         assert consumer.started == ["valid", "stale"]
-        assert consumer.ended == ["stale"]
+        # T3c0.1: the implicit switch ends every obligation of "valid" (result consumer included).
+        assert consumer.ended == ["valid", "stale"]
     finally:
         release.set()
         detector.close()
