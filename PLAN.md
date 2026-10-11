@@ -8,7 +8,7 @@ Last reviewed at commit `36ffa20` (2026-10-04).
 
 | Plan | Status |
 |---|---|
-| [T3 — private parking integration](docs/exec-plans/active/t3-private-parking-integration.md) | **T3a1 completed — core only (reviewed PASS WITH LIMITATIONS; not wired into runtime); T3a2 completed — lifecycle only (reviewed PASS); T3b–T3e not started, not authorized; T3 not complete** |
+| [T3 — private parking integration](docs/exec-plans/active/t3-private-parking-integration.md) | **T3a1 completed — core only (reviewed PASS WITH LIMITATIONS; not wired into runtime); T3a2 completed — lifecycle only (reviewed PASS); T3b completed — core only (coordinator and bounded tee, reviewed PASS; not wired); T3c prerequisites open: DetectorService cleanup retry, tee refusal propagation to private-mode start; T3c–T3e not started, not authorized; T3 not complete** |
 
 ## Next candidates (not yet planned; order is a proposal for the owner)
 

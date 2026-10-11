@@ -422,7 +422,8 @@ class EpisodeEvidenceSampler:
             generation = getattr(token, "session_generation", None) if token is not None else None
             if token is not None and (not isinstance(token, CandidateToken)
                                       or generation != self._marker_generation
-                                      or type(token.episode_instance) is not int):
+                                      or type(token.episode_instance) is not int
+                                      or token.event_id != event_id):
                 self._counts["stale_seals_rejected"] += 1
                 return SealResult(None, EvidenceFailure.STALE_TOKEN)
             key = token.episode_instance if token is not None else episode_id
@@ -547,6 +548,9 @@ class EpisodeEvidenceSampler:
     def release(self, event_id: str, *, token: object | None = None) -> bool:
         """Release sealed evidence; only the token given to ``seal`` may do it."""
         with self._lock:
+            if not self._token_names_event(token, event_id):
+                self._counts["token_mismatches"] += 1
+                return False
             sealed = self._sealed.get(event_id)
             if sealed is None:
                 return False
@@ -559,6 +563,11 @@ class EpisodeEvidenceSampler:
     # ── plans and bundles ────────────────────────────────────────────────────
 
     @staticmethod
+    def _token_names_event(token: object | None, event_id: object) -> bool:
+        """A token must name the event it is used for; ``None`` (untokened T2 call) passes."""
+        return token is None or getattr(token, "event_id", None) == event_id
+
+    @staticmethod
     def _plan_locked(evidence: SealedEvidence) -> FrameSelectionPlan:
         return FrameSelectionPlan(
             evidence.event_id, evidence.source_session_id, DomainName.PARKING_MOTORCYCLE,
@@ -569,6 +578,9 @@ class EpisodeEvidenceSampler:
         """Evidence-derived plan: offsets are the sealed frames' actual offsets."""
         with self._lock:
             self._expire_locked(self._clock())
+            if not self._token_names_event(token, event_id):
+                self._counts["token_mismatches"] += 1
+                return None
             sealed = self._sealed.get(event_id)
             if sealed is None:
                 return None
@@ -591,6 +603,9 @@ class EpisodeEvidenceSampler:
         triggered_at = getattr(candidate, "triggered_at", None)
         with self._lock:
             self._expire_locked(self._clock())
+            if not self._token_names_event(token, event_id):
+                self._counts["plans_unavailable"] += 1
+                return PlanUnavailable(PlanUnavailableReason.MISSING)    # mixed identity: refused
             sealed = self._sealed.get(event_id) if isinstance(event_id, str) else None
             if (sealed is not None and sealed.token == token
                     and session_id == self._session_id == sealed.evidence.source_session_id
@@ -646,6 +661,9 @@ class EpisodeEvidenceSampler:
     def failure_for(self, event_id: str, *, token: object | None = None) -> EvidenceFailure | None:
         with self._lock:
             self._expire_locked(self._clock())
+            if not self._token_names_event(token, event_id):
+                self._counts["token_mismatches"] += 1
+                return None
             record = self._failures.get(event_id)
             if record is None:
                 return None

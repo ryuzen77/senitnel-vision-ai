@@ -83,6 +83,7 @@ _COUNTERS = (
     "candidates_prepare_expired", "candidates_abandoned", "publish_rejected", "abandon_rejected",
     "outcomes_evicted", "markers_emitted", "markers_popped", "marker_overflows",
     "markers_dropped_overflow", "resyncs_issued", "finish_rejected", "episode_id_collisions",
+    "resyncs_requested",
 )
 _ID_ATTEMPTS = 4      # fresh ids tried when a minted episode id is already live
 # Tombstones of closed candidates kept per session: a multiple of max_candidates.
@@ -418,7 +419,7 @@ class PrivateParkingTrigger:
                           episode.crossed_in_at, instance=episode.instance)
         event_id = uuid.uuid4().hex
         self._serial += 1
-        token = CandidateToken(self._session_generation, self._serial, episode.instance)
+        token = CandidateToken(self._session_generation, self._serial, episode.instance, event_id)
         self._counts["events_issued"] += 1
         if len(self._alerts) >= self._t.alert_queue_limit:
             self._counts["alerts_dropped_queue_full"] += 1
@@ -584,13 +585,27 @@ class PrivateParkingTrigger:
         live = frozenset((*self._preparing, *(entry.token for entry in self._candidates)))
         return EvidenceView(entered, preparing, live)
 
+    def request_resync(self) -> None:
+        """Ask for an authoritative view on the next ``pop_markers`` (bounded: one view per
+        request), e.g. after a consumer failed to drain or apply a batch. Session-scoped:
+        a reset clears it."""
+        with self._lock:
+            if not self._closed and self._session_id is not None:
+                self._resync_required = True
+                self._markers.clear()
+                self._counts["resyncs_requested"] += 1
+
     def pop_markers(self) -> MarkerBatch:
-        """Atomically drain markers; after an overflow, return the authoritative view instead."""
+        """Atomically drain markers; after an overflow or a resync request, return the
+        authoritative view instead. A view takes its own, newer ``seq`` (``upto_seq``), so
+        it supersedes every batch popped before it — even one the consumer already
+        applied — while a replay of an older view or batch stays stale."""
         with self._lock:
             self._expire_locked(self._clock())
             if self._resync_required:
                 self._resync_required = False
                 self._markers.clear()
+                self._marker_seq += 1
                 self._counts["resyncs_issued"] += 1
                 return MarkerBatch(self._session_id, self._session_generation, self._marker_seq, (),
                                    self._view_locked())

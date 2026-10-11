@@ -614,7 +614,7 @@ def test_racing_seal_and_bundle_retrieval_never_return_partial_bundles() -> None
 # Hand-built ids for marker-managed episodes: each name maps to one episode instance,
 # and each token is bound to the instance it was issued for.
 _INSTANCE = {"ep1": 1, "ep2": 2, "ep3": 3, "ep4": 4, "ep5": 5, "marked": 1}
-T1, T2 = CandidateToken(1, 1, 1), CandidateToken(1, 2, 2)
+T1, T2 = CandidateToken(1, 1, 1, "ev1"), CandidateToken(1, 2, 2, "ev2")   # each bound to its event
 
 
 def _candidate(event_id="ev1", token=T1, session="s1", triggered_at=6.0):
@@ -665,7 +665,8 @@ def test_a_second_seal_for_an_event_id_held_under_another_token_is_refused() -> 
     _sealed_token(rig)
     _begin(rig, "ep2", 6.1)
     rig.play(9.0)
-    result = rig.sampler.seal("s1", "ep2", "ev1", 9.0, token=T2)        # reused event id
+    reused = CandidateToken(1, 2, 2, "ev1")                             # another token for the same event id
+    result = rig.sampler.seal("s1", "ep2", "ev1", 9.0, token=reused)    # reused event id
     assert result.evidence is None and result.failure is EvidenceFailure.UNKNOWN_EPISODE
     assert rig.sampler.plan_for("ev1", token=T1) is not None              # original untouched
 
@@ -788,14 +789,14 @@ def test_view_keeps_entered_and_preparing_and_releases_everything_else() -> None
     _begin(rig, "ep3", 4.5)                                               # TRIGGERED + preparing, kept
     _begin(rig, "ep4", 5.0)                                               # AUTHORIZED: not in the view
     rig.play(7.0)
-    t3 = CandidateToken(1, 3, 3)
+    t3 = CandidateToken(1, 3, 3, "ev3")
     view = EvidenceView((("ep2", 2, 1, 4.0), ("ep5", 5, 1, 6.5)), (("ep3", t3),), frozenset({t3}))
     assert rig.sampler.apply_markers(_batch(upto=10, view=view))
     snapshot = rig.snapshot()
     assert snapshot.active_episodes == 3                                  # ep2, ep3, ep5 (re-begun)
     assert snapshot.count("episodes_cancelled_resync") == 1 and snapshot.count("episodes_begun_resync") == 1
     assert snapshot.sealed == 0 and snapshot.count("sealed_released_resync") == 1   # T1 not live
-    assert rig.sampler.seal("s1", "ep4", "ev4", 7.0, token=CandidateToken(1, 4, 4)).failure \
+    assert rig.sampler.seal("s1", "ep4", "ev4", 7.0, token=CandidateToken(1, 4, 4, "ev4")).failure \
         is EvidenceFailure.UNKNOWN_EPISODE
 
 
@@ -841,12 +842,12 @@ def test_old_token_seal_after_a_trigger_restart_with_reused_ids_changes_nothing(
     _begin(rig, "ep1", 2.5, generation=2, instance=9)   # trigger restarted: same session and episode id
     rig.play(6.0)
     before = _state(rig)
-    stale = rig.sampler.seal("s1", "ep1", "ev1", 6.0, token=CandidateToken(1, 1, 1))
+    stale = rig.sampler.seal("s1", "ep1", "ev1", 6.0, token=CandidateToken(1, 1, 1, "ev1"))
     assert stale.evidence is None and stale.failure is EvidenceFailure.STALE_TOKEN
     assert _state(rig) == before                      # episode, JPEG refs, counters, records intact
     assert rig.snapshot().count("stale_seals_rejected") == 1
-    assert rig.sampler.failure_for("ev1", token=CandidateToken(1, 1, 1)) is None   # nothing recorded
-    fresh = rig.sampler.seal("s1", "ep1", "ev1", 6.0, token=CandidateToken(2, 10, 9))
+    assert rig.sampler.failure_for("ev1", token=CandidateToken(1, 1, 1, "ev1")) is None   # nothing recorded
+    fresh = rig.sampler.seal("s1", "ep1", "ev1", 6.0, token=CandidateToken(2, 10, 9, "ev1"))
     assert fresh.failure is None and fresh.evidence.frames[0].source_timestamp == pytest.approx(2.5)
 
 
@@ -861,10 +862,10 @@ def test_old_token_seal_after_a_sampler_session_restart_with_reused_ids_changes_
     _begin(rig, "ep1", 1.03, generation=2, instance=9)
     rig.play(6.0)
     before = _state(rig)
-    assert rig.sampler.seal("s1", "ep1", "ev1", 6.0, token=CandidateToken(1, 1, 1)).failure \
+    assert rig.sampler.seal("s1", "ep1", "ev1", 6.0, token=CandidateToken(1, 1, 1, "ev1")).failure \
         is EvidenceFailure.STALE_TOKEN
     assert _state(rig) == before
-    assert rig.sampler.seal("s1", "ep1", "ev1", 6.0, token=CandidateToken(2, 7, 9)).failure is None
+    assert rig.sampler.seal("s1", "ep1", "ev1", 6.0, token=CandidateToken(2, 7, 9, "ev1")).failure is None
 
 
 def test_token_and_untokened_calls_never_cross() -> None:
@@ -885,9 +886,9 @@ def test_token_and_untokened_calls_never_cross() -> None:
 
 # ── T3a1 delta 2: episode instances (episode_id reused within one generation) ─
 
-TOKEN_A = CandidateToken(1, 10, 101)          # issued for instance 101 (episode A)
-TOKEN_B = CandidateToken(1, 11, 102)          # issued for instance 102 (episode B, same episode_id)
-TOKEN_C = CandidateToken(1, 12, 103)          # issued for instance 103 (another episode)
+TOKEN_A = CandidateToken(1, 10, 101, "ev-a")  # issued for instance 101 (episode A)
+TOKEN_B = CandidateToken(1, 11, 102, "ev-b")  # issued for instance 102 (episode B, same episode_id)
+TOKEN_C = CandidateToken(1, 12, 103, "ev-c")  # issued for instance 103 (another episode)
 
 
 def _a_ended_then_b_entered(rig: Rig) -> None:
@@ -909,6 +910,8 @@ def test_a_token_for_an_old_instance_cannot_seal_the_new_one_with_the_same_id() 
     before = _state(rig)
     result = rig.sampler.seal("s1", "ep-x", "ev-b", 6.0, token=TOKEN_A)
     assert result.evidence is None and result.failure is EvidenceFailure.STALE_TOKEN
+    forged = CandidateToken(1, 10, 101, "ev-b")                        # right event, A's instance
+    assert rig.sampler.seal("s1", "ep-x", "ev-b", 6.0, token=forged).failure is EvidenceFailure.STALE_TOKEN
     assert _state(rig) == before                                      # B active, bytes/refcounts intact
     assert rig.sampler.failure_for("ev-b", token=TOKEN_A) is None     # nothing recorded
     sealed = rig.sampler.seal("s1", "ep-x", "ev-b", 6.0, token=TOKEN_B)
@@ -921,6 +924,9 @@ def test_a_token_of_another_episode_in_the_same_generation_is_refused() -> None:
     _a_ended_then_b_entered(rig)
     before = _state(rig)
     assert rig.sampler.seal("s1", "ep-x", "ev-b", 6.0, token=TOKEN_C).failure is EvidenceFailure.STALE_TOKEN
+    other_instance = CandidateToken(1, 12, 103, "ev-b")                # right event, C's instance
+    assert rig.sampler.seal("s1", "ep-x", "ev-b", 6.0, token=other_instance).failure \
+        is EvidenceFailure.STALE_TOKEN
     assert rig.sampler.seal("s1", "ep-c", "ev-b", 6.0, token=TOKEN_B).failure is EvidenceFailure.STALE_TOKEN
     assert _state(rig) == before
     assert rig.sampler.seal("s1", "ep-c", "ev-c", 6.0, token=TOKEN_C).failure is None
@@ -974,7 +980,7 @@ def test_an_unverifiable_tokened_seal_records_nothing_that_could_block_the_right
     rig = Rig()
     _a_ended_then_b_entered(rig)
     records = rig.snapshot().failure_records
-    ghost = CandidateToken(1, 99, 999)                                 # its instance no longer exists
+    ghost = CandidateToken(1, 99, 999, "ev-b")                         # its instance no longer exists
     assert rig.sampler.seal("s1", "ep-ghost", "ev-b", 6.0, token=ghost).failure is EvidenceFailure.UNKNOWN_EPISODE
     assert rig.snapshot().failure_records == records and rig.snapshot().count("seals_unverified") == 1
     assert rig.sampler.seal("s1", "ep-x", "ev-b", 6.0, token=TOKEN_B).failure is None   # not blocked
@@ -998,3 +1004,31 @@ def test_a_view_naming_another_instance_of_the_same_id_drops_the_unlisted_one() 
     snapshot = rig.snapshot()
     assert snapshot.count("episodes_cancelled_resync") == 2 and snapshot.count("episodes_begun_resync") == 1
     assert rig.sampler.seal("s1", "ep-x", "ev-b", 6.0, token=TOKEN_B).failure is EvidenceFailure.STALE_TOKEN
+
+
+# ── K1: the token is bound to its event ─────────────────────────────────────
+
+def test_mixed_event_and_token_are_refused_without_touching_the_other_event() -> None:
+    rig = Rig()
+    rig.play(1.5)
+    _begin(rig, "ep1", 1.03)
+    _begin(rig, "ep2", 1.13)
+    rig.play(6.0)
+    token_one, token_two = CandidateToken(1, 21, 1, "ev-one"), CandidateToken(1, 22, 2, "ev-two")
+    before = _state(rig)
+    # episode/token of event one with the event id of event two: refused before any change
+    mixed = rig.sampler.seal("s1", "ep1", "ev-two", 6.0, token=token_one)
+    assert mixed.evidence is None and mixed.failure is EvidenceFailure.STALE_TOKEN
+    assert _state(rig) == before
+    assert rig.sampler.failure_for("ev-two", token=token_two) is None    # nothing recorded for event two
+    assert rig.sampler.seal("s1", "ep2", "ev-two", 6.0, token=token_two).failure is None
+    assert rig.sampler.seal("s1", "ep1", "ev-one", 6.0, token=token_one).failure is None
+    # release / plan / failure lookups with the other event's token are refused too
+    assert not rig.sampler.release("ev-two", token=token_one)
+    assert rig.sampler.plan_for("ev-two", token=token_one) is None
+    assert rig.sampler.failure_for("ev-two", token=token_one) is None
+    mixed_candidate = _candidate(event_id="ev-two", token=token_one)
+    assert rig.sampler.plan_for_candidate(mixed_candidate) == PlanUnavailable(PlanUnavailableReason.MISSING)
+    assert rig.snapshot().sealed == 2
+    assert rig.sampler.plan_for("ev-two", token=token_two) is not None
+    assert rig.sampler.release("ev-two", token=token_two)

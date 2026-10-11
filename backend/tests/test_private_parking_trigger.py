@@ -887,7 +887,7 @@ def test_marker_overflow_returns_an_authoritative_view_once() -> None:
     snapshot = rig.trigger.get_snapshot()
     assert snapshot.resync_required and snapshot.count("marker_overflows") == 1
     batch = rig.trigger.pop_markers()
-    assert batch.markers == () and batch.view is not None and batch.upto_seq == 6
+    assert batch.markers == () and batch.view is not None and batch.upto_seq == 7   # 6 markers + the view
     entered = {episode_id for episode_id, _instance, _revision, _crossed in batch.view.entered}
     assert len(entered) == 4                                            # the authorized one is not listed
     authorized = [e.episode_id for e in snapshot.episodes if e.state is EpisodeState.AUTHORIZED]
@@ -1071,3 +1071,33 @@ def test_an_episode_ending_keeps_samples_only_for_its_own_preparing_candidate(mo
     ended = [m for m in rig.trigger.pop_markers().markers if m.kind is MarkerKind.EPISODE_ENDED]
     assert [m.keep_samples for m in ended] == [True, False]
     assert ended[0].episode_instance != ended[1].episode_instance
+
+
+# ── T3b: token bound to its event; consumer-requested resync ─────────────────
+
+def test_the_alert_token_names_its_own_event() -> None:
+    rig = Rig()
+    alert = _issue(rig)
+    assert alert.token.event_id == alert.event_id
+    assert alert.token.episode_instance is not None
+
+
+def test_request_resync_makes_the_next_pop_an_authoritative_view_once() -> None:
+    rig = Rig()
+    rig.walk_in(1)
+    rig.trigger.request_resync()
+    batch = rig.trigger.pop_markers()
+    assert batch.view is not None and batch.markers == ()
+    assert [entry[0] for entry in batch.view.entered] == [e.episode_id for e in rig.episodes()]
+    assert rig.trigger.pop_markers().view is None                        # one view per request
+    assert rig.count("resyncs_requested") == 1 and rig.count("resyncs_issued") == 1
+
+
+def test_request_resync_is_session_scoped() -> None:
+    rig = Rig()
+    rig.trigger.request_resync()
+    rig.trigger.end_session("s1")
+    rig.trigger.request_resync()                                         # no session: ignored
+    rig.trigger.start_session("s1")
+    assert rig.trigger.pop_markers().view is None                        # a reset cleared it
+    assert rig.count("resyncs_requested") == 0

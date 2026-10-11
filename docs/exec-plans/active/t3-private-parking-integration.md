@@ -3,8 +3,8 @@
 Code baseline `36ffa20` (T2 sampler); plan HEAD `7c41672` (H1 docs). §4.1 records the
 facts before T3a1. §4.2, §4.4, §4.5, §4.6 and §4.7 describe trigger, sampler, worker and
 audio-gate contracts as implemented by T3a1 (completed, core only, not wired into runtime).
-§4.3 (`VideoService` lifecycle) is implemented by T3a2 (completed — lifecycle only). §4.8 is planned for T3b/T3c and not implemented. T3b–T3e code does not exist.
-Status: see §8 — **rev 12: design PASS WITH LIMITATIONS (owner-reported); T3a1 completed — core only (reviewed PASS WITH LIMITATIONS, Codex via owner; committed as "feat: prepare private parking integration contracts"); T3a2 completed — lifecycle only (reviewed PASS; committed as "fix: isolate video session lifecycle and cleanup"); private parking not wired into runtime; T3b–T3e not started, not authorized. T3 as a whole is not complete.**
+§4.3 (`VideoService` lifecycle) is implemented by T3a2 (completed — lifecycle only). §4.2 alert sequence and §4.4 resync application are implemented by T3b (completed — core only: coordinator and tee, not wired); the rest of §4.8 is planned for T3c. T3c–T3e code does not exist.
+Status: see §8 — **rev 13: design PASS WITH LIMITATIONS (owner-reported); T3a1 completed — core only (reviewed PASS WITH LIMITATIONS, Codex via owner; committed as "feat: prepare private parking integration contracts"); T3a2 completed — lifecycle only (reviewed PASS; committed as "fix: isolate video session lifecycle and cleanup"); T3b completed — core only (coordinator and bounded tee; independent review PASS on the overflow delta; committed as "feat: add private parking coordinator and bounded frame tee"); private parking not wired into runtime; T3c–T3e not started, not authorized. T3 as a whole is not complete.**
 
 ## 1. Goal
 
@@ -738,11 +738,179 @@ failure records by `event_id`, so the coordinator must pass each alert's OWN
 to `seal`, `publish_candidate`, `abandon_candidate` and `release`; a T3b test must show
 that mixing two alerts' fields is refused or has no effect on the other candidate.
 
+PM decisions for T3b (PM message "keputusan K1–K7", 2026-10-08): K1 (a) bind `event_id`
+into the candidate token and validate it in seal/release/plan; K2 seal and publish even
+when the worker is disabled; K3 gate optional, audio failures logged sanitized, evidence
+processing continues; K4 wrappers never close their dependencies (runtime owns shutdown in
+T3c), `close()` only stops new work and is idempotent; K5 no coordinator generation —
+token and dependency session checks, proven by Stop/new-session interleaving tests; K6
+order: trigger observe → drain/apply markers → alerts (audio before seal/publish) →
+drain markers once more, no unbounded draining; K7 replace the `prepare()` stand-in with
+the real coordinator. Added: a marker drain/apply failure must hold publication of the
+affected candidates until synchronization is proven again (local audio may still run).
+
+Scope expansion recorded before editing (K1, K7):
+- `backend/app/models/private_parking.py` — `CandidateToken.event_id`.
+- `backend/app/services/private_parking_trigger.py` — token producer (mints the token with
+  its `event_id`) and a bounded `request_resync()` so the coordinator can ask for an
+  authoritative view after a failed marker drain/apply.
+- `backend/app/services/private_parking_evidence_sampler.py` — validate token ↔ `event_id`
+  in seal, release, plan and failure lookups.
+- `backend/tests/test_private_parking_trigger.py`,
+  `backend/tests/test_private_parking_evidence_sampler.py` — tests for the bound token.
+- `backend/tests/test_private_parking_contracts_integration.py` — `prepare()` replaced by
+  the coordinator (K7).
+- New: `backend/app/services/private_parking_coordinator.py`,
+  `backend/tests/test_private_parking_coordinator.py`.
+
+Status: **completed — core only** (implemented 2026-10-08, deltas 2026-10-09/11;
+independent review PASS on the overflow delta; committed on the PM instruction "penutupan dan
+commit core T3b", 2026-10-11). Not wired into runtime — runtime/env, API, mode selection
+and prompt stay in T3c/T3d; the two T3c prerequisites below remain open.
+
+**T3b results (agent run, 2026-10-08, HEAD `a23fe62`, working tree)**
+- K1: `CandidateToken.event_id` (default `None` for older callers); the trigger mints it
+  with the alert's `event_id`; the sampler refuses a token naming another event in
+  `seal` (`STALE_TOKEN`, checked before any mutation, nothing recorded), `release`,
+  `plan_for`, `failure_for` and `plan_for_candidate` (`PlanUnavailable(MISSING)`).
+  Test: `test_mixed_event_and_token_are_refused_without_touching_the_other_event`;
+  "forged" tokens (right event, wrong instance) keep the instance checks covered.
+- Trigger: `request_resync()` — session-scoped, bounded (clears the marker queue; the
+  next `pop_markers` returns one authoritative view), counted `resyncs_requested`.
+- `PrivateParkingCoordinator` (detector parking-trigger slot): K6 order per observation —
+  `trigger.observe` → one marker drain/apply → `pop_alerts` → per alert: local audio offer
+  first (gate optional, K3), then `seal` with the alert's own triple → `publish`, or
+  `abandon` on an evidence failure, or `release` with the own token when publication did
+  not succeed → one more drain/apply. Every dependency call is isolated; logs carry only
+  step name and exception type. No generation of its own (K5); `close()` idempotent,
+  stops new work, never closes a dependency (K4); `end_session` forwarded even after close.
+- Marker sync failure (drain or apply raises, or apply returns False): the coordinator
+  requests a resync and **holds** new alerts (audio still offered; no seal/publish) until
+  a batch carrying a view was applied; held alerts are bounded (32, oldest dropped →
+  its candidate expires unpublished) and voided by a new session. A held candidate that
+  expires is never published; its seal fails (`UNKNOWN_EPISODE`) and the publish/abandon
+  returns `EXPIRED`.
+- `FrameSinkTee` (VideoService event-frame-buffer slot): forwards `offer`/`start_session`
+  in order and `end_session` in reverse (even after close); one sink's exception never
+  stops the others. It does no I/O, HTTP or inference, but it is **not** claimed
+  non-blocking: each call takes the sinks' own (bounded, in-memory) locks and can wait for
+  them.
+- K7: `test_private_parking_contracts_integration.py` now drives the real coordinator
+  (the `prepare()` stand-in is gone); held-seal cases run the final observation in a
+  thread; late/stale calls use the coordinator's `_prepare` with a recorded alert.
+- Real-core acceptance added: audio before seal (10/15); worker claim while the seal is
+  held finds nothing until publication; Stop while the seal is held → STALE, nothing
+  claimable, `held_bytes` 0 (16); restart with the same id between seal and publish →
+  sealed evidence released (23); old tokens never touch a new candidate (24); seal past
+  the deadline → EXPIRED and released; blocked dispatch never delays the local warning
+  or the next candidate's evidence (3, fake blocking client); K2 without any worker;
+  overflow/resync cases 25, 26, 30; marker-apply failure → hold → view → publish, and the
+  expiry variant → never published, samples gone; reused episode id with a late old seal.
+- Tests (serial, fakes only, unique `--basetemp`): coordinator 19, integration 17, all
+  `test_private_parking_*` 231, evaluation worker 119, audio 62, video 100 — all passed;
+  full backend suite **1091 passed**, 1 Starlette `DeprecationWarning`; `pip check`
+  clean; `git diff --check` clean; new files end with a newline, no trailing whitespace.
+- Limitations: not wired into runtime (T3c); no real video, device, speaker or provider
+  request was run; mutation testing not run for T3b; the tee's latency depends on the
+  sinks' locks; held alerts are lost on overflow beyond 32 (their candidates expire).
+
+**T3b review delta 1 (Codex findings via PM, 2026-10-09; agent run, HEAD `a23fe62`, working tree)**
+- Tee cleanup failure: `FrameSinkTee.end_session` still tries every sink, then raises
+  `SessionCleanupError` (sanitized: count only, `from None`) when any sink did not end,
+  so VideoService keeps the tee pending → ERROR, `cleanup_ok=False`, a new session is
+  refused. The tee remembers, per session id, which sinks failed (the delta-1 bound evicted
+  the oldest entry — superseded by delta 2: obligations are never evicted), so the next explicit Stop ends only
+  the failed sinks — sinks that already ended are not ended again. `pending_cleanups()`
+  for diagnostics. Test through VideoService: a sink fails before ending A → ERROR,
+  `cleanup_ok=False`, B refused; the next Stop ends only that sink → IDLE, B accepted.
+- Coordinator `end_session`: no longer swallows a trigger failure — it raises
+  `SessionCleanupError` (sanitized); a second call retries the trigger.
+  **Gap (outside the assigned files, for T3c):** `DetectorService.end_session` clears its
+  active session id before calling the parking-trigger slot, so a VideoService retry
+  returns early and never re-calls the coordinator; the failure is reported once (ERROR)
+  but the retry reports success. The trigger is reset by its next `start_session`, so no
+  candidate survives into B, but the detector should keep the slot pending. Fix belongs
+  in `detector_service.py` (T3c or a separate authorization).
+- Resync after "applied, then exception": a view now takes its own newer `seq`
+  (`pop_markers` advances the marker seq when it issues a view; `upto_seq` = that seq), so
+  a requested view always supersedes every batch popped before it, even one the sampler
+  already applied, without waiting for a new episode transition. The sampler's ordering
+  rule is unchanged: a replayed older view (`upto_seq <= applied_seq`) is refused
+  (`views_stale`), replayed markers are skipped (`markers_stale`), older generations and
+  old-session tokens stay refused. Trigger test updated (overflow view `upto_seq` 6 → 7).
+  Real-core test: the sampler applies a batch and then the resync view, each followed by
+  an exception → the alert stays held; the next view (only the TRIGGERED marker emitted
+  in between) proves sync → the candidate is published and claimable; replaying the old
+  view/batch leaves episodes, frames, bytes and sealed evidence unchanged.
+  Mutation (agent run, scratch script, source restored): without the seq advance this
+  test fails.
+- Tests (serial, fakes only, unique `--basetemp`): coordinator 22, integration 18,
+  trigger 105, sampler 90, evaluation worker 119, audio 62, video 100 — all passed; full
+  backend suite **1095 passed**, 1 Starlette `DeprecationWarning`; `pip check` clean;
+  `git diff --check` clean; new files end with a newline, no trailing whitespace.
+
+**T3b review delta 2 — tee retry bound (PM message "perbaikan batas retry T3b", 2026-10-11; agent run, HEAD `a23fe62`, working tree)**
+Finding (self-review, confirmed by the PM): the delta-1 retry record evicted the oldest
+pending session at 8 entries, and `start_session` with the same id cleared it, so an
+unfinished cleanup obligation could disappear from the tee. Also D1/D2 doc corrections.
+- `FrameSinkTee` contract (public use: VideoService event-frame-buffer slot, one session
+  at a time — `start_session` → `offer`… → `end_session`, `end_session` repeated until it
+  stops raising):
+  - Obligations = the ACTIVE session (started, not ended) + sessions with sinks still to
+    end. Bounded by `max_pending_cleanups` (default 8, valid 1–64); **never evicted**.
+  - `start_session` reserves the slot the session's cleanup may need, so a failed end
+    always fits. Overflow: when another session is still active, when the same id still
+    has cleanup pending, or when all slots are taken, `start_session` raises
+    `FrameSinkAdmissionError` (sanitized reason, no ids) **before any sink is called**,
+    and counts `starts_refused_active` / `_pending` / `_capacity`. Ignored after close().
+  - `end_session` for an active or pending session always runs (also at full capacity
+    and after close()); it tries every sink still to end, keeps exactly the failed ones
+    pending and raises `SessionCleanupError`; a later call retries only those. A
+    successful cleanup frees the slot. `end_session` for a session the tee never started
+    is a no-op (no obligation).
+  - Start/end (with their sink calls) are serialized by a tee lifecycle lock, so two
+    cleanups of one session never race; `offer` does not take it.
+  - `get_diagnostics()` (counts only): `active_sessions`, `pending_sessions`,
+    `pending_sink_ends`, `free_slots`, `capacity`, refusal counters, `end_failures`,
+    `cleanups_completed`, `closed`.
+- VideoService behaviour (unchanged file): it treats the tee as an optional sink, so a
+  refused tee start is logged ("Unable to start event frame buffer session") and the
+  video session continues without buffer/evidence for that session; no sink was
+  touched. VideoService itself refuses a new session while a cleanup is pending (ERROR),
+  so in normal use the tee holds at most one obligation. Making a tee refusal fail the
+  video start would need a VideoService change (T3c decision).
+- Tests (`test_private_parking_coordinator.py`, 27): full capacity keeps every old
+  obligation (all still end, nothing evicted); an extra session — capacity full, same id
+  pending, another active — is refused before any sink starts; a retry at full capacity
+  never re-ends a sink that already ended; a successful cleanup frees its slot;
+  diagnostics count every open obligation without ids; existing tee tests now start a
+  session before ending it (an unknown session is a no-op); VideoService slot tests
+  unchanged and passing. Mutations (agent run, scratch script, source restored): no
+  capacity check → 3 failed; retry ends every sink → 3 failed; refusal after touching
+  sinks → 1 failed.
+- Tests (serial, fakes only, unique `--basetemp`): coordinator 27, integration 18 (incl.
+  the resync tests of delta 1), trigger 105, sampler 90, evaluation worker 119, audio 62,
+  video 100 — all passed; full backend suite **1100 passed**, 1 Starlette
+  `DeprecationWarning`; `pip check` clean; `git diff --check` clean; new files end with
+  a newline, no trailing whitespace.
+- Limitations: the tee's latency still depends on the sinks' locks (start/end also wait
+  on the tee lifecycle lock); a refused tee start does not stop the video (see above).
+
 **T3c — runtime wiring and mode**
 Files: `backend/app/services/runtime.py`, `backend/app/main.py`, `backend/.env.example`,
 integration tests.
 Scope: mode/config/local-clip variables, worker `enabled=False` in private mode until
 T3d, tee wiring, shutdown order.
+**Blocker before wiring (from T3b review delta 1, not fixed):** `DetectorService.end_session`
+clears its active session before calling the parking-trigger slot, so a failed
+coordinator `end_session` is never retried by VideoService's Stop. The coordinator must
+not be wired into the detector until a separately scoped fix in `detector_service.py`
+keeps that slot pending and retries it (PM: own scope before T3c wiring).
+**Prerequisite before private-mode start (from T3b review delta 2, not done):** VideoService
+treats a refused `FrameSinkTee.start_session` (`FrameSinkAdmissionError`) as an optional
+sink failure and keeps the video running without buffer/evidence. In private mode that
+refusal must propagate and fail the start (or block private mode) instead of running
+silently without evidence.
 Acceptance: 1, 2, 6, 8, 9 (pre-T3d), 11, 12, 14 with `FakeCapture`, fake dispatcher and
 fake audio device.
 
@@ -797,7 +965,24 @@ evidence was not included in the relay). Acceptance 24 and 30 finalised.
   records; T3b must pass each alert's own triple (see T3b).
 - **T3a2: completed — lifecycle only, reviewed PASS** (review deltas 1–2 applied; see
   "T3a2 results"; committed on the owner's instruction, 2026-10-08).
-- **T3b, T3c, T3d, T3e: not started, not authorized** — each waits for its own owner
+- **T3b: completed — core only** (PM decisions K1–K7, review deltas 1–2; see "T3b
+  results", "T3b review delta 1/2"). Committed on the PM instruction "penutupan dan commit
+  core T3b" (2026-10-11) as "feat: add private parking coordinator and bounded frame tee".
+  Not wired into runtime; private parking integration (T3) is not complete.
+  - Independent review (Codex via PM, 2026-10-11): **PASS** on the overflow delta
+    (delta 2); 420 fake-based tests passed, `pip check` clean, `git diff --check` and
+    whitespace checks passed (reviewer's run, relayed; not re-run by this agent).
+  - Full backend suite **1100 passed** (1 Starlette `DeprecationWarning`): implementer
+    run (agent, 2026-10-11, HEAD `a23fe62`, working tree), not an independent result.
+  - Closure check (agent run, 2026-10-11): all eight source/test blobs equal the
+    versions submitted for the delta-2 review (`git hash-object`), so no test was re-run.
+  - Not proven: runtime wiring, real video, webcam, speaker, provider requests.
+  - The 2026-10-09 re-review of delta 1 was a self-review by the implementing agent
+    (PASS WITH LIMITATIONS, findings D1/D2, both corrected), not an independent review.
+  - Open prerequisites for T3c (see T3c): (1) `DetectorService` cleanup retry for a
+    failed parking-trigger `end_session` (separate scope); (2) a refused tee start must
+    propagate to the private-mode start.
+- **T3c, T3d, T3e: not started, not authorized** — each waits for its own owner
   authorization (`docs/PLANS.md`).
 - Open for review: the deviations and limitations listed under "T3a1 results", the
   worker identity extension in "T3a1 delta 1", the episode-instance contract in

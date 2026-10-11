@@ -245,11 +245,14 @@ class CandidateToken:
     process, so a late call with an old token never matches a new candidate,
     even when a session id or event id is reused. ``episode_instance`` binds the
     token to the one episode instance it was issued for (episode ids may repeat;
-    instances never do), so it can never seal or change another episode."""
+    instances never do), so it can never seal or change another episode, and
+    ``event_id`` binds it to its one event, so it can never seal, release or plan
+    another event's evidence."""
 
     session_generation: int
     serial: int
     episode_instance: int | None = None
+    event_id: str | None = None
 
 
 class CandidateOutcome(str, enum.Enum):
@@ -312,6 +315,7 @@ class MarkerBatch:
     session_id: str | None
     session_generation: int
     upto_seq: int                      # every marker of this generation with seq <= upto_seq is covered
+                                       # (a view takes its own newer seq)
     markers: tuple[EpisodeMarker, ...]
     view: EvidenceView | None = None   # set (and markers empty) after an overflow
 
