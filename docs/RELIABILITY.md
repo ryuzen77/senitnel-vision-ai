@@ -17,6 +17,9 @@ sessions, pending evaluations and the per-process dispatch counter.
 | Audio device stop fails | Audio disabled until restart (`device_fault`) |
 | Audio lifecycle update fails | Gate fails closed for the process |
 | Invalid configuration | Only the affected feature is disabled |
+| Invalid `SENTINEL_PARKING_MODE`, or private mode with a missing/invalid config file | Parking candidates disabled (`DisabledParkingTrigger`), video keeps running, no fallback to legacy; generic warning without path or content |
+| Private mode: tee or detector refuses a start | Start refused (ERROR until Stop, HTTP 503); never a silent run without evidence |
+| Invalid or identical local warning clip | Local warning audio off with a fixed warning; the CRITICAL clip keeps working and is never used for the local warning |
 
 Timeouts:
 - Gemini HTTP timeout (`SENTINEL_GEMINI_TIMEOUT_SECONDS`): default 30 s, configurable

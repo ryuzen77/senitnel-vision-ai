@@ -1,7 +1,19 @@
-"""Production composition root for the single-worker application process."""
+"""Production composition root for the single-worker application process.
+
+Parking mode (T3c): ``SENTINEL_PARKING_MODE`` unset/``legacy`` keeps today's legacy
+parking trigger; ``private`` with a valid ``SENTINEL_PRIVATE_PARKING_CONFIG_FILE`` wires the
+private-parking coordinator, evidence sampler and frame tee (detector and tee required,
+evaluation disabled until the private prompt exists); any other value, or a missing or
+invalid private configuration, wires an explicitly disabled candidate path — never a
+fallback to legacy. Only that selection lives in :func:`build_parking_wiring`; the rest of
+this module is unchanged. Paths and configuration contents are never logged.
+"""
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+import dataclasses
+import hashlib
 import logging
 import math
 import os
@@ -11,13 +23,16 @@ import sys
 import threading
 import time
 
+from app.models.domain import DomainName
 from app.models.evaluation import EvaluationRequest
+from app.models.private_parking import MAX_CONFIG_BYTES, PrivateParkingConfig, parse_private_parking_config
 from app.services.clip_scene_runner import (
     DEFAULT_MODEL_ID,
     DEFAULT_MODEL_REVISION,
     make_clip_scene_runner_factory,
 )
 from app.services.detector_service import DetectorService
+from app.services.disabled_parking_trigger import DisabledParkingTrigger
 from app.services.domain_service import domain_service
 from app.services.audio_alert_service import (
     DEFAULT_COOLDOWN_SECONDS, MAX_ALERT_SECONDS, MAX_COOLDOWN_SECONDS, MIN_COOLDOWN_SECONDS,
@@ -30,6 +45,9 @@ from app.services.gemini_evaluation_client import GeminiEvaluationClient, Gemini
 from app.services.langflow_evaluation_client import LangflowDispatchRejected, LangflowEvaluationClient
 from app.services.scene_domain_classifier import SceneDomainClassifier
 from app.services.parking_candidate_trigger import ParkingCandidateTrigger
+from app.services.private_parking_coordinator import FrameSinkTee, PrivateParkingCoordinator
+from app.services.private_parking_evidence_sampler import EpisodeEvidenceSampler
+from app.services.private_parking_trigger import PrivateParkingTrigger
 from app.services.tracker_service import TrackerService
 from app.services.video_service import VideoService
 
@@ -123,8 +141,69 @@ def _evaluation_max_dispatches() -> tuple[bool, int | None]:
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
 
 
+def _validated_clip(raw_path: str) -> tuple[Path, float] | None:
+    """A readable PCM WAV outside the repository within the duration limit, or None."""
+    try:
+        path = Path(raw_path).resolve(strict=True) if raw_path.strip() else None
+    except (OSError, RuntimeError):
+        path = None
+    duration = probe_wav_duration(path) if path is not None and path.is_file() else None
+    if (path is None or path.is_relative_to(_REPOSITORY_ROOT)
+            or duration is None or duration > MAX_ALERT_SECONDS):
+        return None
+    return path, duration
+
+
+def _file_digest(path: Path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 16), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _same_asset(first: Path, second: Path) -> bool:
+    """True when both resolved paths reach the same file or byte-identical content.
+    In memory only; nothing about the files is logged. Unprovable → treated as same."""
+    if first == second:
+        return True
+    try:
+        if os.path.samefile(first, second):
+            return True
+        if first.stat().st_size != second.stat().st_size:
+            return False
+        return _file_digest(first) == _file_digest(second)
+    except OSError:
+        return True
+
+
+def _local_alert_clip(critical_path: Path) -> tuple[str, float] | None:
+    """The separate local-warning clip (O5), or None. Never the CRITICAL asset; an
+    invalid local clip disables only the local warning."""
+    raw = os.getenv("SENTINEL_AUDIO_LOCAL_ALERT_FILE", "")
+    if not raw.strip():
+        return None
+    clip = _validated_clip(raw)
+    if clip is None:
+        logger.warning("Local audio alert disabled: invalid local clip configuration")
+        return None
+    if _same_asset(clip[0], critical_path):
+        logger.warning("Local audio alert disabled: the local clip must differ from the CRITICAL clip")
+        return None
+    return str(clip[0]), clip[1]
+
+
 def _create_audio_alert_gate() -> AudioAlertGate | None:
-    """Optional CRITICAL-only local alert. Any invalid setting disables audio only."""
+    """Optional local alert gate (CRITICAL clip + optional separate local clip). Any
+    invalid setting disables audio only; an invalid local clip disables only the local
+    warning and never the valid CRITICAL clip."""
+    gate = _build_audio_alert_gate()
+    if gate is None and os.getenv("SENTINEL_AUDIO_LOCAL_ALERT_FILE", "").strip():
+        logger.warning("Local audio alert unused: audio alerts are disabled")
+    return gate
+
+
+def _build_audio_alert_gate() -> AudioAlertGate | None:
     enabled = os.getenv("SENTINEL_AUDIO_ALERT_ENABLED")
     if enabled is None or enabled == "false":
         return None
@@ -142,28 +221,120 @@ def _create_audio_alert_gate() -> AudioAlertGate | None:
     if not math.isfinite(cooldown) or not MIN_COOLDOWN_SECONDS <= cooldown <= MAX_COOLDOWN_SECONDS:
         logger.warning("Audio alert disabled: invalid cooldown configuration")
         return None
-    raw_path = os.getenv("SENTINEL_AUDIO_ALERT_FILE", "")
-    try:
-        path = Path(raw_path).resolve(strict=True) if raw_path.strip() else None
-    except (OSError, RuntimeError):
-        path = None
-    duration = probe_wav_duration(path) if path is not None and path.is_file() else None
-    if (path is None or path.is_relative_to(_REPOSITORY_ROOT)
-            or duration is None or duration > MAX_ALERT_SECONDS):
+    clip = _validated_clip(os.getenv("SENTINEL_AUDIO_ALERT_FILE", ""))
+    if clip is None:
         logger.warning("Audio alert disabled: invalid alert file configuration")
         return None
-    return AudioAlertGate(WinsoundDevice(), str(path), duration, cooldown_seconds=cooldown)
+    path, duration = clip
+    local = _local_alert_clip(path)
+    local_kwargs = {} if local is None else {"local_wav_path": local[0], "local_duration_seconds": local[1]}
+    return AudioAlertGate(WinsoundDevice(), str(path), duration, cooldown_seconds=cooldown, **local_kwargs)
+
+
+# ── parking mode selection (T3c) ─────────────────────────────────────────────
+
+PARKING_MODES = ("legacy", "private")
+PRIVATE_REQUIRED_SINKS = frozenset({"event frame buffer", "detector"})
+
+
+def _parking_mode(env: Mapping[str, str]) -> str:
+    """``legacy`` (default) | ``private`` | ``disabled`` (invalid value; no fallback)."""
+    raw = env.get("SENTINEL_PARKING_MODE")
+    if raw is None or raw == "legacy":
+        return "legacy"
+    if raw == "private":
+        return "private"
+    logger.warning("Parking candidates disabled: invalid parking mode")
+    return "disabled"
+
+
+def _read_private_parking_config(env: Mapping[str, str]) -> PrivateParkingConfig | None:
+    """Read SENTINEL_PRIVATE_PARKING_CONFIG_FILE once (size-capped) and validate it.
+    Neither the path nor the content is logged."""
+    raw = env.get("SENTINEL_PRIVATE_PARKING_CONFIG_FILE", "")
+    config = None
+    if raw.strip():
+        try:
+            with open(raw, "rb") as handle:
+                data = handle.read(MAX_CONFIG_BYTES + 1)
+        except OSError:
+            data = None
+        if data is not None and len(data) <= MAX_CONFIG_BYTES:
+            # Fail closed at the parse boundary only: undecodable bytes or numbers the
+            # parser cannot convert (e.g. a 10**350 integer → OverflowError) disable the
+            # private path; service construction errors elsewhere are NOT caught here.
+            try:
+                config = parse_private_parking_config(data.decode("utf-8"))
+            except (UnicodeDecodeError, ValueError, TypeError, OverflowError, RecursionError):
+                config = None
+    if config is None:
+        logger.warning("Private parking disabled: invalid configuration")
+    return config
+
+
+@dataclasses.dataclass(frozen=True)
+class ParkingWiring:
+    """The mode-dependent objects of the composition (everything else is shared)."""
+
+    mode: str                                  # "legacy" | "private" | "disabled"
+    detector_slot: object                      # the detector's parking-trigger slot
+    worker_trigger: object                     # the evaluation worker's candidate trigger
+    buffer_slot: object                        # VideoService's event-frame-buffer slot
+    bundle_source: object                      # the evaluation worker's bundle source
+    candidate_strategies: dict | None
+    required_sinks: frozenset
+    worker_enabled_override: bool | None       # None: the evaluation configuration decides
+    private_trigger: PrivateParkingTrigger | None = None
+    sampler: EpisodeEvidenceSampler | None = None
+    coordinator: PrivateParkingCoordinator | None = None
+    tee: FrameSinkTee | None = None
+
+
+def build_parking_wiring(env: Mapping[str, str], *, event_frame_buffer: EventFrameBuffer,
+                         audio_gate: AudioAlertGate | None, clock=time.monotonic) -> ParkingWiring:
+    """Select the parking objects for ``env`` (pure apart from reading the private
+    configuration file once). Private: the coordinator in the detector slot, the tee
+    (EventFrameBuffer + sampler) in the buffer slot, the SAMPLER as the only bundle
+    source, detector and tee required, evaluation disabled until the private prompt
+    (T3d). Invalid mode/config: one DisabledParkingTrigger, never the legacy trigger."""
+    mode = _parking_mode(env)
+    if mode == "legacy":
+        trigger = ParkingCandidateTrigger()
+        return ParkingWiring("legacy", trigger, trigger, event_frame_buffer, event_frame_buffer,
+                             None, frozenset(), None)
+    config = _read_private_parking_config(env) if mode == "private" else None
+    if config is None:
+        disabled = DisabledParkingTrigger()
+        return ParkingWiring("disabled", disabled, disabled, event_frame_buffer, event_frame_buffer,
+                             None, frozenset(), False)
+    # No gesture/authorization source exists yet: every unauthorized approach warns.
+    private_trigger = PrivateParkingTrigger(config, clock=clock)
+    sampler = EpisodeEvidenceSampler(clock=clock)
+    coordinator = PrivateParkingCoordinator(private_trigger, sampler, audio_gate=audio_gate)
+    tee = FrameSinkTee(event_frame_buffer, sampler)
+    return ParkingWiring(
+        "private", coordinator, private_trigger, tee, sampler,
+        {DomainName.PARKING_MOTORCYCLE: sampler.plan_for_candidate},
+        PRIVATE_REQUIRED_SINKS, False,
+        private_trigger=private_trigger, sampler=sampler, coordinator=coordinator, tee=tee,
+    )
 
 # This is the one shared production GPU gate.  It is injected, never looked up
 # by worker modules, so capture/MJPEG paths cannot acquire it accidentally.
 shared_cuda_gate = threading.Lock()
 
 tracker_service = TrackerService()
-parking_candidate_trigger = ParkingCandidateTrigger()
+event_frame_buffer = EventFrameBuffer()
+audio_alert_gate = _create_audio_alert_gate()
+parking_wiring = build_parking_wiring(os.environ, event_frame_buffer=event_frame_buffer,
+                                      audio_gate=audio_alert_gate)
+# Legacy: the ParkingCandidateTrigger; private: the private trigger; disabled: the
+# DisabledParkingTrigger. The detector slot holds the coordinator in private mode.
+parking_candidate_trigger = parking_wiring.worker_trigger
 detector_service = DetectorService(
     result_consumer=domain_service,
     tracker=tracker_service,
-    parking_trigger=parking_candidate_trigger,
+    parking_trigger=parking_wiring.detector_slot,
     domain_snapshot_provider=domain_service.get_snapshot,
     cuda_gate=shared_cuda_gate,
 )
@@ -173,7 +344,6 @@ scene_domain_classifier = SceneDomainClassifier(
     clock=time.monotonic,
     scene_model=f"{DEFAULT_MODEL_ID}@{DEFAULT_MODEL_REVISION}",
 )
-event_frame_buffer = EventFrameBuffer()
 evaluation_callback_timeout_seconds = _evaluation_callback_timeout_seconds()
 effective_callback_timeout_seconds = evaluation_callback_timeout_seconds or 45.0
 evaluation_budget = EvaluationBudget(
@@ -193,29 +363,35 @@ transport_ready = (_external_evaluation_enabled(langflow_client) if evaluation_t
 evaluation_enabled = (transport_ready
                       and evaluation_callback_timeout_seconds is not None
                       and evaluation_max_dispatches_valid)
-audio_alert_gate = _create_audio_alert_gate()
 evaluation_worker = EvaluationWorker(
-    parking_candidate_trigger, evaluation_budget, event_frame_buffer,
+    parking_wiring.worker_trigger, evaluation_budget, parking_wiring.bundle_source,
     evaluation_client if evaluation_client is not None else _UnavailableDispatcher(),
     callback_timeout_seconds=effective_callback_timeout_seconds,
-    enabled=evaluation_enabled,
+    enabled=(evaluation_enabled if parking_wiring.worker_enabled_override is None
+             else parking_wiring.worker_enabled_override),
     max_dispatches=evaluation_max_dispatches,
     audio_gate=audio_alert_gate,
+    candidate_strategies=parking_wiring.candidate_strategies,
 )
 video_service = VideoService(
     detector=detector_service,
     scene_classifier=scene_domain_classifier,
-    event_frame_buffer=event_frame_buffer,
+    event_frame_buffer=parking_wiring.buffer_slot,
     evaluation_worker=evaluation_worker,
+    required_sinks=parking_wiring.required_sinks,
 )
 
 
 def shutdown_services(
     video, scene, detector, parking_trigger, tracker, frame_buffer=None,
     *, evaluation_worker=None, langflow_client=None, evaluation_budget=None,
-    audio_alert=None,
+    audio_alert=None, coordinator=None, frame_tee=None, sampler=None,
 ) -> None:  # noqa: ANN001
-    """Stop the worker before its client; in-flight request errors stay isolated."""
+    """Stop the worker before its client; in-flight request errors stay isolated.
+
+    Private mode (T3c): the detector ends the coordinator's obligations first, then the
+    coordinator closes, then its trigger (``parking_trigger``; the coordinator never
+    closes its dependencies), and the tee before the buffer and the sampler."""
     video.stop()
     if audio_alert is not None:
         audio_alert.close()  # drops the slot, signals cancel; join <= 2 s outside every lock
@@ -225,9 +401,15 @@ def shutdown_services(
         langflow_client.close()
     scene.close()
     detector.close()
+    if coordinator is not None:
+        coordinator.close()
     parking_trigger.close()
     tracker.close()
+    if frame_tee is not None:
+        frame_tee.close()
     if frame_buffer is not None:
         frame_buffer.close()
+    if sampler is not None:
+        sampler.close()
     if evaluation_budget is not None:
         evaluation_budget.close()

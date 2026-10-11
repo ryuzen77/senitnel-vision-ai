@@ -17,6 +17,7 @@ from app.services.runtime import (
     evaluation_client,
     evaluation_worker,
     parking_candidate_trigger,
+    parking_wiring,
     scene_domain_classifier,
     shutdown_services,
     tracker_service,
@@ -93,6 +94,10 @@ async def lifespan(app: FastAPI):  # noqa: ANN001
         langflow_client=evaluation_client,  # the one active transport client
         evaluation_budget=evaluation_budget,
         audio_alert=audio_alert_gate,
+        # Private parking (T3c); None in legacy and disabled modes.
+        coordinator=parking_wiring.coordinator,
+        frame_tee=parking_wiring.tee,
+        sampler=parking_wiring.sampler,
     )
 
 

@@ -44,16 +44,22 @@ VideoService (capture thread, JPEG once, MJPEG slot)            video_service.py
 | Current evaluation view | `GET /api/evaluation/current` | runtime |
 | Local audio alert gate | `services/audio_alert_service.py` | runtime, off by default |
 | Retail trigger (ROI zones) + retail plan/strategy | `services/retail_candidate_trigger.py`, `models/event_frame.py` | core only (no router/runtime) |
-| Private parking trigger (T1) | `services/private_parking_trigger.py`, `models/private_parking.py`, `services/private_parking_authorization.py` | core only |
-| Private parking evidence sampler (T2) | `services/private_parking_evidence_sampler.py`, `models/private_parking_evidence.py` | core only |
-| Private parking integration (T3) | — | planned, draft: [`docs/exec-plans/active/t3-private-parking-integration.md`](docs/exec-plans/active/t3-private-parking-integration.md) |
+| Private parking trigger (T1) | `services/private_parking_trigger.py`, `models/private_parking.py`, `services/private_parking_authorization.py` | runtime in `SENTINEL_PARKING_MODE=private` (off by default); no authorization source |
+| Private parking evidence sampler (T2) | `services/private_parking_evidence_sampler.py`, `models/private_parking_evidence.py` | runtime in private mode (fed by the tee; the only private bundle source) |
+| Private parking coordinator + frame tee (T3b) | `services/private_parking_coordinator.py` | runtime in private mode |
+| Parking mode selection (T3c) | `services/runtime.py` (`build_parking_wiring`), `services/disabled_parking_trigger.py` | runtime; private dispatch off until T3d; see [`docs/exec-plans/active/t3-private-parking-integration.md`](docs/exec-plans/active/t3-private-parking-integration.md) |
 | Frontend dashboard | `frontend/src/` | runtime; see [`docs/FRONTEND.md`](docs/FRONTEND.md) |
 
 ## 3. Domains and modes
 
 `DomainName`: `UNKNOWN`, `PARKING_MOTORCYCLE`, `RETAIL_STORE`. The domain is locked
 once per session. **Private parking is a mode of `PARKING_MOTORCYCLE`**, not a fourth
-domain; it is core only today. A cashier domain does not exist.
+domain, selected by `SENTINEL_PARKING_MODE` (unset/`legacy` = the legacy parking trigger;
+`private` = coordinator + private trigger + evidence sampler + frame tee, detector and tee
+required, evaluation off until the private prompt (T3d); any other value or an invalid
+private configuration = an explicitly disabled candidate path, never a fallback to
+legacy). No gesture/authorization source exists, so every unauthorized approach warns;
+real-device use waits for it (O1). A cashier domain does not exist.
 
 ## 4. Contracts that matter
 
@@ -81,14 +87,16 @@ domain; it is core only today. A cashier domain does not exist.
   first-wins with cooldown; Stop/new session cancels; a failed device stop disables
   audio until restart. An offer is not proof a sound was heard.
 
-### Local access warning vs CRITICAL assessment (private mode, core only)
+### Local access warning vs CRITICAL assessment (private mode)
 
 These are two different signals and must stay separate:
 - **Local access warning**: a rule outcome of the private-parking trigger — an
   episode that crossed the entry line without authorization was confirmed close to a
   parked motorcycle. It is issued by the local rule without waiting for a model or
   evidence, and is not a threat score. Its end-to-end latency (target under one
-  second) is unverified; the private parking → speaker path is not wired.
+  second) is unverified; in private mode the coordinator offers it to the audio gate
+  with the separate local clip (`SENTINEL_AUDIO_LOCAL_ALERT_FILE`), tested with fakes only
+  — no real speaker run and no local clip asset yet.
 - **CRITICAL assessment**: a validated model result for the same event, possibly
   seconds later, possibly NORMAL. It never upgrades or replaces the warning, and the
   warning never fabricates a CRITICAL.
@@ -111,7 +119,9 @@ Invalid values disable the affected feature and log a generic warning without th
 value. Key switches: `SENTINEL_EVALUATION_TRANSPORT` (`langflow` default | `gemini`),
 `SENTINEL_GEMINI_*`, `SENTINEL_LANGFLOW_*`, `SENTINEL_CALLBACK_TOKEN`,
 `SENTINEL_EVALUATION_CALLBACK_TIMEOUT_SECONDS` (45), `SENTINEL_EVALUATION_MAX_DISPATCHES`,
-`SENTINEL_AUDIO_ALERT_*`, `SENTINEL_CLIP_MODEL_*`, `SENTINEL_VIDEO_STARTUP_TIMING_ENABLED`.
+`SENTINEL_AUDIO_ALERT_*`, `SENTINEL_AUDIO_LOCAL_ALERT_FILE`, `SENTINEL_PARKING_MODE`,
+`SENTINEL_PRIVATE_PARKING_CONFIG_FILE` (local JSON read once at startup; path and content
+never logged), `SENTINEL_CLIP_MODEL_*`, `SENTINEL_VIDEO_STARTUP_TIMING_ENABLED`.
 
 ## 7. Threads and locks
 

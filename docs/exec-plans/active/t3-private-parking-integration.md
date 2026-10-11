@@ -3,8 +3,8 @@
 Code baseline `36ffa20` (T2 sampler); plan HEAD `7c41672` (H1 docs). §4.1 records the
 facts before T3a1. §4.2, §4.4, §4.5, §4.6 and §4.7 describe trigger, sampler, worker and
 audio-gate contracts as implemented by T3a1 (completed, core only, not wired into runtime).
-§4.3 (`VideoService` lifecycle) is implemented by T3a2 (completed — lifecycle only). §4.2 alert sequence and §4.4 resync application are implemented by T3b (completed — core only: coordinator and tee, not wired). The T3c lifecycle prerequisites are implemented and committed: T3c0.1 (`e50d9e2`, detector cleanup/lease/delivery) and T3c0.2 (`d479357`, VideoService required-sink/refusal capability, token-bound upload rollback, capture cleanup). The rest of §4.8 — private-mode configuration and runtime wiring — is planned for T3c; T3c wiring, T3d and T3e code does not exist.
-Status: see §8 — **rev 13: design PASS WITH LIMITATIONS (owner-reported); T3a1 completed — core only (reviewed PASS WITH LIMITATIONS, Codex via owner; committed as "feat: prepare private parking integration contracts"); T3a2 completed — lifecycle only (reviewed PASS; committed as "fix: isolate video session lifecycle and cleanup"); T3b completed — core only (coordinator and bounded tee; independent review PASS on the overflow delta; committed as "feat: add private parking coordinator and bounded frame tee"); T3c0.1 completed (`e50d9e2`) and T3c0.2 completed (`d479357`) — lifecycle prerequisites, reviewed PASS WITH LIMITATIONS; private parking not wired into runtime; T3c (wiring and mode), T3d and T3e not started, not authorized. T3 as a whole is not complete.**
+§4.3 (`VideoService` lifecycle) is implemented by T3a2 (completed — lifecycle only). §4.2 alert sequence and §4.4 resync application are implemented by T3b (completed — core only: coordinator and tee, not wired). The T3c lifecycle prerequisites are implemented and committed: T3c0.1 (`e50d9e2`, detector cleanup/lease/delivery) and T3c0.2 (`d479357`, VideoService required-sink/refusal capability, token-bound upload rollback, capture cleanup). The rest of §4.8 — private-mode configuration and runtime wiring — is T3c: completed — fake integration verified (committed as "feat: wire private parking runtime with fail-closed configuration"); not proven on a real device. T3d and T3e code does not exist.
+Status: see §8 — **rev 13: design PASS WITH LIMITATIONS (owner-reported); T3a1 completed — core only (reviewed PASS WITH LIMITATIONS, Codex via owner; committed as "feat: prepare private parking integration contracts"); T3a2 completed — lifecycle only (reviewed PASS; committed as "fix: isolate video session lifecycle and cleanup"); T3b completed — core only (coordinator and bounded tee; independent review PASS on the overflow delta; committed as "feat: add private parking coordinator and bounded frame tee"); T3c0.1 completed (`e50d9e2`) and T3c0.2 completed (`d479357`) — lifecycle prerequisites, reviewed PASS WITH LIMITATIONS; T3c (wiring and mode) completed — fake integration verified (committed as "feat: wire private parking runtime with fail-closed configuration"); not proven on a real device; T3d and T3e not started, not authorized. T3 as a whole is not complete.**
 
 ## 1. Goal
 
@@ -810,7 +810,7 @@ and prompt stay in T3c/T3d; the two T3c prerequisites below remain open.
   `test_private_parking_*` 231, evaluation worker 119, audio 62, video 100 — all passed;
   full backend suite **1091 passed**, 1 Starlette `DeprecationWarning`; `pip check`
   clean; `git diff --check` clean; new files end with a newline, no trailing whitespace.
-- Limitations: not wired into runtime (T3c); no real video, device, speaker or provider
+- Limitations: not wired into runtime at that time (historical; T3c since completed, fake integration verified); no real video, device, speaker or provider
   request was run; mutation testing not run for T3b; the tee's latency depends on the
   sinks' locks; held alerts are lost on overflow beyond 32 (their candidates expire).
 
@@ -910,7 +910,7 @@ not a proven wait bound; (3) the delivery-versus-lifecycle test proves that end 
 already waiting for the delivery before start B runs. Authorization (historical, as of
 that message): **only T3c0.1** was authorized; T3c0.2, T3c wiring, prompt, gesture and
 frontend were not. T3c0.2 was authorized later (rev 5 final) and completed in `d479357`;
-T3c wiring, prompt, gesture and frontend remain unauthorized.
+(Historical, as of that step: T3c wiring was not yet authorized; it was authorized later and is now completed, fake integration verified.) Prompt, gesture and frontend remain unauthorized.
 
 Rev 4 delta: detector frame/job binding to a generation with an atomic
 delivery-versus-invalidation point (closes the detector blocker); standalone T3c0.1
@@ -923,7 +923,7 @@ aligned with the lease contract implemented and committed in T3c0.1 — see "T3c
 alignment with the implemented T3c0.1 contract". Runtime wiring is not part of it.
 
 Rev 5 final (PM message "finalisasi rencana dan implementasi T3c0.2", 2026-10-11):
-**T3c0.2 authorized** (since completed in `d479357`); T3c wiring NOT authorized. The
+**T3c0.2 authorized** (since completed in `d479357`); T3c wiring NOT authorized (historical, at that step). The
 DetectorService cleanup retry is done (T3c0.1, commit `e50d9e2`). Added rule A8 (sanitized lifecycle/rollback logging)
 and acceptance 17 (synthetic id/token/path never logged or returned).
 
@@ -1342,7 +1342,7 @@ rev 3"; TQ1 restated as the lease boundary above):
 **T3c0.1 — completed, commit `e50d9e2`** (independent review PASS WITH LIMITATIONS;
 committed on the PM instruction "penutupan dan commit T3c0.1", 2026-10-11, as "fix:
 preserve detector cleanup and isolate stale delivery"). At that time T3c0.2 was not done
-(historical; completed later in `d479357`); runtime wiring is NOT done.
+(historical; completed later in `d479357`); runtime wiring was NOT done at that time (historical; T3c is now completed, fake integration verified).
 - Independent review (Codex via PM, 2026-10-11): **PASS WITH LIMITATIONS**; 74 target
   tests and 1,110 full backend tests passed; `pip check` and diff/whitespace checks
   clean; the mutation testing and the stability repetitions below were NOT reproduced by
@@ -1425,7 +1425,7 @@ committed on the PM instruction "finalisasi dan commit T3c0.2", 2026-10-11, as "
 isolate video start rollback and retain capture cleanup"). Completed here: the
 required-sink/refusal CAPABILITY of VideoService (`required_sinks`, refusal → ERROR until
 Stop, HTTP 503), leases, safe RUNNING publication, token-bound upload rollback and
-single-owner capture cleanup. NOT done (T3c): private-mode configuration (passing
+single-owner capture cleanup. NOT done at that time (historical; since completed in T3c, fake integration verified): private-mode configuration (passing
 `required_sinks={"event frame buffer", "detector"}`), tee/coordinator wiring and mode
 selection in runtime.
 - Independent review (Codex via PM, 2026-10-11): **PASS WITH LIMITATIONS**; 216 target
@@ -1500,7 +1500,7 @@ plan and `PLAN.md`.
   241, detection API 5, domain API 6, evaluation worker 119, audio 62 — all passed; full
   backend suite **1131 passed**, 1 Starlette `DeprecationWarning`; `pip check` clean; `git
   diff --check` clean; new files without trailing whitespace, ending with a newline.
-- Limitations: not wired into runtime (T3c decides `required_sinks` and the tee); no
+- Limitations: not wired into runtime at that time (historical; T3c since completed, fake integration verified, decides `required_sinks` and the tee); no
   server, real webcam, real file decoding, device or provider run (route coroutines were
   called directly, not through an HTTP server); leases reach only lease-aware sinks
   (scene classifier, evaluation worker and EventFrameBuffer stay id-only); a lifecycle
@@ -1613,6 +1613,357 @@ Files: `backend/app/services/runtime.py`, `backend/app/main.py`, `backend/.env.e
 integration tests.
 Scope: mode/config/local-clip variables, worker `enabled=False` in private mode until
 T3d, tee wiring, shutdown order.
+
+*T3c plan aligned with the source at `05a95b8`* — **rev 3** (plan only, 2026-10-11, PM
+messages "commit koreksi status dan siapkan rencana T3c", "revisi desain wiring T3c" and
+"delta terakhir desain T3c"). Rev 3 adds the audio factory extension for the local clip;
+the mode-selection builder stays limited. Design review: **PASS WITH LIMITATIONS**
+(independent reviewer, Codex via PM message "implementasi T3c", 2026-10-11).
+**T3c authorized and in progress** (same message); gesture, T3d prompt, configuration UI,
+real voice assets and provider/device tests stay out of scope.
+
+Source facts used (read, not run):
+- `runtime.py` builds module-level singletons from `os.environ` at import:
+  `ParkingCandidateTrigger` in the detector's parking-trigger slot, `EventFrameBuffer`
+  directly in VideoService's buffer slot, `EvaluationWorker(parking_candidate_trigger,
+  budget, event_frame_buffer, client, enabled=..., audio_gate=...)`, `VideoService(...)`
+  without `required_sinks`, `DetectorService` with the production (YOLO) model factory.
+  `shutdown_services(video, scene, detector, parking_trigger, tracker, frame_buffer, ...)`;
+  `main.py` lifespan starts worker and gate. `test_evaluation_runtime_integration.py`
+  imports `runtime` in a subprocess with a prepared env.
+- The worker's third argument is its bundle source: it calls only
+  `wait_for_bundle(plan, timeout)` and `get_snapshot().source_session_id` on it.
+  `EpisodeEvidenceSampler` implements both (`wait_for_bundle` never waits; missing evidence
+  → `INSUFFICIENT_HISTORY`, closed → `CLOSED`, other session → `SESSION_MISMATCH`), and
+  `plan_for_candidate` maps FAILED/EXPIRED/RELEASED/MISSING to `PlanUnavailable`.
+- Worker `CandidateTrigger` Protocol: `wait_for_candidate(timeout)`, `wake_waiters()`,
+  `claim_next_candidate(now)`, `complete(event_id, now)`, `fail(event_id, now)`,
+  `get_snapshot()` (`source_session_id`, `pending_event_id`); the worker calls
+  `wake_waiters()` on close. Detector `ParkingCandidateConsumer` Protocol:
+  `start_session`, `observe(domain, tracks)`, `end_session`, `close`.
+- `parse_private_parking_config(str)`: JSON ≤ 4096 bytes, fail-closed → None;
+  `PrivateParkingTrigger(config, authorization=None)` acts only while the domain is LOCKED
+  `PARKING_MOTORCYCLE`; an alert needs a crossing (ENTERED) AND a confirmed approach to a
+  configured motor zone while unauthorized.
+- Detector and tee are lease-aware; VideoService passes `lease=session.token`;
+  `required_sinks` refusal → ERROR until Stop, 503. `AudioAlertGate.offer_local` never
+  waits; the gate exists only with `SENTINEL_AUDIO_ALERT_ENABLED=true` and a valid CRITICAL
+  clip outside the repository.
+
+Configuration (O1, O2, O5; **C1 recorded**):
+- `SENTINEL_PARKING_MODE`: unset or `legacy` → today's runtime, unchanged (private mode OFF
+  by default); `private` → private mode; any other value → parking candidate path DISABLED
+  (see "Disabled composition"), video runs, generic warning without the value.
+- **C1 (PM decision, 2026-10-11): `SENTINEL_PRIVATE_PARKING_CONFIG_FILE`** — a local JSON
+  file read ONCE at startup (size-capped read of at most 4096 + 1 bytes, UTF-8) and
+  validated by `parse_private_parking_config`. Neither the path nor the content is ever
+  logged (warning: "Private parking disabled: invalid configuration"). Unset, unreadable,
+  too large or invalid → Disabled composition, never the legacy trigger. Setting the
+  line/zones in a UI stays a separate task.
+- `SENTINEL_AUDIO_LOCAL_ALERT_FILE` (O5): read by the audio factory (see "Audio factory
+  extension"); missing/invalid → local audio off with a diagnostic, the CRITICAL clip
+  stays as configured and is never a fallback for the local warning.
+
+Audio factory extension (rev 3; in `runtime._create_audio_alert_gate`, no change to
+`audio_alert_service.py`):
+- Source fact: `AudioAlertGate(device, wav_path, duration, local_wav_path=None,
+  local_duration_seconds=None)` already plays the local clip for `offer_local` and drops a
+  local offer without a local clip (`dropped_no_local_clip`, never the CRITICAL clip). Its
+  constructor RAISES `ValueError` when the local path lexically equals the CRITICAL path
+  (`_same_path`) — passing such a path would fail the whole gate and silence the valid
+  CRITICAL clip. The factory therefore validates the local clip BEFORE constructing the
+  gate and only ever drops the local part.
+- Order: (1) the existing enable flag, platform, cooldown and CRITICAL-clip checks run
+  unchanged — any failure there disables audio exactly as today (legacy behaviour); (2)
+  only with a valid CRITICAL clip, `_local_alert_clip(critical_path)` evaluates
+  `SENTINEL_AUDIO_LOCAL_ALERT_FILE`: unset → no local clip, no warning; otherwise the same
+  rules as the CRITICAL clip (`Path.resolve(strict=True)`, regular file, outside the
+  repository, `probe_wav_duration` not None and ≤ `MAX_ALERT_SECONDS`) plus "not the
+  CRITICAL asset"; (3) the gate is built with `local_wav_path`/`local_duration_seconds` only
+  when the local clip passed, otherwise without them. If the local variable is set while
+  audio is disabled, one warning says the local clip is unused (no path).
+- Same-asset detection without printing paths: after both paths resolved strictly
+  (symlinks, `..`, case resolved by the OS), the local clip is "the CRITICAL asset" when
+  (a) the resolved paths are equal, or (b) `os.path.samefile` is true (same file reached
+  through a hard link, a different spelling or a short name), or (c) the two files have the
+  same size and the same SHA-256 digest (a byte-identical copy of the CRITICAL clip). The
+  comparison happens in memory; only booleans are used. Diagnostic text is fixed:
+  "Local audio alert disabled: invalid local clip configuration" or "...: the local clip
+  must differ from the CRITICAL clip" — never the path, file name, digest or size.
+- Unchanged: one device owner, shared first-wins slot and cooldown, per-event dedup across
+  local and CRITICAL, Stop/new-session cancel, `fail_closed` (O3).
+
+Private composition (mode `private`, valid config):
+- `private_trigger = PrivateParkingTrigger(config, authorization=None)`;
+  `sampler = EpisodeEvidenceSampler()`;
+  `coordinator = PrivateParkingCoordinator(private_trigger, sampler, audio_gate=gate)`;
+  detector parking-trigger slot = `coordinator`;
+  VideoService buffer slot = `FrameSinkTee(event_frame_buffer, sampler)` — frames reach both;
+  `required_sinks={"event frame buffer", "detector"}` (O-P1).
+- **Bundle source (rev 2):** `EvaluationWorker(private_trigger, budget, sampler, client,
+  enabled=False, candidate_strategies={PARKING_MOTORCYCLE: sampler.plan_for_candidate},
+  audio_gate=gate)` — the SAMPLER is the worker's bundle source. The `EventFrameBuffer`
+  keeps being fed through the tee (compatibility, O2) but is never a source of private
+  evidence: no router, no fallback. Missing/expired/released evidence fails explicitly
+  (`PlanUnavailable` → `EVIDENCE_UNAVAILABLE`, or a non-ready `BundleDecision`), with zero
+  `EventFrameBuffer.wait_for_bundle` calls. `enabled=False` until T3d (O4): no claim, no
+  budget, no dispatch; candidates expire after their TTL (O6); the local warning is
+  independent of evaluation.
+Disabled composition (invalid mode value; `private` with missing/invalid config):
+- New `DisabledParkingTrigger` (one small module) that satisfies BOTH Protocols:
+  `start_session`/`end_session` record nothing claimable; `observe` ignores input
+  (counted); `claim_next_candidate` → None; `complete`/`fail` → False; `get_snapshot()` →
+  `source_session_id=None`, `pending_event_id=None`; `wait_for_candidate(timeout)` blocks on
+  its own condition until `wake_waiters()`, `close()` or the timeout, then returns False
+  (no busy loop); `wake_waiters()` notifies; `close()` is idempotent, wakes waiters, and
+  later `start_session` raises a sanitized refusal. It is placed in the detector slot and
+  given to the worker (`enabled=False`, bundle source `EventFrameBuffer`, never reached).
+  Neither `None` nor the legacy trigger is used as a silent substitute.
+- Buffer slot = `EventFrameBuffer` directly (still fed); `required_sinks` empty; video runs.
+Leases: no configuration — VideoService passes them to detector and tee; sampler,
+`EventFrameBuffer`, scene classifier and worker stay id-only (documented boundary).
+Lifecycle and shutdown:
+- Stop/EOF/new session: VideoService ends tee (buffer, sampler) and detector (coordinator
+  → private trigger) with the lease; the worker drives the gate lifecycle as today.
+- `shutdown_services` gains optional keyword-only arguments for the private/disabled
+  objects; order: `video.stop()` → gate close → worker close → client close → scene close
+  → `detector.close()` → `coordinator.close()` → `private_trigger.close()` (or the disabled
+  trigger) → tracker close → `tee.close()` → `event_frame_buffer.close()` →
+  `sampler.close()` → budget close. Legacy arguments and order unchanged.
+Runtime extraction (minimal, justified): the module-level singletons read `os.environ`
+and build the YOLO model factory at import, so mode behaviour cannot be exercised with a
+fake model, fake capture and fake audio in-process. Extract ONLY the mode-dependent
+selection into one pure function, e.g. `build_parking_wiring(env, *, config_text, gate,
+event_frame_buffer, budget, client, clock) -> ParkingWiring` (detector slot object,
+buffer-slot sink, worker trigger, worker bundle source, `candidate_strategies`,
+`required_sinks`, worker `enabled`, objects to close), plus the config reader
+`_read_private_parking_config(env)`. The rest of `runtime.py` (CLIP, transports, budget,
+gate, detector construction) stays as it is and calls the function once. Tests build a
+`DetectorService` with a fake model and use the SAME function, so they test the
+production selection, not a copy.
+
+Files (definite): `backend/app/services/runtime.py` (mode + C1 reader + minimal
+extraction + shutdown kwargs + audio factory extension), new
+`backend/app/services/disabled_parking_trigger.py`,
+`backend/app/main.py` (pass the new closables to `shutdown_services`),
+`backend/.env.example` (`SENTINEL_PARKING_MODE`, `SENTINEL_PRIVATE_PARKING_CONFIG_FILE`,
+`SENTINEL_AUDIO_LOCAL_ALERT_FILE`, values commented, no real paths), new
+`backend/tests/test_private_parking_runtime_wiring.py` (in-process integration with
+fakes + a few subprocess imports of `runtime` for the env → composition check), new
+`backend/tests/test_runtime_audio_local_clip.py` (production factory with a fake WAV probe
+and a fake device), this plan and `PLAN.md`; after implementation `ARCHITECTURE.md` (component/mode rows) and
+`RELIABILITY.md` (failure table). Not changed: `audio_alert_service.py`,
+`detector_service.py`, `video_service.py`, `private_parking_*` services, API, frontend.
+Conditional (report before editing): `backend/tests/test_evaluation_runtime_integration.py`
+only if the shutdown call, an import or its audio-factory assertions change there.
+
+Acceptance (fakes: fake model/tracker tracks, `FakeCapture`, fake dispatcher, fake audio
+device, fake clock; no server, device or provider):
+1. Mode unset/`legacy` → composition identical to today (same classes/slots, no tee, no
+   `required_sinks`); existing runtime and legacy suites green (§5: 6, 8).
+2. Invalid mode; `private` with config unset, unreadable, > 4096 bytes or invalid → the
+   `DisabledParkingTrigger` in the detector slot and the worker; no candidate ever, no
+   legacy fallback, video RUNNING, `EventFrameBuffer` fed; Start/Stop, worker close and
+   full shutdown complete (bounded); logs carry neither path nor content (§5: 2, 12).
+3. Private valid → detector slot = coordinator, buffer slot = tee(buffer, sampler),
+   `required_sinks` = {"event frame buffer", "detector"}; frames reach buffer and sampler;
+   a refused tee/detector start → 503/ERROR (O-P1).
+4. Bundle source: with evaluation enabled in the test only (to prove the source), evidence
+   that exists is taken from the sampler; missing/expired evidence fails explicitly
+   (`EVIDENCE_UNAVAILABLE`/non-ready decision); `EventFrameBuffer.wait_for_bundle` is called
+   zero times (spy). Production stays `enabled=False` until T3d.
+5. Cloud unavailable/disabled: the gate follows the session lifecycle
+   (`apply_lifecycle` on start/stop), the local offer happens with the LOCAL clip, zero
+   claims, zero budget reservations, zero dispatches; local clip missing → local audio off
+   with a diagnostic, never the CRITICAL clip (§5: 1, 9, 14, 20, 21).
+6. Expiry without observation: a published candidate is not claimable after its deadline
+   (fake clock, no new frames); its sealed bytes are released at the next sampler call
+   (call-based sweep, no timer) (§5: 29).
+7. Stop/EOF/restart and failed cleanup: a sink/dependency end fails → ERROR, admission
+   closed (409) until a Stop retry succeeds; afterwards a new session starts; late calls
+   with the old lease/token change nothing and no old state is revived (§5: 11, 18).
+8. Crossing only (ENTERED, no approach) → no alert and no local offer; a confirmed approach
+   to a motor zone without authorization → exactly one alert and one local offer (§5: 9).
+9. Shutdown closes every private/disabled object once in the order above; no hang.
+10. No images, secrets, config values or paths in logs (§5: 12).
+Audio factory acceptance (through `runtime._create_audio_alert_gate` with env set by
+`monkeypatch`, `runtime.probe_wav_duration` replaced by a fake probe, `runtime.WinsoundDevice`
+replaced by a fake device, placeholder files in `tmp_path` outside the repository; no WAV
+is generated or played):
+11. Valid local clip with evaluation/cloud disabled → the gate is built with the local
+   clip (`local_clip_configured`); an `offer_local` starts the fake device with the LOCAL
+   path (compared in memory).
+12. Local clip unset → no warning; missing, unreadable, probe-invalid, too long, inside
+   the repository, or the CRITICAL asset (same path, other spelling via `..`, hard link,
+   byte-identical copy) → gate built WITHOUT a local clip, `offer_local` dropped as
+   `dropped_no_local_clip` with no device start, one fixed warning, and `caplog` contains
+   no path, file name or digest.
+13. The CRITICAL clip works as configured before: a valid CRITICAL clip with any local
+   outcome → the CRITICAL offer starts the device with the CRITICAL path; invalid CRITICAL
+   or disabled flag → no gate (unchanged), the local setting does not enable audio.
+14. Lifecycle, dedup and Stop cancel still hold with a local clip: a local grant then an
+   accepted CRITICAL for the same event → no second grant; a new lifecycle epoch/Stop
+   cancels a playing local clip (fake device `stop`); a stale-session local offer is
+   rejected.
+Dependencies not finished (block real use, not the fake-based wiring): T3d private
+prompt (dispatch stays off, O4); gesture/authorization source — with `authorization=None`
+every unauthorized approach, including the owner's, warns, so real activation waits for
+the gesture or an explicit owner permission (O1); a separate local warning clip (the
+approved voice WAV is the CRITICAL clip); the domain must lock to `PARKING_MOTORCYCLE`;
+T3e real-device checks (owner permission each). Carried limitations: scene classifier
+id-only, MJPEG generator `logger.exception`, hanging capture constructor /
+always-failing release keep ERROR.
+Separate UI/API work (not T3c): the operator flow **preview → configure line/zones →
+Play** (draw the access line, inside point and motor zones on a preview frame, validate
+with `parse_private_parking_config`, then start). Needs its own endpoints, frontend and
+plan; T3c only reads the static C1 file at startup.
+
+**T3c results (agent run, 2026-10-11, HEAD `05a95b8`, working tree; at that time awaiting independent re-review — completed at closure, fake integration verified)**
+Files: `backend/app/services/runtime.py`, new `backend/app/services/disabled_parking_trigger.py`,
+`backend/app/main.py`, `backend/.env.example`, new
+`backend/tests/test_private_parking_runtime_wiring.py` (17), new
+`backend/tests/test_runtime_audio_local_clip.py` (6); docs: this plan, `PLAN.md`,
+`ARCHITECTURE.md` (component rows, modes, local warning, configuration keys),
+`docs/RELIABILITY.md` (three failure rows), `docs/SECURITY.md` (config/clip paths never
+logged — added because the PM listed SECURITY.md among the affected documents). No other
+source or test file changed.
+- Mode selection: `build_parking_wiring(env, *, event_frame_buffer, audio_gate, clock)` →
+  `ParkingWiring` (mode, detector slot, worker trigger, buffer slot, bundle source,
+  candidate strategies, required sinks, worker `enabled` override, private objects).
+  Legacy (unset/`legacy`): a new `ParkingCandidateTrigger` in both slots, the
+  `EventFrameBuffer` as buffer slot and bundle source, no required sinks, the evaluation
+  configuration decides `enabled` — the module composition is unchanged. Private (valid
+  C1 file): `PrivateParkingTrigger(config, clock)` (no authorization source),
+  `EpisodeEvidenceSampler(clock)`, `PrivateParkingCoordinator(trigger, sampler, gate)` in
+  the detector slot, `FrameSinkTee(buffer, sampler)` in the buffer slot, the SAMPLER as
+  bundle source with `{PARKING_MOTORCYCLE: sampler.plan_for_candidate}`, required
+  `{"event frame buffer", "detector"}`, worker `enabled=False`. Invalid mode or missing,
+  unreadable, oversized (> 4096 bytes), non-UTF-8 or invalid config: one
+  `DisabledParkingTrigger` in both slots, buffer slot = `EventFrameBuffer`, worker
+  disabled. Warnings are fixed texts (no value, path or content).
+- Module wiring: `event_frame_buffer` and `audio_alert_gate` are now built before the
+  detector (the coordinator needs the gate); `parking_candidate_trigger` is the wiring's
+  worker trigger (the legacy trigger in legacy mode, so existing imports keep working);
+  `shutdown_services` gained `coordinator`, `frame_tee`, `sampler` keyword arguments
+  (order: detector → coordinator → trigger → tracker → tee → buffer → sampler); `main.py`
+  passes them (None outside private mode).
+- Audio factory: `_validated_clip` (unchanged CRITICAL rules, shared), `_local_alert_clip`
+  (only after a valid CRITICAL clip; same-asset check: equal resolved paths,
+  `os.path.samefile`, or equal size + SHA-256; unprovable → treated as the same), the
+  gate built with `local_wav_path`/`local_duration_seconds` only when the local clip passed;
+  a set local clip while audio is disabled logs one "unused" warning. Flag, platform,
+  cooldown and CRITICAL validation are unchanged.
+- Tests (wiring, 17): legacy default and explicit (composition unchanged); 7 invalid
+  cases (mode value, config unset/missing/too large/not JSON/invalid/not UTF-8) — disabled
+  trigger, no candidate, no fallback, video RUNNING and buffer fed, full
+  `shutdown_services` completes, no path/content in logs; private composition (tee feeds
+  buffer AND sampler, required sinks, a closed tee → `VideoStartRefusedError`/ERROR until
+  Stop); bundles only from the sampler (test-only enabled worker: request from sealed
+  evidence, 5 frames, zero `EventFrameBuffer.wait_for_bundle` calls; released evidence →
+  `EVIDENCE_UNAVAILABLE`, no request, zero buffer calls); cloud disabled: crossing + journey
+  → no alert, confirmed approach → exactly one alert and one LOCAL-clip grant, zero claims,
+  budget and dispatches, no second alert for the same episode, a late local offer after
+  the session ended is not granted; expiry without observation (not claimable after the
+  TTL; sealed bytes released by the next sampler call, `sealed_expired` = 1); Stop with a
+  failing trigger end → ERROR and admission closed, Stop retry with the same lease → IDLE,
+  file EOF, restart, late old-lease ends change nothing; shutdown order; the real
+  `runtime` module imported in subprocesses selects legacy / private / disabled from the
+  environment and never prints the config path.
+  Tests (audio factory, 6): valid local clip passed and played as LOCAL; missing, probe-
+  invalid, too long, inside the repository, same path, `..` spelling, byte-identical
+  copy and hard link → local off with the fixed warning, CRITICAL kept, no `.wav`/path in
+  logs; unset local clip silent; CRITICAL plays with any local outcome; flag off or invalid
+  CRITICAL → no gate (local never enables audio), legacy default logs nothing; local grant
+  then CRITICAL for the same event → one grant (`dropped_duplicate`), Stop cancels the
+  playing local clip, stale-session local offer dropped.
+- Mutations (agent run, scratch script, source restored): invalid mode → legacy, invalid
+  config → legacy, private bundles from the `EventFrameBuffer`, private sinks not
+  required, private worker following the cloud setting, no content comparison of clips,
+  invalid local clip disabling the gate, config path logged, coordinator closed after its
+  trigger — each fails the tests. Stability: both new files passed 3 consecutive runs.
+- Tests (serial, fakes only, unique `--basetemp`): wiring 17, audio factory 6, runtime
+  integration 83, audio 62, video 142, detector 28, all `test_private_parking_*` 258
+  (incl. wiring), evaluation worker 119, current-evaluation API 10, legacy parking trigger
+  19 — all passed; full backend suite **1175 passed**, 1 Starlette `DeprecationWarning`;
+  `pip check` clean; `git diff --check` clean; new files without trailing whitespace,
+  ending with a newline.
+- Limitations: no gesture/authorization source — in private mode every unauthorized
+  approach (the owner's included) raises the local warning, so real use waits for T3e/O1;
+  private dispatch disabled until the T3d prompt; no local warning clip asset exists (the
+  approved voice WAV is the CRITICAL clip); the trigger acts only after the domain locks to
+  `PARKING_MOTORCYCLE`; with a configured Langflow transport the callback route stays
+  mounted in private mode, but the disabled worker has no pending evaluation and rejects
+  any callback; the frontend has no message for the 503 refusal and no mode indicator;
+  configuration only through the C1 file (the preview → line/zone → Play UI is separate);
+  carried limitations (scene classifier id-only, MJPEG `logger.exception`, hanging capture
+  constructor / failing release keep ERROR). No server, real video, speaker, provider or
+  device was run.
+
+**T3c review delta 1 (reviewer findings via PM message "perbaikan delta wiring T3c", 2026-10-11; agent run, HEAD `05a95b8`, working tree)**
+- Fail-closed config boundary: a small JSON with an integer coordinate or threshold of
+  10**350 made `parse_private_parking_config` raise `OverflowError`, which escaped
+  `_read_private_parking_config` (startup would fail instead of disabling the private
+  path). `_read_private_parking_config` now catches `UnicodeDecodeError`, `ValueError`,
+  `TypeError`, `OverflowError` and `RecursionError` around the decode + parse step ONLY →
+  `DisabledParkingTrigger`, no legacy fallback, the fixed generic warning (no value, path
+  or exception). Construction of the private services is outside that `try`: a service
+  construction error still propagates (tested). The parser itself
+  (`models/private_parking.py`) is outside the reviewed scope and unchanged. Float
+  exponents such as `1e350` and deep nesting were already rejected by the parser (None).
+- `.env.example`: the two new example paths contained a CR (`\r` from an escape inside a
+  shell heredoc) and a TAB; both lines now use unambiguous placeholders
+  (`<absolute path to …>`). A byte test asserts the file has no control byte except LF
+  and documents the three new keys. All 11 changed files were scanned: no control byte
+  except LF.
+- Tests: wiring file now 22 (two OverflowError cases through the full invalid-config
+  lifecycle and shutdown, the builder-level 10**350 regression, a construction error not
+  hidden, the `.env.example` byte check); audio factory 6 unchanged. Mutations (agent run,
+  scratch script, sources restored): removing `OverflowError` from the boundary fails 7
+  tests; putting a CR back into `.env.example` fails the byte test. Stability: the wiring
+  file passed 3 consecutive runs.
+- Tests (serial, fakes only, unique `--basetemp`): wiring 22, audio factory 6, runtime
+  integration 83, audio 62, all `test_private_parking_*` 263, video 142 — all passed; full
+  backend suite **1180 passed**, 1 Starlette `DeprecationWarning`; `pip check` clean; `git
+  diff --check` clean; byte scan of the 11 changed files: no control byte except LF.
+
+**T3c review delta 2 — invalid-config matrix and status (PM message "delta penutupan T3c", 2026-10-11; agent run, HEAD `05a95b8`, working tree)**
+- Test defect (fixture only, production source unchanged): `_invalid_cases` built every
+  case at once and all file cases wrote the SAME path, so the last payload ("huge integer
+  threshold") overwrote the others — the oversized, broken-JSON, invalid, non-UTF-8 and
+  huge-coordinate cases did not read their own payloads. Now `INVALID_PAYLOADS` holds the
+  payloads, `_invalid_env` writes only the running case to its own file
+  (`<case>.json`), `_config_file` refuses to overwrite an existing file, each case reads
+  its file back and a spy on `runtime.parse_private_parking_config` proves what the parser
+  received (exactly that payload for broken JSON / invalid / huge numbers; nothing for
+  oversized, non-UTF-8, missing, unset or an invalid mode). New test: all payload files
+  coexist with distinct paths, each holding its own bytes, all different.
+- Mutations of the fixture (agent run, test file restored): a shared file name with
+  overwrite allowed → 1 failure; the old behaviour (the last payload overwriting the
+  case file) → 6 failures (5 cases + the fixture test).
+- Status: "Still to do in T3c" replaced by the implemented wiring; a "Status of T3c" list
+  separated (at that time) implemented/awaiting re-review, completed (nothing of T3c yet) and features
+  not available (T3d prompt, gesture, configuration UI, local clip asset, real devices).
+- Tests: wiring file 23 passed in 3 consecutive runs; audio factory 6 passed; full suite
+  not re-run (only a test fixture and documentation changed; see the targeted results).
+
+**T3c — completed, fake integration verified** (closure on the PM instruction "penutupan dan
+commit T3c", 2026-10-11; committed as "feat: wire private parking runtime with fail-closed
+configuration"). Not proven on a real device, speaker or provider.
+- Independent review (Codex via PM, 2026-10-11): **PASS** on the closure delta (review
+  delta 2); 23 targeted tests passed in that last review. The full backend suite of
+  **1,180 passed** comes from the earlier independent review of delta 1 — it was not
+  re-run for this closure (no source change since; only a test fixture and documentation
+  changed in delta 2).
+- Closure check (agent run): HEAD `05a95b8`, nothing staged; the blob hashes reported by
+  Codex were not included in the PM message, so they could not be matched directly; no
+  source/test file changed after the delta-2 report (the last test-file write was the
+  byte-identical restore of the fixture-mutation script). Blobs at closure:
+  `runtime.py` `be76cd7`, `main.py` `0a9f686`, `.env.example` `13cfd05`,
+  `disabled_parking_trigger.py` `ee45c69`, `test_private_parking_runtime_wiring.py`
+  `a0bb1b2`, `test_runtime_audio_local_clip.py` `31383be`.
+- Still NOT done (outside T3c): the private prompt and private dispatch (T3d); a
+  gesture/authorization source; the configuration UI (preview → line/zones → Play); a
+  local warning clip asset; real-device, speaker and provider tests (T3e).
 **Former blocker — DetectorService cleanup retry: resolved by T3c0.1 (commit `e50d9e2`).**
 History (from T3b review delta 1): `DetectorService.end_session` cleared its active
 session before calling the parking-trigger slot; the first failure gave ERROR, but the
@@ -1620,13 +1971,25 @@ Stop retry found the session forgotten and VideoService wrote IDLE although the
 coordinator/trigger never ended. T3c0.1 keeps every dependency obligation pending and
 retries only the failed ones.
 **Required sinks in private mode — capability done in T3c0.2 (commit `d479357`);
-configuration and wiring remain in T3c.** History (from T3b review delta 2): VideoService
-treated a refused `FrameSinkTee.start_session` as an optional sink failure and kept the
-video running without buffer/evidence. T3c0.2 added `VideoService(required_sinks=...)`: a
-refusal by a required sink fails the start (ERROR until Stop, HTTP 503). Still to do in
-T3c: in private mode, pass `required_sinks={"event frame buffer", "detector"}` (PM
-decision O-P1), wire the tee and the coordinator, and select the mode. Legacy/open mode
-keeps `required_sinks` empty.
+configuration and wiring completed in T3c (fake integration verified).** History (from T3b review delta 2): VideoService treated a refused
+`FrameSinkTee.start_session` as an optional sink failure and kept the video running
+without buffer/evidence. T3c0.2 added `VideoService(required_sinks=...)`: a refusal by a
+required sink fails the start (ERROR until Stop, HTTP 503). T3c (completed, fake integration verified) passes `required_sinks={"event frame buffer", "detector"}` in private mode (PM
+decision O-P1), wires the tee and the coordinator, and selects the mode through
+`build_parking_wiring`; legacy and disabled modes keep `required_sinks` empty.
+
+**Status of T3c, kept apart (2026-10-11; updated at closure):**
+- *Completed — fake integration verified (closure, PM message "penutupan dan commit T3c"):*
+  mode
+  selection (`SENTINEL_PARKING_MODE`), the C1 config file reader (fail-closed),
+  `DisabledParkingTrigger`, private wiring (coordinator, private trigger, sampler, tee,
+  required sinks, sampler as the only private bundle source, worker disabled), the local
+  clip in the audio factory, shutdown order — proven with fakes only, never on a real
+  device. Prerequisites T3c0.1 (`e50d9e2`) and T3c0.2 (`d479357`) completed earlier.
+- *Not available (not part of T3c):* the private prompt and private dispatch (T3d); a
+  gesture/authorization source (none exists — every unauthorized approach warns); the
+  configuration UI (preview → line/zones → Play, separate UI/API work); a local warning
+  clip asset; any real-device, speaker or provider run (T3e, owner permission each).
 Acceptance: 1, 2, 6, 8, 9 (pre-T3d), 11, 12, 14 with `FakeCapture`, fake dispatcher and
 fake audio device.
 
@@ -1697,8 +2060,8 @@ evidence was not included in the relay). Acceptance 24 and 30 finalised.
     (PASS WITH LIMITATIONS, findings D1/D2, both corrected), not an independent review.
   - Prerequisites for T3c as recorded at T3b closure (historical): (1) `DetectorService`
     cleanup retry — resolved by T3c0.1 (`e50d9e2`); (2) a refused tee start must fail the
-    private-mode start — capability done in T3c0.2 (`d479357`), private-mode
-    configuration and wiring remain in T3c.
+    private-mode start — capability done in T3c0.2 (`d479357`); private-mode
+    configuration and wiring since completed in T3c (fake integration verified).
 - **T3c0 (lifecycle prerequisites): design rev 4 final, reviewed PASS WITH LIMITATIONS**
   (Codex via PM, 2026-10-11). **T3c0.1 completed** — independent review PASS WITH
   LIMITATIONS (Codex via PM: 74 target + 1,110 full tests passed, `pip check` and
@@ -1712,9 +2075,19 @@ evidence was not included in the relay). Acceptance 24 and 30 finalised.
   PM: 216 target tests, 1,152 full backend); committed as "fix: isolate video start
   rollback and retain capture cleanup". Limitations: a hanging capture constructor or a
   permanently failing release keeps ERROR (no timeout / restart needed). T3c0.2 delivers
-  the required-sink/refusal capability only; **private-mode configuration and runtime
-  wiring (T3c) are not authorized and not done.**
-- **T3c (runtime wiring and mode), T3d, T3e: not started, not authorized** — each waits for its own owner
+  the required-sink/refusal capability only; at that time private-mode configuration
+  and runtime wiring (T3c) were not authorized and not done (historical — see the T3c
+  entry below for the current state).
+- **T3c (runtime wiring and mode): completed — fake integration verified** (design PASS
+  WITH LIMITATIONS; review deltas 1–2; closure delta PASS, Codex via PM, 23 targeted tests;
+  full suite 1,180 passed in the earlier independent review, not re-run). Committed as
+  "feat: wire private parking runtime with fail-closed configuration". Not proven on a
+  real device. T3d prompt, gesture, configuration UI, local clip asset and real tests
+  remain open. Rev 3: C1 recorded (`SENTINEL_PRIVATE_PARKING_CONFIG_FILE`);
+  sampler is the private bundle source; `DisabledParkingTrigger` for invalid
+  modes/configs; audio factory validates the local clip without affecting the CRITICAL
+  clip. The preview → line/zone → Play operator flow is a separate UI/API work item.
+- **T3d, T3e: not started, not authorized** — each waits for its own owner
   authorization (`docs/PLANS.md`).
 - Open for review: the deviations and limitations listed under "T3a1 results", the
   worker identity extension in "T3a1 delta 1", the episode-instance contract in

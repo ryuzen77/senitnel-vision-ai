@@ -12,6 +12,9 @@
   be committed or printed.
 - The Langflow callback uses a static shared token header compared in constant time;
   deploy only over HTTPS with a long random token.
+- The private-parking configuration file (`SENTINEL_PRIVATE_PARKING_CONFIG_FILE`) and the
+  audio clip paths are never logged; warnings are fixed texts. Clip comparison (same
+  file or identical bytes) happens in memory only.
 
 ## Network surface
 
