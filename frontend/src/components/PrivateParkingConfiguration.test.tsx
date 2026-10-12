@@ -1,3 +1,5 @@
+import { useState } from 'react'
+import { Configuration } from '../geometry/privateParkingGeometry'
 import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, beforeEach, it, expect, vi } from 'vitest'
 import { PrivateParkingConfiguration } from './PrivateParkingConfiguration'
@@ -61,4 +63,91 @@ it.each([true, false])('R6: create unknown/cancelled=%s exposes only manual rele
   expect(fileInput.disabled).toBe(false)
   expect(screen.getByText(/Operasi server mungkin masih selesai kemudian/)).toBeTruthy()
   expect(requests.filter(request => request === 'POST /api/video/sources')).toHaveLength(1)
+})
+
+
+function EditableForm({ save, configuration = validConfiguration }: { save: () => void; configuration?: Configuration }) {
+  const [draft, setDraft] = useState<Configuration>(configuration)
+  const p = {
+    capabilities: privateCaps, current: preparedSnapshot(), draft, preview: 'blob:fixture',
+    imageVerified: true, errorField: null, message: null, pending: null, cancelling: false,
+    unknown: null, canPlay: false, acceptedRevision: null, identity: null, fresh: true,
+    reconciliationPaused: false, canReplay: false, save, changeDraft: setDraft,
+  } as unknown as ReturnType<typeof useSourcePreparation>
+  return <PrivateParkingConfiguration preparation={p} />
+}
+
+it('Escape in the panel preserves overlay keyboard undo and makes no save request', () => {
+  const save = vi.fn()
+  render(<EditableForm save={save} />)
+  const handle = screen.getByRole('button', { name: 'Titik P1; panah untuk menggeser' })
+  const horizontal = screen.getByLabelText('P1 horizontal (%)') as HTMLInputElement
+  const original = horizontal.value
+  fireEvent.keyDown(handle, { key: 'ArrowRight' })
+  expect(horizontal.value).not.toBe(original)
+  fireEvent.keyDown(handle, { key: 'Escape' })
+  expect(horizontal.value).toBe(original)
+  expect(save).not.toHaveBeenCalled()
+})
+
+it('numeric reverse order is retained, flagged immediately and Save focuses Kiri with no request', () => {
+  const save = vi.fn()
+  const { container } = render(<EditableForm save={save} />)
+  const left = screen.getByLabelText('Kiri (%)') as HTMLInputElement
+  const right = screen.getByLabelText('Kanan (%)') as HTMLInputElement
+  fireEvent.change(left, { target: { value: '70' } })
+  expect(left.value).toBe('70')
+  expect(right.value).toBe('50')
+  expect(left.getAttribute('aria-invalid')).toBe('true')
+  expect(right.getAttribute('aria-invalid')).toBe('true')
+  expect(document.getElementById(left.getAttribute('aria-describedby')!)?.textContent).toContain('Kiri harus lebih kecil')
+  expect(container.querySelector('.zone-shape')).toBeNull()
+  fireEvent.click(screen.getByRole('button', { name: 'Simpan pengaturan' }))
+  expect(document.activeElement).toBe(left)
+  expect(save).not.toHaveBeenCalled()
+  expect(vi.mocked(fetch).mock.calls.some(([url]) => String(url).endsWith('/configuration'))).toBe(false)
+})
+
+it('top/bottom stay typed, zero and small areas are rejected and focus the first offending axis', () => {
+  const save = vi.fn()
+  const { container } = render(<EditableForm save={save} />)
+  const top = screen.getByLabelText('Atas (%)') as HTMLInputElement
+  const bottom = screen.getByLabelText('Bawah (%)') as HTMLInputElement
+  fireEvent.change(top, { target: { value: '80' } })
+  expect(top.value).toBe('80')
+  expect(bottom.value).toBe('50')
+  fireEvent.click(screen.getByRole('button', { name: 'Simpan pengaturan' }))
+  expect(document.activeElement).toBe(top)
+  expect(save).not.toHaveBeenCalled()
+  expect(container.querySelector('.zone-shape')).toBeNull()
+  fireEvent.change(top, { target: { value: '10' } })
+  fireEvent.change(bottom, { target: { value: '10' } })
+  expect(bottom.getAttribute('aria-invalid')).toBe('true')
+  fireEvent.change(bottom, { target: { value: '10.1' } })
+  expect(screen.getByText(/Luas minimum/)).toBeTruthy()
+  expect(container.querySelector('.zone-shape')).toBeNull()
+  fireEvent.click(screen.getByRole('button', { name: 'Simpan pengaturan' }))
+  expect(document.activeElement).toBe(screen.getByLabelText('Kiri (%)'))
+  expect(save).not.toHaveBeenCalled()
+})
+
+it('pending selection is visible outside the image and resets after a form edit or Escape', () => {
+  vi.stubGlobal('PointerEvent', MouseEvent)
+  const { container } = render(<EditableForm save={vi.fn()} />)
+  fireEvent.click(screen.getByRole('button', { name: 'Pilih sudut area pada gambar' }))
+  const svg = screen.getByLabelText('Garis dan area pada gambar')
+  vi.spyOn(svg, 'getBoundingClientRect').mockReturnValue({ left: 0, top: 0, width: 640, height: 480 } as DOMRect)
+  fireEvent.pointerDown(svg, { clientX: 192, clientY: 192 })
+  expect(container.querySelector('.pending-corner')).not.toBeNull()
+  expect(screen.getByRole('button', { name: 'Batalkan pemilihan' })).toBeTruthy()
+  expect(container.querySelector('.editor-feedback')?.textContent).toContain('Klik sudut kedua')
+  fireEvent.change(screen.getByLabelText('Kiri (%)'), { target: { value: '20' } })
+  expect(container.querySelector('.pending-corner')).toBeNull()
+  expect(screen.queryByRole('button', { name: 'Batalkan pemilihan' })).toBeNull()
+  fireEvent.pointerDown(svg, { clientX: 200, clientY: 200 })
+  fireEvent.keyDown(screen.getByLabelText('Kiri (%)'), { key: 'Escape' })
+  expect(container.querySelector('.pending-corner')).toBeNull()
+  fireEvent.pointerDown(svg, { clientX: 220, clientY: 220 })
+  fireEvent.click(screen.getByRole('button', { name: 'Batalkan pemilihan' }))
+  expect(container.querySelector('.pending-corner')).toBeNull()
 })

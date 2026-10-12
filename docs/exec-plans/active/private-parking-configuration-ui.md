@@ -1645,3 +1645,112 @@ Preflight penutupan: HEAD `eb6a3ac9b093a99fd9e151261f984383b5b95c01`, branch `ma
 staging kosong. Perubahan agen lain/referensi tetap dipertahankan dan di luar
 commit. Hash rencana penutupan, commit final dan verifikasi remote dilaporkan pada
 handoff owner; tidak dimasukkan ke file yang sama agar tidak membuat hash rekursif.
+
+
+## 24. Delta editor sesudah uji awal owner — scope dan bug
+
+Owner mengotorisasi perbaikan lima temuan editor pada baseline P1d committed
+`67a04fb83efc3e39425a23c679673b9c83b7dc6c`. Staging kosong; source frontend bersih
+saat preflight. **Reviewed: PASS WITH LIMITATIONS — Claude melalui owner/PM.** Owner telah
+mengotorisasi penutupan, stage tepat delapan path, commit dan push normal;
+source/test delta tidak berubah setelah review.
+Status completed/review §23 hanya berlaku pada versi shipped, bukan delta ini.
+
+| Temuan owner dan pembacaan source | Penyebab / perbaikan yang dituju |
+|---|---|
+| Handle garis menghalangi klik kedua di mode zona | Circle handle selalu stopPropagation dan key handler tidak memeriksa tool; hanya line valid pada mode line boleh interaktif |
+| Handle di0,0 saat garis belum diisi | Default p1/p2 zeros dirender sebagai handle; sembunyikan handle/arsiran ketika line invalid |
+| Sudut pertama tidak terlihat, menjadi stale sesudah edit form | first hanya ref, hint hanya SVG title; state visual marker + instruksi terlihat, cancel/Escape dan context guard draft/tool/preview |
+| Klik kedua invalid menambahkan area nol/kecil | Pointer append tanpa validasi luas; tolak sebelum onChange dan jelaskan pemilihan ulang dua sudut |
+| Numeric invalid tidak ditandai langsung; fokus selalu P1 | generic geometryError baru pada submit; structured local issues, aria-invalid/describedby, pesan terkait, fokus error pertama, nol request konfigurasi |
+
+Nilai numeric di source sekarang tidak disortir pada onChange; ketentuan owner
+untuk mempertahankan Kiri/Kanan/Atas/Bawah tetap dipertahankan dan diuji secara
+langsung. Sorting dua sudut pointer tetap boleh untuk rectangle, tetapi tidak
+berlaku pada input form. Rectangle invalid/kecil tidak boleh digambar seolah valid.
+
+Scope: ConfigurationOverlay.tsx, PrivateParkingConfiguration.tsx dan dua testnya.
+Adjacent helper/CSS diperlukan dan dicatat: privateParkingGeometry.ts + testnya
+untuk satu validasi rectangle/field yang sama pada overlay/form/submit; index.css
+untuk petunjuk pemilihan di luar gambar (tidak mengubah letterboxing) dan border
+field invalid. Tidak mengubah parser/backend, hook request/lifecycle, stored
+konfigurasi owner, API, Play, prompt/gesture atau dokumen bersama.
+
+Own Vite live session dihentikan sebelum edit agar owner tidak terkena HMR delta
+belum direview. Backend tidak dihentikan/direstart. Browser verifikasi terpisah
+memakai bundle produksi + API fake; tidak ada request upload/config/DELETE/Stop/
+Play ke backend nyata pada delta ini. Tidak memakai gambar CCTV nyata dalam bukti.
+
+### 24.1 Hasil implementer dan batas bukti
+
+Lima temuan owner ditangani: handle hanya interaktif pada alat garis valid;
+marker sudut pertama dan instruksi terlihat; Escape/Batal dan perubahan konteks
+membersihkan pilihan; sudut kedua invalid ditolak sebelum append; nilai form
+terbalik tetap diketik, diberi aria-invalid/pesan dan rectangle tidak digambar.
+Simpan menolak lokal tanpa request dan memfokuskan field invalid pertama.
+
+Browser fake menemukan dua delta adjacent yang juga diperbaiki:
+- Pembulatan pointer pecahan CSS pixel membuat klik pojok tepat dianggap di luar
+  gambar. pointerPoint memakai toleransi 0.00001 CSS pixel lalu clamp batas;
+  letterbox di luar toleransi dan koordinat nonfinite tetap ditolak. Regresi unit
+  memakai ukuran SVG pecahan aktual browser.
+- Escape panel dahulu menginvalidasi transaksi keyboard overlay. Panel kini
+  menyerahkan Escape di overlay kepada overlay; Escape dari form tetap menghapus
+  sudut tertunda. Regresi parent dan browser membuktikan undo nilai keyboard.
+
+Verifikasi Codex (implementer, bukan review independen):
+- `npm test`: **192 passed, 16 files**, semua fake; 17 tambahan dari baseline175.
+- `npm run build`: TypeScript/Vite lulus, 43 modules; bundle terakhir
+  `index-Bm_n6aey.js`, CSS `index-DGPeNoLd.css`.
+- Chrome headless bundle produksi + API fake lulus true pointer hit-testing:
+  klik kedua di pojok asli/penanda P1 mode zona, area nol/subminimum, nilai
+  terbalik, fokus Simpan tanpa request, reset form/Escape/Batal, keyboard panah
+  satu pixel dan Escape undo. Enam viewport1440/1280/1024/768/390/320 dan zoom200%
+  tanpa overflow horizontal, delapan zona terlihat valid. Gambar sintetis640x480
+  di container16:9 menguji letterboxing; koordinat mengikuti gambar asli.
+- Screenshot sintetis1280 dan390 dibaca implementer; tidak ada CCTV dalam bukti.
+  Seluruh request harness GET saja; nol upload/config/DELETE/Stop/Play, provider,
+  detector/video nyata, speaker atau perangkat. Chrome sendiri ditutup finally.
+- Tidak mengulang backend suite karena backend tidak berubah. Build terakhir
+  mendahului tambahan test parent saja, source produksi tetap identik.
+
+Batas: API fake dan screenshot sintetis bukan bukti decoder/video/perangkat atau
+akurasi model. Audit aksesibilitas menyeluruh/screen reader dan kontras seluruh
+state belum dilakukan; delta menguji aria-invalid/describedby, fokus dan keyboard.
+Tidak mengubah geometri tersimpan owner. Hasil implementer di atas tetap
+terpisah dari review Claude melalui owner/PM pada catatan penutupan berikut.
+Scope tepat tujuh source/test/CSS berikut dan rencana ini; perubahan
+dokumen/referensi agen lain dipertahankan.
+
+### 24.2 Manifest delta untuk re-review
+
+| Path | Git blob dari disk |
+|---|---|
+| `frontend/src/components/ConfigurationOverlay.tsx` | `0a6f540e006b9a2027ddc5fe375602e15efcd6a8` |
+| `frontend/src/components/ConfigurationOverlay.test.tsx` | `463d612889b57b3c7a47fcfcc14b728a2962f356` |
+| `frontend/src/components/PrivateParkingConfiguration.tsx` | `f737e41571bb8d433b4af6944ccb98652864bc51` |
+| `frontend/src/components/PrivateParkingConfiguration.test.tsx` | `cc0e67da4ee140d1cca382a03effe456199ad4f8` |
+| `frontend/src/geometry/privateParkingGeometry.ts` | `017ab8904dfe60ef7a0f95f0c81fe248057deb70` |
+| `frontend/src/geometry/privateParkingGeometry.test.ts` | `805ad34d05daefdd656a290348df428f0a47cec1` |
+| `frontend/src/index.css` | `60788166696fc7da3ed139d8e0aad7adde83e866` |
+
+Hash rencana dilaporkan pada handoff agar tidak membuat hash rekursif.
+
+### 24.3 Penutupan review melalui owner/PM
+
+Owner/PM menyampaikan verdict independen Claude **PASS WITH LIMITATIONS** dan
+mengotorisasi commit `fix: prevent parking zone editor pointer conflicts`, lalu
+push normal tanpa force. Penutupan hanya mengubah rencana; ketujuh hash
+source/test/CSS dicocokkan ulang dari disk dan identik dengan manifest §24.2.
+Suite tidak diulang karena tidak ada perubahan perilaku. Bukti implementer tetap
+192 test/16 file, build lulus, dan browser fake sebagaimana §24.1.
+
+Rincian hasil test/build, reproduksi browser reviewer dan lima temuan UX rendah
+masih menunggu transkripsi laporan Claude dari owner/PM. Temuan tersebut adalah
+pekerjaan lanjutan; tidak memperluas perbaikan/source pada delta penutupan ini.
+Batas visual/accessibility/perangkat pada §24.1 tetap berlaku dan tidak ditutup
+oleh verdict ini. Owner kemudian menginstruksikan penyelesaian commit/push
+lebih dahulu; rincian kelima temuan tetap tindak lanjut pencatatan, tanpa
+perubahan source. **Completed — editor verified with API fakes, independently
+reviewed PASS WITH LIMITATIONS melalui owner/PM.** Tidak menyatakan validasi
+seluruh private parking di lapangan.

@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { useSourcePreparation } from '../hooks/useSourcePreparation'
-import { ConfigurationOverlay } from './ConfigurationOverlay'
-import { Configuration, geometryError } from '../geometry/privateParkingGeometry'
+import { ConfigurationOverlay, OverlayInteraction } from './ConfigurationOverlay'
+import { Configuration, geometryIssues } from '../geometry/privateParkingGeometry'
 import { errorFieldMessage, privateMutationAvailable, SECURE_CONTEXT_MESSAGE } from '../api/preparedSourceApi'
 
 type Preparation = ReturnType<typeof useSourcePreparation>
@@ -13,18 +13,30 @@ export function PrivateParkingConfiguration({ preparation: p }: { preparation: P
   const [tool, setTool] = useState<'line' | 'zone'>('line')
   const [validation, setValidation] = useState<string | null>(null)
   const form = useRef<HTMLFormElement>(null)
+  const [cancelVersion, setCancelVersion] = useState(0)
+  const [interaction, setInteraction] = useState<OverlayInteraction>({ pending: false, message: '' })
   const c = p.current
   const d = p.draft
   const fieldMessage = errorFieldMessage(p.errorField)
-  const fieldInvalid = (name: string) => !!p.errorField && (
-    name === p.errorField || name.startsWith(p.errorField + '.') || name.startsWith(p.errorField + '[')
-  )
+  const localIssues = d && p.imageVerified ? geometryIssues(d, p.capabilities?.limits) : []
+  const matchesField = (name: string, field: string) => name === field
+    || name.startsWith(field + '.') || name.startsWith(field + '[')
+  const fieldInvalid = (name: string) => (!!p.errorField && matchesField(name, p.errorField))
+    || localIssues.some(issue => matchesField(name, issue.field))
+  const messages = (prefix: string) => [...new Set(localIssues
+    .filter(issue => matchesField(issue.field, prefix)).map(issue => issue.message))].join(' ')
+  const lineMessage = messages('line')
+  const insideMessage = messages('inside')
+  const zonesMessage = localIssues.find(issue => issue.field === 'zones')?.message
+  const focusField = (field: string) => {
+    const input = [...form.current?.querySelectorAll<HTMLElement>('[data-contract-field]') ?? []]
+      .find(el => matchesField(el.dataset.contractField ?? '', field) && !el.matches(':disabled'))
+    ;(input ?? form.current)?.focus()
+  }
 
   useEffect(() => {
     if (!p.errorField) return
-    const input = [...form.current?.querySelectorAll<HTMLElement>('[data-contract-field]') ?? []]
-      .find(el => fieldInvalid(el.dataset.contractField ?? '') && !el.matches(':disabled'))
-    ;(input ?? form.current)?.focus()
+    focusField(p.errorField)
   }, [p.errorField, p.pending])
 
   const cryptoAvailable = privateMutationAvailable()
@@ -34,26 +46,37 @@ export function PrivateParkingConfiguration({ preparation: p }: { preparation: P
     setValidation(null)
     p.changeDraft(draft)
   }
+  const formChange = (draft: Configuration) => {
+    setCancelVersion(version => version + 1)
+    editorChange(draft)
+  }
   const pointInput = (name: 'p1' | 'p2', axis: 0 | 1) => (
     <label key={`${name}-${axis}`}>
       {name.toUpperCase()} {axis === 0 ? 'horizontal' : 'vertikal'} (%)
       <input
         type="number" min="0" max="100" step="any"
-        data-contract-field={`line.${name}`}
-        aria-invalid={fieldInvalid(`line.${name}`)}
+        data-contract-field={`line.${name}[${axis}]`}
+        aria-invalid={fieldInvalid(`line.${name}[${axis}]`)}
+        aria-describedby={lineMessage ? 'local-line-error' : p.errorField ? 'server-field-error' : undefined}
         value={d ? percent(d.line[name][axis]) : ''}
         onChange={e => {
           if (!d) return
           const point = [...d.line[name]] as [number, number]
           point[axis] = e.target.value === '' ? NaN : Number(e.target.value) / 100
-          editorChange({ ...d, line: { ...d.line, [name]: point }, inside: '' })
+          formChange({ ...d, line: { ...d.line, [name]: point }, inside: '' })
         }}
       />
     </label>
   )
 
   return (
-    <section className="private-preparation" aria-label="Persiapan area parkir">
+    <section className="private-preparation" aria-label="Persiapan area parkir"
+      onKeyDownCapture={event => {
+        // The overlay owns Escape, including undoing its keyboard transaction.
+        if (event.key === 'Escape' && !(event.target as Element).closest('.configuration-overlay')) {
+          setCancelVersion(version => version + 1)
+        }
+      }}>
       <div className="preparation-image-column">
         <h2>Preview persiapan</h2>
         <p className="preview-only">
@@ -71,10 +94,22 @@ export function PrivateParkingConfiguration({ preparation: p }: { preparation: P
               <ConfigurationOverlay
                 key={`${p.preview}-${tool}`} configuration={d}
                 disabled={locked} onChange={editorChange} tool={tool}
+                cancelVersion={cancelVersion} onInteraction={setInteraction}
+                minZoneArea={p.capabilities?.limits.min_zone_area}
+                minLineLength={p.capabilities?.limits.min_line_length}
+                maxZones={p.capabilities?.limits.max_zones}
               />
             </>
           ) : <p>Gambar sumber akan tersedia setelah file disiapkan.</p>}
         </div>
+        {p.preview && d && (
+          <div className="editor-feedback">
+            <p role="status">{interaction.message}</p>
+            {interaction.pending && <button type="button" onClick={() => setCancelVersion(version => version + 1)}>
+              Batalkan pemilihan
+            </button>}
+          </div>
+        )}
         {!cryptoAvailable && <p className="inline-error" role="alert">{SECURE_CONTEXT_MESSAGE}</p>}
         <div className="preparation-actions">
           <label className="file-input-label">
@@ -146,14 +181,15 @@ export function PrivateParkingConfiguration({ preparation: p }: { preparation: P
         )}
       </div>
       <form
-        ref={form} tabIndex={-1} className="configuration-form"
+        ref={form} tabIndex={-1} noValidate className="configuration-form"
         aria-describedby={fieldMessage ? 'server-field-error' : undefined}
         onSubmit={e => {
           e.preventDefault()
-          const error = d ? geometryError(d, p.capabilities?.limits) : 'Muat preview terlebih dahulu.'
-          setValidation(error)
-          if (error) {
-            form.current?.querySelector<HTMLInputElement>('input:not(:disabled)')?.focus()
+          const issue = d ? geometryIssues(d, p.capabilities?.limits)[0]
+            : { field: 'configuration', message: 'Muat preview terlebih dahulu.' }
+          setValidation(issue?.message ?? null)
+          if (issue) {
+            focusField(issue.field)
             return
           }
           void p.save()
@@ -171,6 +207,7 @@ export function PrivateParkingConfiguration({ preparation: p }: { preparation: P
           <div className="coordinate-grid">
             {pointInput('p1', 0)}{pointInput('p1', 1)}{pointInput('p2', 0)}{pointInput('p2', 1)}
           </div>
+          {lineMessage && <p id="local-line-error" className="inline-error" role="status">{lineMessage}</p>}
           <div className="editor-tools">
             <button type="button" aria-pressed={tool === 'line'} onClick={() => setTool('line')}>
               Pilih titik garis pada gambar
@@ -186,13 +223,14 @@ export function PrivateParkingConfiguration({ preparation: p }: { preparation: P
               <label className="side-choice" key={side}>
                 <input
                   type="radio" name="inside" data-contract-field="inside"
-                  aria-invalid={fieldInvalid('inside')} checked={d?.inside === side}
-                  onChange={() => { if (d) editorChange({ ...d, inside: side }) }}
+                  aria-invalid={fieldInvalid('inside')} aria-describedby={insideMessage ? 'local-inside-error' : undefined} checked={d?.inside === side}
+                  onChange={() => { if (d) formChange({ ...d, inside: side }) }}
                 />
                 {side === 'left' ? 'Kiri' : 'Kanan'} terhadap P1 ke P2
               </label>
             ))}
           </fieldset>
+          {insideMessage && <p id="local-inside-error" className="inline-error" role="status">{insideMessage}</p>}
           <p className="editor-help">
             Arsiran menunjukkan sisi yang dipilih. Angka adalah persen gambar asli; garis dapat diatur tanpa drag.
           </p>
@@ -205,31 +243,35 @@ export function PrivateParkingConfiguration({ preparation: p }: { preparation: P
                     {['Kiri', 'Atas', 'Kanan', 'Bawah'][axis]} (%)
                     <input
                       type="number" min="0" max="100" step="any"
-                      data-contract-field={`zones[${index}].rect`}
-                      aria-invalid={fieldInvalid(`zones[${index}].rect`)} value={percent(value)}
+                      data-contract-field={`zones[${index}].rect[${axis}]`}
+                      aria-invalid={fieldInvalid(`zones[${index}].rect[${axis}]`)}
+                      aria-describedby={messages(`zones[${index}]`) ? `local-zone-${index}-error` : p.errorField ? 'server-field-error' : undefined} value={percent(value)}
                       onChange={e => {
                         const rect = [...zone.rect] as [number, number, number, number]
                         rect[axis] = e.target.value === '' ? NaN : Number(e.target.value) / 100
-                        editorChange({ ...d, zones: d.zones.map((existing, i) => i === index ? { ...zone, rect } : existing) })
+                        formChange({ ...d, zones: d.zones.map((existing, i) => i === index ? { ...zone, rect } : existing) })
                       }}
                     />
                   </label>
                 ))}
               </div>
-              <button type="button" onClick={() => editorChange({ ...d, zones: d.zones.filter((_, i) => i !== index) })}>
+              {messages(`zones[${index}]`) && <p id={`local-zone-${index}-error`} className="inline-error" role="status">{messages(`zones[${index}]`)}</p>}
+              <button type="button" onClick={() => formChange({ ...d, zones: d.zones.filter((_, i) => i !== index) })}>
                 Hapus area {index + 1}
               </button>
             </fieldset>
           ))}
           <button
-            type="button" disabled={(d?.zones.length ?? 0) >= 8}
+            type="button" data-contract-field="zones" aria-describedby={zonesMessage ? 'local-zones-error' : undefined}
+            disabled={(d?.zones.length ?? 0) >= 8}
             onClick={() => {
               if (!d) return
               let n = 1
               while (d.zones.some(zone => zone.name === `zona-${n}`)) n++
-              editorChange({ ...d, zones: [...d.zones, { name: `zona-${n}`, rect: [0, 0, 0, 0] }] })
+              formChange({ ...d, zones: [...d.zones, { name: `zona-${n}`, rect: [0, 0, 0, 0] }] })
             }}
           >Tambah area motor</button>
+          {zonesMessage && <p id="local-zones-error" className="inline-error" role="status">{zonesMessage}</p>}
         </fieldset>
         {fieldMessage && <p id="server-field-error" className="inline-error" role="alert">{fieldMessage}</p>}
         {validation && <p id="configuration-error" className="inline-error" role="alert">{validation}</p>}

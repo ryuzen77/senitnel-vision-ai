@@ -142,3 +142,8 @@ dd { margin: 0; overflow-wrap: anywhere; }
 .configuration-form button,.preparation-actions button { max-width:100%; overflow-wrap:anywhere; }
 
 @media(min-width:1024px) { .preparation-image-column { position:sticky; top:1rem; } }
+
+/* Editor feedback stays outside the image so original-image mapping is unchanged. */
+.editor-feedback { display:flex; flex-wrap:wrap; align-items:center; gap:.5rem; margin:.75rem 0; }
+.editor-feedback p { flex-basis:100%; margin:0; color:var(--muted); }
+.coordinate-grid input[aria-invalid="true"] { border-color:#ffaaa5; }
