@@ -14,7 +14,7 @@ webcam or an uploaded clip. One camera, one session at a time.
 |---|---|---|
 | `UNKNOWN` | No confident scene lock (CLIP may lock it deliberately) | runtime |
 | `PARKING_MOTORCYCLE` | Motorcycle parking area; legacy person↔motorcycle candidates | runtime |
-| — private mode | Home/kost parking with entry line, zones and authorization | core only (T1/T2), integration draft |
+| — private mode | Home/kost parking with entry line, zones and authorization | runtime opt-in (`SENTINEL_PARKING_MODE=private`), video files only; configuration UI available (P1: upload → preview → line/zones → save → Play); trigger and warnings proven with fakes only; no gesture source |
 | `RETAIL_STORE` | Shop display zones; candidates when a person stays in a zone | core only |
 
 ## Behaviour the user sees (runtime)
@@ -26,7 +26,16 @@ webcam or an uploaded clip. One camera, one session at a time.
 - Optional local audio (off by default): the owner-configured WAV (kept outside the
   repository) plays once for a CRITICAL parking assessment, with cooldown; Stop cuts it.
 
-## Private parking (planned behaviour, not available)
+## Private parking
+
+Available (opt-in): choose a video file, see one preview frame before any analysis,
+draw the entry line (P1 → P2 with an inside side) and up to eight motorcycle zones, save,
+then start or stop analysis; the source can be deleted. Owner-tested with a real file
+(report baseline `67a04fb`; commit of the running app not recorded): Play, Stop, delete,
+line and zone drawing only.
+
+Rule behaviour below is wired but proven with fakes only (no gesture source exists, so
+step 2 never happens and every unauthorized approach warns; no local warning clip yet):
 
 1. A person crosses the entry line → watchful episode starts.
 2. A valid gesture (source not built yet) authorizes that episode only.

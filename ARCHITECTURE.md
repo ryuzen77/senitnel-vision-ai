@@ -1,6 +1,8 @@
 # Architecture — Sentinel Vision AI
 
-Verified against source at commit `36ffa20` (2026-10-04). "Runtime" means wired in
+Verified against source at commit `36ffa20` (2026-10-04); the private-parking rows,
+§3, §5 and §6 were re-checked at `67a04fb` and the UI paths again at `8a6b8e5`
+(2026-10-12). "Runtime" means wired in
 `backend/app/services/runtime.py` and used by the running app; "core only" means
 built and unit-tested in isolation, not wired; "planned" means a draft exec plan.
 
@@ -47,8 +49,11 @@ VideoService (capture thread, JPEG once, MJPEG slot)            video_service.py
 | Private parking trigger (T1) | `services/private_parking_trigger.py`, `models/private_parking.py`, `services/private_parking_authorization.py` | runtime in `SENTINEL_PARKING_MODE=private` (off by default); no authorization source |
 | Private parking evidence sampler (T2) | `services/private_parking_evidence_sampler.py`, `models/private_parking_evidence.py` | runtime in private mode (fed by the tee; the only private bundle source) |
 | Private parking coordinator + frame tee (T3b) | `services/private_parking_coordinator.py` | runtime in private mode |
-| Parking mode selection (T3c) | `services/runtime.py` (`build_parking_wiring`), `services/disabled_parking_trigger.py` | runtime; private dispatch off until T3d; see [`docs/exec-plans/active/t3-private-parking-integration.md`](docs/exec-plans/active/t3-private-parking-integration.md) |
+| Parking mode selection (T3c) | `services/runtime.py` (`build_parking_wiring`), `services/disabled_parking_trigger.py` | runtime; private dispatch only with `SENTINEL_PRIVATE_PARKING_EVALUATION=true` and the Gemini transport (T3d); see [`docs/exec-plans/active/t3-private-parking-integration.md`](docs/exec-plans/active/t3-private-parking-integration.md) |
+| Prepared sources (P1): upload, probe, preview, operator configuration, Play, cleanup | `services/prepared_source.py`, `services/video_decoder.py`, `api/sources.py`, `models/sources.py` | runtime in private mode; single source slot, files under `storage/uploads/prepared/`; see the [backend plan](docs/exec-plans/active/private-parking-preview-configuration.md) §19.3 |
+| Per-session operator configuration binding (P1) | `services/session_config_registry.py` | runtime in private mode; the trigger reads only the configuration bound to its session |
 | Frontend dashboard | `frontend/src/` | runtime; see [`docs/FRONTEND.md`](docs/FRONTEND.md) |
+| Private-parking preparation UI (P1d): preview, line/ROI editor, save, Play | `frontend/src/hooks/useSourcePreparation.ts`, `components/PrivateParkingConfiguration.tsx`, `components/ConfigurationOverlay.tsx`, `geometry/`, `api/preparedSourceApi.ts` | runtime when capabilities report private mode; see the [frontend plan](docs/exec-plans/active/private-parking-configuration-ui.md) |
 
 ## 3. Domains and modes
 
@@ -56,9 +61,13 @@ VideoService (capture thread, JPEG once, MJPEG slot)            video_service.py
 once per session. **Private parking is a mode of `PARKING_MOTORCYCLE`**, not a fourth
 domain, selected by `SENTINEL_PARKING_MODE` (unset/`legacy` = the legacy parking trigger;
 `private` = coordinator + private trigger + evidence sampler + frame tee, detector and tee
-required, evaluation off until the private prompt (T3d); any other value or an invalid
-private configuration = an explicitly disabled candidate path, never a fallback to
-legacy). No gesture/authorization source exists, so every unauthorized approach warns;
+required; private evaluation only with `SENTINEL_PRIVATE_PARKING_EVALUATION=true`, the
+direct Gemini transport and its private prompt (T3d), Langflow has none); any other value
+= an explicitly disabled candidate path, never a fallback to legacy). Since P1c the
+private startup file is only an optional, unconfirmed template: analysis uses the
+configuration the operator saved for each source, and a missing or invalid template
+leaves the editor available (it no longer disables the mode). Private mode accepts
+video files only; the legacy upload and webcam routes answer `409`. No gesture/authorization source exists, so every unauthorized approach warns;
 real-device use waits for it (O1). A cashier domain does not exist.
 
 ## 4. Contracts that matter
@@ -100,7 +109,8 @@ These are two different signals and must stay separate:
 - **CRITICAL assessment**: a validated model result for the same event, possibly
   seconds later, possibly NORMAL. It never upgrades or replaces the warning, and the
   warning never fabricates a CRITICAL.
-They share one `event_id` so audio deduplication plays at most once. Wiring is T3 (draft).
+They share one `event_id` so audio deduplication plays at most once. Wired in T3c/T3d
+(runtime, fakes only; no local clip asset and no real speaker run).
 
 ## 5. API
 
@@ -109,7 +119,11 @@ They share one `event_id` so audio deduplication plays at most once. Wiring is T
 `GET /api/video/stream` (MJPEG) · `GET /api/detections/latest` (204 = none) ·
 `GET /api/domain/current` · `GET /api/evaluation/current` ·
 `POST /api/evaluation/callback` (Langflow transport only; static shared token header,
-constant-time comparison, 16 KiB body limit). CORS allows only the local Vite origin.
+constant-time comparison, 16 KiB body limit). Private mode adds `/api/video/sources`:
+`capabilities`, `current`, create, `{id}/file`, `{id}/preview`, `{id}/template`,
+`{id}/configuration`, `{id}/play`, `{id}/play/{attempt}`, `DELETE {id}` and
+`cleanup/retry`; errors are `{category, field?}` bodies (contract frozen in the backend
+plan §19.3). CORS allows only the local Vite origin.
 No other endpoint is authenticated: the API is meant for `127.0.0.1`.
 
 ## 6. Configuration
@@ -120,8 +134,11 @@ value. Key switches: `SENTINEL_EVALUATION_TRANSPORT` (`langflow` default | `gemi
 `SENTINEL_GEMINI_*`, `SENTINEL_LANGFLOW_*`, `SENTINEL_CALLBACK_TOKEN`,
 `SENTINEL_EVALUATION_CALLBACK_TIMEOUT_SECONDS` (45), `SENTINEL_EVALUATION_MAX_DISPATCHES`,
 `SENTINEL_AUDIO_ALERT_*`, `SENTINEL_AUDIO_LOCAL_ALERT_FILE`, `SENTINEL_PARKING_MODE`,
-`SENTINEL_PRIVATE_PARKING_CONFIG_FILE` (local JSON read once at startup; path and content
-never logged), `SENTINEL_CLIP_MODEL_*`, `SENTINEL_VIDEO_STARTUP_TIMING_ENABLED`.
+`SENTINEL_PRIVATE_PARKING_CONFIG_FILE` (optional editor template, local JSON read once at
+startup; path and content never logged), `SENTINEL_PRIVATE_PARKING_EVALUATION`,
+`SENTINEL_CLIP_MODEL_*`, `SENTINEL_VIDEO_STARTUP_TIMING_ENABLED`. Fixed paths, not
+configurable: YOLO weights `backend/yolo26s.pt`, uploads `backend/app/storage/uploads/`
+(prepared files in its `prepared/` subfolder).
 
 ## 7. Threads and locks
 

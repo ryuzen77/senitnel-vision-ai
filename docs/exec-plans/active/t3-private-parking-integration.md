@@ -2316,8 +2316,9 @@ evidence was not included in the relay). Acceptance 24 and 30 finalised.
   WITH LIMITATIONS; review deltas 1–2; closure delta PASS, Codex via PM, 23 targeted tests;
   full suite 1,180 passed in the earlier independent review, not re-run). Committed as
   "feat: wire private parking runtime with fail-closed configuration". Not proven on a
-  real device. T3d prompt, gesture, configuration UI, local clip asset and real tests
-  remain open. Rev 3: C1 recorded (`SENTINEL_PRIVATE_PARKING_CONFIG_FILE`);
+  real device. At that closure T3d prompt, gesture, configuration UI, local clip asset
+  and real tests remained open; the T3d prompt and the configuration UI are done since
+  (T3d entry below; P1). Rev 3: C1 recorded (`SENTINEL_PRIVATE_PARKING_CONFIG_FILE`);
   sampler is the private bundle source; `DisabledParkingTrigger` for invalid
   modes/configs; audio factory validates the local clip without affecting the CRITICAL
   clip. The preview → line/zone → Play operator flow is a separate UI/API work item.
@@ -2325,10 +2326,21 @@ evidence was not included in the relay). Acceptance 24 and 30 finalised.
   LIMITATIONS and closure check PASS without blocker (Codex via PM, 2026-10-11); committed
   as "feat: enable direct Gemini evaluation for private parking" (see "T3d results", "T3d
   independent review" and "T3d closure"). Not proven: model accuracy, gesture, latency,
-  real devices. T3 as a whole is NOT complete (gesture source, local clip asset,
-  configuration UI and T3e remain).
+  real devices. T3 as a whole is NOT complete: the gesture source, the local clip asset
+  and T3e remain, and the private trigger, video path and VLM evaluation are not
+  validated on real footage or in the field. The configuration UI is no longer open: it
+  was delivered by P1 (P1d `67a04fb`, editor fix `8a6b8e5`).
 - **T3e: not started, not authorized** — waits for its own owner authorization
   (`docs/PLANS.md`).
+- Backlog recorded 2026-10-11 (not started): local warning voice clip — owner-approved
+  candidate text “Permisi, ada keperluan apa, ya? Kalau tidak ada keperluan, tolong
+  jangan pegang motornya.”, Indonesian TTS, natural, questioning then firm, separate from
+  the CRITICAL clip, duration within the current validator; asset not created, deterrent
+  effect unproven (tech-debt #15). Configuration UI flow:
+  [P1](private-parking-preview-configuration.md), committed `b3b7f3a`…`8a6b8e5` (fakes;
+  owner real-video UI test of Play, Stop, delete, line and ROI only, report baseline
+  `67a04fb`, commit of the running app not recorded). Camera health: draft
+  [C1H](camera-health-monitoring.md).
 - Open for review: the deviations and limitations listed under "T3a1 results", the
   worker identity extension in "T3a1 delta 1", the episode-instance contract in
   "T3a1 delta 2", and the audio point in §4.7.

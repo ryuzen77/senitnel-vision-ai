@@ -1,7 +1,12 @@
 # Private parking mode (home / kost)
 
-Status: T1 trigger core (`d999885`) and T2 evidence sampler (`36ffa20`) are built and
-reviewed; **not runtime-wired**. Integration is the draft plan
+Status: T1 trigger core (`d999885`) and T2 evidence sampler (`36ffa20`) are wired into
+runtime as an opt-in mode (T3c `d075207`, T3d `1771d6b`), proven with fakes only. The
+operator configuration flow (upload → preview → line/zones → save → Play) exists since
+P1 (`b3b7f3a`…`67a04fb`, editor fix `8a6b8e5`); with a real file the owner tested only
+Play, Stop, delete and line/zone drawing (report baseline `67a04fb`; commit of the running
+app not recorded), not the trigger or warnings. No gesture source, local voice asset or
+real-device run yet. Plan:
 [`../exec-plans/active/t3-private-parking-integration.md`](../exec-plans/active/t3-private-parking-integration.md).
 
 ## Why a mode, not a domain

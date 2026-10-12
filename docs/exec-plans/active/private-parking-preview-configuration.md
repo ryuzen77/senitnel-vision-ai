@@ -2,8 +2,14 @@
 
 Status: **rev 4.3 — P1a completed (core only, §15.4); P1b completed — lifecycle core
 verified with fakes (§17.2); P1c completed — runtime/API integration verified with fakes
-(§19.3, wire contract frozen for P1d); P1 as a whole is not complete: P1d (UI) remains
-and is not authorized; no real server, OpenCV decode or device proven.**
+(§19.3, wire contract frozen for P1d); P1d (UI) completed in `67a04fb`, frontend verified
+with API fakes (frontend plan §23). Real video (cloud and audio off): an agent local
+replay through the API on `67a04fb`, and an owner UI test of Play, Stop, delete, line and
+ROI only (report baseline `67a04fb`; commit of the running app not recorded), both in
+`completed/history.md`. The zone-editor fix that test called for is in
+`8a6b8e5` (frontend plan §24; fakes and independent review, no real-video re-test). P1 as
+a whole stays open until the owner closes it; private-trigger behaviour on real footage,
+accuracy and devices are not proven.**
 Author: Claude
 (implementing agent), 2026-10-11, from source read at `a45c986`. Review history: rev 1
 (`2fc0a08`) BLOCKED (five gaps), rev 2 (`53e27c1`) BLOCKED (R1-R4), rev 3 (`413c5ae`)
