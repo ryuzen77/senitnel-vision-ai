@@ -1242,11 +1242,17 @@ class VideoService:
     # ------------------------------------------------------------------
 
     def get_status(self) -> VideoStatusResponse:
+        """state, source, error and the reservation's session_ref/session_id in ONE
+        _lock section (never a mix of two reservations); ids are null once IDLE."""
         with self._lock:
+            session = self._current
+            identity = (session is not None and self._state is not VideoState.IDLE)
             return VideoStatusResponse(
                 state=self._state,
                 source=self._source,
                 error=self._error,
+                session_ref=session.session_ref if identity else None,
+                session_id=session.session_id if identity else None,
             )
 
     def get_latest_packet(self) -> FramePacket | None:

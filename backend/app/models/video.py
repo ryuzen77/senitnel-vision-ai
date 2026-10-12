@@ -56,6 +56,10 @@ class VideoStatusResponse(BaseModel):
     state: VideoState
     source: str | None = None
     error: str | None = None
+    # Additive (P1c, D6): the current reservation's public name and session id, read in
+    # the same lock section as ``state``; null without a reservation or once IDLE.
+    session_ref: str | None = None
+    session_id: str | None = None
 
 
 class VideoStartResponse(BaseModel):

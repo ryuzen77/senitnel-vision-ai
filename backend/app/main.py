@@ -8,6 +8,7 @@ from app.api import health
 from app.api import evaluation as evaluation_router
 from app.api import domain as domain_router
 from app.api import detections as detections_router
+from app.api import sources as sources_router
 from app.api import video as video_router
 from app.services.runtime import (
     audio_alert_gate,
@@ -20,6 +21,7 @@ from app.services.runtime import (
     parking_wiring,
     scene_domain_classifier,
     shutdown_services,
+    start_prepared_store,
     tracker_service,
     video_service,
 )
@@ -82,11 +84,16 @@ configure_evaluation_logging()
 async def lifespan(app: FastAPI):  # noqa: ANN001
     # ── Startup ──────────────────────────────────────────────────────────────
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    store = start_prepared_store()               # private mode only; sweeps its own directory
     evaluation_worker.start()
     if audio_alert_gate is not None:
         audio_alert_gate.start()
     yield
     # ── Shutdown ─────────────────────────────────────────────────────────────
+    # One Stop owner (P1c): the store's phases never call VideoService; the single
+    # video.stop() is the one inside shutdown_services().
+    if store is not None:
+        store.begin_shutdown()
     shutdown_services(
         video_service, scene_domain_classifier, detector_service,
         parking_candidate_trigger, tracker_service, event_frame_buffer,
@@ -99,6 +106,8 @@ async def lifespan(app: FastAPI):  # noqa: ANN001
         frame_tee=parking_wiring.tee,
         sampler=parking_wiring.sampler,
     )
+    if store is not None:
+        store.finish_shutdown()
 
 
 app = FastAPI(
@@ -124,4 +133,5 @@ app.include_router(health.router, prefix="/api")
 app.include_router(domain_router.router, prefix="/api")
 app.include_router(detections_router.router, prefix="/api")
 app.include_router(video_router.router, prefix="/api")
+app.include_router(sources_router.router, prefix="/api")
 app.include_router(evaluation_router.router, prefix="/api")

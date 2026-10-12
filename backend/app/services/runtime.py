@@ -15,6 +15,14 @@ is ``true`` (unset/``false`` = off, any other value = off with a warning), the s
 transport is ``gemini`` (the only one with the private prompt; Langflow = off with a
 warning) and the existing Gemini configuration is ready. Enabling it is a configuration
 change only; a live request still needs the owner's permission.
+
+Private mode (P1c): the startup configuration file is only an optional template; the
+trigger always reads the operator configuration bound to each session in the
+``SessionConfigRegistry`` (no fallback), VideoService binds it per lease, and the
+``PreparedSourceStore`` (dedicated directory, created in the application lifespan because
+its constructor sweeps that directory) owns uploaded files. Shutdown has one Stop owner:
+``store.begin_shutdown()``, then :func:`shutdown_services` (its single ``video.stop()``),
+then ``store.finish_shutdown()``.
 """
 
 from __future__ import annotations
@@ -55,7 +63,9 @@ from app.services.scene_domain_classifier import SceneDomainClassifier
 from app.services.parking_candidate_trigger import ParkingCandidateTrigger
 from app.services.private_parking_coordinator import FrameSinkTee, PrivateParkingCoordinator
 from app.services.private_parking_evidence_sampler import EpisodeEvidenceSampler
+from app.services.prepared_source import PreparedSourceStore
 from app.services.private_parking_trigger import PrivateParkingTrigger
+from app.services.session_config_registry import SessionConfigRegistry
 from app.services.tracker_service import TrackerService
 from app.services.video_service import VideoService
 
@@ -276,7 +286,7 @@ def _read_private_parking_config(env: Mapping[str, str]) -> PrivateParkingConfig
             except (UnicodeDecodeError, ValueError, TypeError, OverflowError, RecursionError):
                 config = None
     if config is None:
-        logger.warning("Private parking disabled: invalid configuration")
+        logger.warning("Private parking template unavailable: missing or invalid configuration")
     return config
 
 
@@ -324,6 +334,8 @@ class ParkingWiring:
     sampler: EpisodeEvidenceSampler | None = None
     coordinator: PrivateParkingCoordinator | None = None
     tee: FrameSinkTee | None = None
+    registry: SessionConfigRegistry | None = None    # private: operator configuration per lease
+    template: PrivateParkingConfig | None = None     # private: optional startup template
 
 
 def build_parking_wiring(env: Mapping[str, str], *, event_frame_buffer: EventFrameBuffer,
@@ -341,13 +353,16 @@ def build_parking_wiring(env: Mapping[str, str], *, event_frame_buffer: EventFra
         trigger = ParkingCandidateTrigger()
         return ParkingWiring("legacy", trigger, trigger, event_frame_buffer, event_frame_buffer,
                              None, frozenset(), None)
-    config = _read_private_parking_config(env) if mode == "private" else None
-    if config is None:
+    if mode == "disabled":
         disabled = DisabledParkingTrigger()
         return ParkingWiring("disabled", disabled, disabled, event_frame_buffer, event_frame_buffer,
                              None, frozenset(), False)
+    # Private (P1c): the startup file is an optional template only; analysis uses the
+    # operator configuration bound to each session, and a session without one is refused.
+    template = _read_private_parking_config(env)
+    registry = SessionConfigRegistry()
     # No gesture/authorization source exists yet: every unauthorized approach warns.
-    private_trigger = PrivateParkingTrigger(config, clock=clock)
+    private_trigger = PrivateParkingTrigger(session_config=registry.get, clock=clock)
     sampler = EpisodeEvidenceSampler(clock=clock)
     coordinator = PrivateParkingCoordinator(private_trigger, sampler, audio_gate=audio_gate)
     tee = FrameSinkTee(event_frame_buffer, sampler)
@@ -356,6 +371,7 @@ def build_parking_wiring(env: Mapping[str, str], *, event_frame_buffer: EventFra
         {DomainName.PARKING_MOTORCYCLE: sampler.plan_for_candidate},
         PRIVATE_REQUIRED_SINKS, False,
         private_trigger=private_trigger, sampler=sampler, coordinator=coordinator, tee=tee,
+        registry=registry, template=template,
     )
 
 # This is the one shared production GPU gate.  It is injected, never looked up
@@ -418,7 +434,26 @@ video_service = VideoService(
     event_frame_buffer=parking_wiring.buffer_slot,
     evaluation_worker=evaluation_worker,
     required_sinks=parking_wiring.required_sinks,
+    session_config_registry=parking_wiring.registry,
 )
+
+# Prepared sources (P1c, private mode only): a dedicated directory, never UPLOAD_DIR itself.
+# It sits inside the git-ignored uploads tree, so prepared videos can never be committed;
+# the legacy upload route writes only directly into UPLOAD_DIR and never sweeps. The store
+# is created by the application lifespan (its constructor sweeps only this directory).
+PREPARED_DIR: Path = Path(__file__).resolve().parent.parent / "storage" / "uploads" / "prepared"
+prepared_store: PreparedSourceStore | None = None
+
+
+def start_prepared_store(directory: Path = PREPARED_DIR, **store_options) -> PreparedSourceStore | None:
+    """Private mode: create the store (startup sweep of ``directory``) and start its
+    sweeper once; other modes have no store."""
+    global prepared_store
+    if parking_wiring.mode != "private" or prepared_store is not None:
+        return prepared_store
+    prepared_store = PreparedSourceStore(directory, video=video_service, **store_options)
+    prepared_store.start()
+    return prepared_store
 
 
 def shutdown_services(

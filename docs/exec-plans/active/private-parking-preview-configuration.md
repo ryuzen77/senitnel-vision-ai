@@ -1,8 +1,9 @@
 # P1 — Private parking: file upload → preview → line/zone configuration → Play
 
 Status: **rev 4.3 — P1a completed (core only, §15.4); P1b completed — lifecycle core
-verified with fakes (§17.2); P1 as a whole is not complete: P1c (API/runtime incl. the
-leftover recovery action) and P1d (UI) remain and are not authorized; no real device.**
+verified with fakes (§17.2); P1c completed — runtime/API integration verified with fakes
+(§19.3, wire contract frozen for P1d); P1 as a whole is not complete: P1d (UI) remains
+and is not authorized; no real server, OpenCV decode or device proven.**
 Author: Claude
 (implementing agent), 2026-10-11, from source read at `a45c986`. Review history: rev 1
 (`2fc0a08`) BLOCKED (five gaps), rev 2 (`53e27c1`) BLOCKED (R1-R4), rev 3 (`413c5ae`)
@@ -1285,9 +1286,15 @@ coordinator tests do not assert the old swallowed start; the re-raise is covered
 - Nothing is wired: the runtime still builds the startup-file trigger and no store,
   registry or decoder (P1c); `get_status()`/`models/video.py` unchanged (P1c).
 - After a required refusal, an open or thread-start failure or a size mismatch,
-  VideoService stays `ERROR` until an explicit Stop (existing T3c0.2 contract); in the
-  composed store the next Play is then an accepted CAS answered `REFUSED video_busy`
-  until the operator stops. P1c must surface this (Stop before the next Play).
+  VideoService stays `ERROR` until an explicit Stop (existing T3c0.2 contract). In the
+  composed store the next Play depends on the store's checks **before** the CAS: after a
+  required refusal or an open/thread-start failure they pass, so the Play is an accepted
+  CAS answered `REFUSED video_busy` until the operator stops; after a size mismatch the
+  generation is `geometry_unstable` (or still `ENDING` until the clean hook), so the Play
+  is refused before the CAS (`409 source_geometry_unstable` / `session_cleanup_pending`,
+  `next_attempt` unchanged) and stays refused after Stop: the remedy is delete, a new
+  upload and a newly confirmed configuration. P1c must surface the Stop requirement.
+  (Corrected 2026-10-12 after the Codex review of the P1c design rev 2.)
 - A store hook that keeps failing keeps VideoService `ERROR` until a Stop delivers it;
   the store stays fail-closed meanwhile.
 - The preview capture owner (§16.4) is P1c and not implemented; `read_first_frame` exists
@@ -1357,4 +1364,556 @@ added after it.
 wiring (P1c), the preview capture owner (§16.4, P1c), the leftover recovery action
 (§0.2.2, P1c), the status wire fields (P1c), UI (P1d), real video files, real devices.
 The integration limits of §17 stay open, in particular `ERROR` until an explicit Stop
-after a refusal, open failure or size mismatch.
+after a refusal, open failure or size mismatch (a size mismatch additionally leaves the
+generation unplayable, §17).
+
+## 18. P1c delta plan against the P1b baseline (design rev 3; implemented, §19)
+
+Author: Claude, 2026-10-12. **P1c was authorized by the owner on design rev 3
+(`93eb76e`) and is implemented (§19), awaiting independent review.** This section fixes
+what P1c would change relative to the committed P1a/P1b code and to §5, §7 and §14, so
+the owner and Codex can review it first. Rev 2 records the PM decisions of 2026-10-12
+(18.1a) and aligns states, HTTP contract and acceptance with them. Rev 3 (Codex review of
+rev 2 `4a5a99d`, BLOCKED on one point) aligns the size-mismatch acceptance with the sticky
+geometry contract (item 9, acceptance 8, §17) and closes the window between capture
+adoption and busy marking (item 3, acceptance 11).
+
+### 18.1 Preflight
+
+- Baseline: HEAD `3c5446a` (`feat: add prepared video lifecycle and session
+  configuration`) = `origin/main`, on top of R1 `c7d4ddc`; nothing staged; `backend/`
+  clean.
+- Uncommitted files of other authors, untouched: `ARCHITECTURE.md`, `PLAN.md` (their
+  rows; the R1 row is committed), `docs/FRONTEND.md`, `docs/design-docs/private-parking-mode.md`,
+  `docs/exec-plans/active/t3-private-parking-integration.md`,
+  `docs/exec-plans/completed/history.md`, `docs/exec-plans/tech-debt-tracker.md`,
+  `docs/product-specs/index.md`, the F1 move, the untracked camera-health and UI plans,
+  the original R1 copy, and the root reference files.
+- `backend/.env.example` read under the owner's authorization (decision 7). Its private
+  mode text still says that a missing or invalid configuration file disables parking
+  candidates; P1c changes that wording (the file becomes an optional template). The real
+  environment files (`.env`, `.env.smoke.local`) are neither read nor changed.
+
+Source facts read at `3c5446a` (no execution):
+
+| Fact | Where |
+|---|---|
+| Legacy routes: `POST /webcam/start`, `POST /upload` (own 200 MiB stream to `UPLOAD_DIR`, own `cv2` probe released in `finally`, `claim_start`/`start_file`), `POST /stop` (`stop()` then status), `GET /status`, `GET /stream` | `app/api/video.py:58-260` |
+| Status wire model `{state, source, error}` | `app/models/video.py:55-58` |
+| Runtime: `build_parking_wiring` builds the startup-file `PrivateParkingTrigger(config)` or the disabled path; `VideoService` built without registry or decoder; module-level singletons | `app/services/runtime.py:329-361`, `:415-421` |
+| Shutdown: `video.stop()` first, then audio, worker, clients, classifier, detector, coordinator, trigger, tracker, tee, buffer, sampler, budget | `app/services/runtime.py:424-454` |
+| Lifespan: creates `UPLOAD_DIR`, starts the worker and audio gate; routers under `/api` | `app/main.py:82-101`, `:123-127` |
+| P1a store `close()` calls `video.stop()` itself (standalone shutdown, D11) | `app/services/prepared_source.py` (`close`) |
+
+### 18.1a PM decisions (owner, 2026-10-12)
+
+1. **Separate cleanup conditions.** A capture may be released once its constructor has
+   returned and no probe or decode is running on it. The file is deleted only after every
+   file user has finished. A capture's own handle never blocks the release of that capture.
+2. **One capture per store.** At most one preview/probe capture exists per store, counting
+   one being constructed or waiting for cleanup. While a capture cleanup is pending, no
+   replacement capture is created and no new upload, preview, configuration or Play is
+   accepted.
+3. **Failed release.** A successful probe is not enough for `PREPARED`: if the probe's
+   capture release fails, the answer is `503 cleanup_pending` with the source identity and
+   generation, ownership is kept, and after the cleanup succeeds the failed operation's
+   file is deleted and the operator uploads again.
+4. **HTTP contract.** `frame_size_changed` is part of the contract; refusals before the CAS
+   are distinguished from `200 REFUSED video_busy` after it; `analysis_stop_required` is
+   transient information tied to a session identity, never a readiness input.
+5. **Configuration size.** 4096 bytes apply to the whole JSON request envelope of the
+   configuration request; the too-large answer and the frontend handling are aligned.
+6. **Shutdown.** Exactly one owner calls Stop; `store.close()` and `shutdown_services()`
+   must not each add a Stop attempt. A timeout keeps the obligations.
+7. **Environment scope.** Claude may read and edit `backend/.env.example` for
+   documentation and placeholders, never a real `.env`.
+
+### 18.2 Contract deltas for P1c
+
+1. **Runtime composition (private mode).** One `SessionConfigRegistry`; the trigger is
+   always `PrivateParkingTrigger(session_config=registry.get)` in private mode; the startup
+   file is only a template (§7.1): invalid or missing → `template_available: false` and a
+   generic warning, never the disabled path. `VideoService(..., session_config_registry=registry)`.
+   The store uses a **dedicated directory** (`app/storage/prepared`), never `UPLOAD_DIR`;
+   it is created in the lifespan startup (its constructor sweeps the directory) and
+   reached by the router through a runtime accessor that tests can replace with fakes.
+   Legacy and disabled modes have no store. `DisabledParkingTrigger` only for an invalid
+   mode value.
+2. **Shutdown with one Stop owner (decision 6).** The store gets a two-phase shutdown used
+   by the runtime: `store.begin_shutdown()` (admission closed for good, open ticket
+   cancelled, slot voided, sweeper stopped; **no VideoService call**), then the existing
+   `shutdown_services()` whose single `video.stop()` is the only Stop, then
+   `store.finish_shutdown()` (at most one final release per capture obligation and one
+   final deletion per file obligation without users, within the budget). `store.close()`
+   stays for standalone use (= both phases plus its own Stop) and is not called by the
+   runtime. A Stop that times out (hook not delivered) leaves the ticket holding the file:
+   the final deletion is skipped, the obligation is logged generically and the startup
+   sweep handles the file (D12).
+3. **Capture slot and cleanup conditions (decisions 1-3) — store extension.** The store
+   owns one **capture slot**: `EMPTY → CREATING → OWNED(busy | idle) → RELEASE_PENDING →
+   EMPTY`, plus `RELEASE_STALLED`. `begin_capture(handle, kind)` reserves the slot under
+   the store lock **before** `create_capture` (a second reservation: `409 capture_busy`;
+   during `RELEASE_PENDING`/`RELEASE_STALLED`: `503 cleanup_pending`). The constructor runs
+   outside the lock; a constructor that raises frees the slot (nothing to release). Its
+   return is adopted by `adopt_capture(handle, capture) -> bool`, which in **one** store
+   lock section records the owner and, only if the handle's operation is still valid (not
+   cancelled, expired or shut down), marks the capture **busy** for the caller's next call
+   and returns `True`; otherwise it adopts it idle and returns `False`, and the caller
+   releases it without any call on it. There is no window between adoption and busy
+   marking, so a cancel, expiry or shutdown can never release a capture that the handler
+   then probes or decodes. Every later use goes through `begin_use(handle)` with the same
+   validity check in the same section; `end_use(handle)` clears busy and, if the operation
+   was invalidated meanwhile, makes the caller the releaser in that section. **Release
+   condition:** adopted and not busy — independent of the file
+   users and of the handle that owns it, so the handle never blocks its own release.
+   Whoever makes the condition true releases it, single flight: the probing/decoding
+   thread when it finishes, or the canceller (DELETE, expiry, close) when the capture is
+   already idle. A failed release → `RELEASE_PENDING` (retry every 60 s, `RELEASE_STALLED`
+   after 10, explicit retry through the recovery action). **File deletion condition:** no
+   file user at all — writer, readers, tickets **and an unreleased capture** (the capture
+   counts as a user until released).
+4. **Failed probe release (decision 3).** Probe succeeds but its release fails → the
+   source is **not** `PREPARED`: the generation is voided with reason
+   `probe_release_failed`, the write answers `503 {category: "cleanup_pending",
+   source_id, generation}`, the capture obligation keeps the file in use; after a
+   successful release the file is deleted through the normal obligation and the slot
+   becomes free (the operator uploads again). A failed **preview** release answers `503
+   {category: "cleanup_pending", source_id, generation}` without the image; the source is
+   not voided, but config, Play, upload and preview are refused until the release succeeds
+   (decision 2); its idle TTL keeps running and an expiry waits for the release before
+   the file is deleted.
+5. **Refusals while a capture cleanup is pending (decision 2).** `PUT /{id}/file`,
+   `GET /preview`, `PUT /configuration` and `POST /play` → `503 {category:
+   "cleanup_pending", source_id, generation}`; `POST /` → `409 cleanup_pending`
+   (admission, §5). Still available: `GET /template` (no capture is created), `/current`,
+   `/play/{attempt}` and capabilities. `DELETE` stays allowed (it voids the generation; the
+   deletion waits for the release).
+6. **API `/api/video/sources` (§5) and wire models (`models/sources.py`).** Frozen for P1d:
+
+   | Situation | Answer |
+   |---|---|
+   | Refused **before** the CAS (identity, generation, revision, attempt rules, `play_in_progress`, `session_cleanup_pending`, `config_not_ready`, `source_geometry_unstable`, `attempt_limit`, `operation_reused`) | `409 {category}` (`410` for `outcome_evicted`/`source_gone` lookups), nothing started, `next_attempt` unchanged |
+   | Capture cleanup pending | `503 {category: "cleanup_pending", source_id, generation}` |
+   | Passed the CAS | `200` attempt record; `outcome` `STARTED`, `REFUSED` (`reason`: `video_busy`, `required_component_refused`, `stopped`, `configuration_unavailable`), `FAILED` (`start_failed`), `TIMED_OUT`, `CANCELLED`; the attempt is used; replay identical; no server retry |
+   | Session sub-record | `session.end_reason` ∈ `stop`, `eof`, `error`, `refused`, `cancelled`, **`frame_size_changed`**; `cleanup_ok` `true`/`false`/`null` |
+   | Generation after `frame_size_changed` | `/current.geometry_unstable: true`, `config.ready: false`; Play `409 source_geometry_unstable`; re-save `409 source_geometry_unstable` |
+
+   The upload handler streams to the store-provided path (200 MiB, MP4/WebM), checks the
+   write handle's cancel flag between chunks, probes through the capture slot and ends
+   through `finish_write`/`fail_write`.
+7. **Configuration envelope (decision 5).** The `PUT /configuration` body is read with a
+   cap: more than 4096 bytes of the whole JSON envelope (`generation`,
+   `expected_revision`, `frame_width`, `frame_height`, `line`, `inside`, `zones`) →
+   `413 {category: "configuration_too_large"}` before parsing; nothing changes and the
+   TTL is not reset. The model's canonical-size check stays as a second guard
+   (`422 invalid_geometry`, field `configuration`). Frontend: compute the serialized
+   envelope size before sending, show the size error in the form, keep the draft, never
+   retry automatically (recorded for the frontend plan; P1c only freezes the contract).
+8. **Status identity (D6) — one lock section.** `VideoStatusResponse` gains optional
+   `session_ref` and `session_id`; `get_status()` reads `state`, `source`, `error`,
+   `session_ref`, `session_id` in **one** `_lock` section. Precondition (§5.3, D8): the
+   composed runtime uses the default `session_id` factory; no environment value or API
+   input can set it.
+9. **`ERROR` until Stop, informational only (decision 4).** VideoService stays `ERROR`
+   after a required refusal, an open or thread-start failure, a size mismatch, a failed
+   hook delivery or a failed unbind until an explicit Stop; no endpoint stops
+   automatically. `/current` adds `analysis: {stop_required, state, session_ref,
+   session_id}` read from `video.get_status()` **outside** the store lock: a separate,
+   transient observation tied to that session identity. It never enters `config.ready`,
+   admission or the Play decision. The Play answer stays authoritative and follows the
+   store's checks **before** the CAS first: `source_geometry_unstable` (after a size
+   mismatch, sticky), `session_cleanup_pending` (session not yet cleaned), `cleanup_pending`
+   (capture or file cleanup pending, 503) and the other 18.2 item 6 cases refuse without
+   using an attempt. Only when all of them pass is the Play an accepted CAS, answered `200
+   REFUSED video_busy` while VideoService is not `IDLE`. After `POST /api/video/stop`
+   VideoService recovers; a refused-start or open-failure generation can then start the
+   next Play, a `geometry_unstable` generation never can (delete, new upload, new
+   configuration).
+10. **Leftover and capture recovery (§0.2.2).** `POST /api/video/sources/cleanup/retry`
+    (private mode, no body) → `store.retry_cleanup()`: one attempt per **stalled**
+    obligation — file deletion or capture release — without an attempt in flight (a file
+    deletion additionally needs no user), through the existing single-flight flags; only
+    obligations the store recorded itself; no path, name or pattern from the request; no
+    loop, no reset of the attempt count. `202 {cleanup: {pending, stalled, attempted}}`
+    (counts only), `204` when none remains, `409 private_mode_inactive` / `closed`.
+11. **Legacy routes by mode.** Private: `POST /webcam/start` and `POST /upload` answer `409
+    private_flow_required` before any reservation, write or probe. Legacy: every `/sources`
+    mutation `409 private_mode_inactive`; capabilities answers. `POST /stop`, `GET
+    /status`, `GET /stream` unchanged.
+12. **Sanitization.** No path, file name, configuration value, token, lease, JPEG/base64 or
+    provider body in logs or error bodies; the preview answer is the image only.
+13. **`.env.example` (decision 7).** Private-mode text: the configuration file is an
+    optional template; missing/invalid → no template, never disabled; the size limit and
+    the prepared-source directory documented; placeholders only, no values.
+
+### 18.3 Files, tests and acceptance
+
+| Files | Tests |
+|---|---|
+| new `app/api/sources.py`, `app/models/sources.py`; `app/api/video.py` (mode refusal); `app/models/video.py` (identity fields); `app/services/video_service.py` (`get_status` in one section); `app/services/runtime.py`, `app/main.py` (composition, lifespan, two-phase shutdown); `app/services/prepared_source.py` (capture slot, capture obligations, `begin_shutdown`/`finish_shutdown`, `retry_cleanup`); `backend/.env.example` | new `test_sources_api.py` (TestClient, fake decoder, fake filesystem and clock through the runtime accessor); capture-slot and shutdown cases in `test_prepared_source.py` / `test_prepared_source_races.py`; adapted `test_private_parking_runtime_wiring.py`, `test_private_parking_evaluation_enable.py`, `test_video_api.py`, `test_video_upload_rollback.py`, `test_evaluation_runtime_integration.py` |
+
+Acceptance (fakes, `threading.Event` gates with timeouts, fake clock; no server, real
+video, device or provider):
+
+1. **§9 over HTTP:** §9.1-§9.3, §9.9, §9.10, §9.11 (polling `/current`, `/play/{n}`,
+   `/capabilities`, `/api/video/status` never resets the TTL), §9.13 (wire models,
+   one-section status read with a gate between reservation and sink start, the factory
+   precondition on the composed runtime).
+2. **Gate tests — capture constructor.** Gate inside `create_capture` for an upload probe
+   and for a preview: (a) `DELETE`, (b) expiry (fake clock, no sweeper pass, then a tick),
+   (c) `begin_shutdown`/`finish_shutdown` while the constructor is held. On release:
+   the capture is adopted and released **once** by the creating thread (idle, cancelled),
+   the probe/decode never runs, no `PREPARED`, no image; the file is deleted only after
+   the release and every other user ended; a second capture request during the gate →
+   `409 capture_busy`, zero extra constructor calls. Constructor raising → slot free,
+   nothing released, file deletion proceeds.
+3. **Gate tests — probe and decode.** Gate inside `probe` and inside `read_first_frame`:
+   (a) `DELETE`, (b) expiry, (c) shutdown while held → no release during the call (busy);
+   on return the calling thread releases once; the result is discarded (`409 cancelled` /
+   `deadline_exceeded` for the write, `409 expired`/`source_gone` for the preview);
+   file deletion only afterwards. With the release then failing → capture obligation,
+   `503 cleanup_pending` with `source_id`/`generation`, file kept.
+4. **Failed release (decision 3).** Probe succeeds, release fails once → `503
+   cleanup_pending` with identity, not `PREPARED`; every new upload, preview, configuration
+   and Play `503 cleanup_pending`, `POST /` `409 cleanup_pending`, zero new constructor
+   calls; the retry 60 s later succeeds → file deleted, slot `EMPTY`, admission open, a new
+   upload works. Preview variant: source kept, requests refused until the retry succeeds,
+   then usable again.
+5. **Stalled capture recovery.** Release failing 10 times → `RELEASE_STALLED`, no further
+   automatic attempt, `/current.cleanup` lists it; `POST /cleanup/retry` → exactly one
+   attempt (gated: a concurrent retry, `DELETE` and sweeper pass add none); success →
+   file deletion proceeds; repeated failure keeps the obligation; counts only in the body.
+6. **Shutdown without a double Stop (decision 6).** Spy on `video.stop`: the composed
+   shutdown calls it **exactly once** (zero calls from the store phases). With a session
+   running: the single Stop delivers the hook, `finish_shutdown` deletes the file once.
+   With the hook gated past the Stop wait: no second Stop, the ticket keeps the file,
+   `finish_shutdown` skips the deletion, the obligation is logged, no exception. With a
+   capture obligation: one final release attempt only. With an attempt already in
+   flight: none started beside it.
+7. **Configuration envelope (decision 5).** 4096 bytes → accepted (if valid); 4097 → `413
+   configuration_too_large`, nothing changed, TTL not reset; a body without a length
+   header read with the cap; the canonical-size guard still `422`.
+8. **`ERROR` until Stop (decision 4).** (a) Required refusal and open failure each →
+   `/current.analysis.stop_required: true` with that session's identity, `config.ready`
+   unchanged by it, next Play `200 REFUSED video_busy` with the attempt used; `POST /stop`
+   → next Play `STARTED`. (b) Size mismatch (aligned 2026-10-12 with the implemented
+   check order): while the hook is not yet applied the slot is still `PLAYING`, so Play
+   answers `409 play_in_progress`; once the `frame_size_changed` hook is applied — with
+   `cleanup_ok` `true`, `false` or `null` — Play answers `409 source_geometry_unstable`
+   (checked before `session_cleanup_pending`). All of these refusals happen **before the
+   CAS** (`next_attempt` unchanged, no VideoService call); after `POST /stop` VideoService
+   is `IDLE` but the generation stays
+   unplayable (same `409`); `DELETE`, a new upload and a newly confirmed configuration →
+   Play `STARTED`. (c) Capture cleanup pending → Play `503 cleanup_pending` before the
+   CAS. (d) A stale `analysis` observation (other `session_id`) never changes readiness.
+9. **Runtime and modes.** Private with missing/invalid startup file → store, registry,
+   per-session trigger built, `template_available: false`; legacy → no store, legacy routes
+   unchanged; private-mode legacy routes `409 private_flow_required` before reservation,
+   write or probe; the startup sweep touches only the dedicated directory.
+10. Full backend suite, `pip check`, `git diff --check`; then the shared documents (18.4).
+11. **Gate between adoption and use (rev 3).** Gate at the constructor's return (before
+    `adopt_capture`) and fire (a) `DELETE`, (b) expiry, (c) `begin_shutdown`; release →
+    `adopt_capture` returns `False`, the handler makes **zero** probe/decode calls (spy),
+    the capture is released once by the handler, the file deletion follows. Fire the same
+    events right after `adopt_capture` returned `True` (gate at the start of `probe` /
+    `read_first_frame`) → no release while busy; `end_use` makes the handler the releaser;
+    one release. Concurrent `begin_use` after an invalidation → refused, no call on the
+    capture.
+
+### 18.4 Risks and open points for the review
+
+- **Mode-specific behaviour change (M3):** private mode refuses the legacy start routes;
+  webcam analysis is unavailable in private mode until a webcam preview phase exists.
+- **Shared documents:** `ARCHITECTURE.md` and `PLAN.md` carry uncommitted changes of other
+  authors; P1c's documentation step must be coordinated (owner decides order).
+- **One capture per store** serializes previews: a second operator tab gets `409
+  capture_busy` while a decode runs (intended by decision 2).
+- The store's `close()` keeps its own Stop for standalone use; the runtime must never call
+  it together with `shutdown_services()` (acceptance 6 checks the composed path).
+- Open technical points carried over (§11): `DELETE` `202` vs `204`, zone renaming,
+  first-frame preview, zone overlap. The 4096-byte question is decided (decision 5).
+- The frozen HTTP table (18.2 item 6) must be reviewed before P1d starts on fakes.
+
+## 19. P1c implementation record (Claude, 2026-10-12) — completed, §19.3
+
+Authorization: owner, on design rev 3 (`93eb76e`), with acceptance 8(b) aligned first
+(18.3: `409 play_in_progress` before the hook is applied, `409 source_geometry_unstable`
+once the `frame_size_changed` hook is applied with any `cleanup_ok`, all before the CAS).
+Preflight: HEAD `3c5446a` = `origin/main`, nothing staged, `backend/` clean; documents of
+other authors untouched; `backend/.env.example` read and edited under decision 7, no real
+environment file read.
+
+**Files:**
+
+| File | Change |
+|---|---|
+| new `backend/app/api/sources.py` | `/api/video/sources` routes; strict body/query parsing (never echoed); category → status table; upload streaming + probe through the capture slot; preview decode through the capture slot; 4096-byte envelope cap; recovery action |
+| new `backend/app/models/sources.py` | Frozen wire models (attempt record, `/current`, capabilities, template, saved configuration) |
+| `backend/app/services/prepared_source.py` | Capture slot (`begin_capture`, `capture_failed`, `adopt_capture`, `finish_capture`, release obligation with retry/stall), an unreleased capture counts as a file user, `cleanup_pending` refusals before the CAS, `retry_cleanup`, two-phase shutdown (`begin_shutdown`/`finish_shutdown`; `close()` = both + its own Stop), snapshot `capture_state`/`capture_attempts`, `write_refusal`/`read_refusal` |
+| `backend/app/services/video_service.py` | `get_status()` adds `session_ref`/`session_id` in the same `_lock` section |
+| `backend/app/models/video.py` | `VideoStatusResponse` additive `session_ref`, `session_id` |
+| `backend/app/services/runtime.py` | Private mode always private: registry, `PrivateParkingTrigger(session_config=registry.get)`, optional template; `VideoService(session_config_registry=...)`; `PREPARED_DIR`, `prepared_store`, `start_prepared_store()` |
+| `backend/app/main.py` | Sources router; lifespan creates the store (private only); shutdown `begin_shutdown` → `shutdown_services` (the single Stop) → `finish_shutdown` |
+| `backend/app/api/video.py` | Private mode: `POST /webcam/start` and `POST /upload` → `409 {category: private_flow_required}` before any reservation, write or probe |
+| `backend/.env.example` | Private-mode text: the configuration file is an optional template, the prepared directory, no disabled path |
+| new `backend/tests/test_sources_api.py` (35 tests) | HTTP flow, Play contract, envelope, capture gates, failed release, recovery, shutdown, status identity, factory, legacy refusal, runtime store |
+| `backend/tests/test_private_parking_runtime_wiring.py` (adapted) | Invalid/missing template → private without template and no fallback (was: disabled); private sessions start through `start_prepared_file` with the bound configuration; the `Stack` binds per lease like VideoService; subprocess mode selection updated |
+
+**Actual wire contract (`/api/video/sources`):**
+
+| Method / path | Success | Refusals (`{category, field?}`) |
+|---|---|---|
+| `GET /capabilities` | `200 {mode, preparation_available, source_kinds:["file"], template_available, evaluation_enabled, limits:{max_upload_bytes, accepted_types, max_zones, min_line_length, min_zone_area, max_configuration_bytes}}` | — (every mode) |
+| `POST /` `{operation_id}` (UUID) | `201 {source_id, generation, state}`; same `operation_id` → same source | `409 slot_busy / cleanup_pending / private_mode_inactive`, `422 invalid_request / invalid_operation_id`, `503 storage_unavailable / closed` |
+| `PUT /{id}/file?generation=g` (multipart) | `200 {state:"PREPARED", frame_width, frame_height, preview_revision}` (decoded first-frame size) | `409 generation_mismatch / upload_not_expected / cancelled / deadline_exceeded / capture_busy`, `410 source_gone`, `422 missing_file / unsupported_type / too_large / not_decodable / invalid_request`, `500 write_failed`, **`503 {category:"cleanup_pending", source_id, generation}`** (probe release failed: not `PREPARED`, file deleted after the release, upload again), `503 closed` |
+| `GET /current` | `200 {source_id, generation, state, upload_operation_id, frame_width, frame_height, preview_revision, config:{revision, ready}\|null, geometry_unstable, template_available, next_attempt, last_attempt, expires_in_seconds, deadline_in_seconds, cleanup:{pending, reason, attempts, capture, capture_attempts}, analysis:{stop_required, state, session_ref, session_id}}` or `204` | `409 private_mode_inactive` |
+| `GET /{id}/preview?generation=g` | `200 image/jpeg` | `409 generation_mismatch / expired / not_prepared / capture_busy`, `410 source_gone`, `500 preview_failed`, `503 cleanup_pending` + ids |
+| `GET /{id}/template?generation=g` | `200 {line:{p1,p2}, inside, zones, frame_width, frame_height, confirmed:false}` or `204` | as preview (no capture) |
+| `PUT /{id}/configuration` (envelope ≤ 4096 bytes) | `200 {revision, ready, canonical}` | `413 configuration_too_large` (before parsing), `422 invalid_request / invalid_geometry + field`, `409 generation_mismatch / revision_conflict / frame_size_mismatch / play_pending / playing / session_cleanup_pending / source_geometry_unstable / not_prepared`, `503 cleanup_pending` + ids |
+| `DELETE /{id}?generation=g` | `202 {state:"DELETING"}` or `204` | `409 generation_mismatch / playing / session_cleanup_pending`, `404` |
+| `POST /{id}/play` `{generation, config_revision, attempt, operation_id}` | **`200` attempt record for every Play past the CAS** (`STARTED`, `REFUSED` + `video_busy` / `required_component_refused` / `stopped` / `configuration_unavailable`, `FAILED start_failed`, `TIMED_OUT`, `CANCELLED`); replay identical | before the CAS: `409 operation_reused / attempt_superseded / attempt_conflict / attempt_limit / source_geometry_unstable / session_cleanup_pending / play_in_progress / config_not_ready / revision_stale`, `410 outcome_evicted / source_gone`, `503 cleanup_pending` + ids |
+| `GET /{id}/play/{attempt}` | `200` attempt record | `404 unknown_attempt / unknown_source`, `410 outcome_evicted / source_gone` |
+| `POST /cleanup/retry` | `202 {cleanup:{pending, stalled, attempted}}` or `204` | `409 private_mode_inactive`, `503 closed` |
+
+Attempt record: `{attempt, operation_id, outcome, reason, session_ref, session_id,
+session:{phase NONE|RUNNING|ENDING|ENDED, end_reason stop|eof|error|refused|cancelled|frame_size_changed|null, cleanup_ok}}`.
+`GET /api/video/status` adds `session_ref` and `session_id` (null once `IDLE`).
+
+**Deviations from the design text, for the reviewer:**
+
+1. `begin_use`/`end_use` are not separate calls: every capture has exactly one use (the
+   upload probe or the preview decode). `adopt_capture` marks it busy for that use only
+   if the operation is valid; `finish_capture` ends the use and releases in one call. A
+   second use of one capture does not exist, so the separate re-check is not needed.
+2. `source_gone` answers `410` on every route (not only lookups); `closed` answers `503`.
+3. The prepared directory is `backend/app/storage/uploads/prepared`, not
+   `app/storage/prepared`: only `backend/app/storage/uploads/*` is git-ignored, and
+   `.gitignore` is outside the P1c scope, so a directory outside it could let uploaded
+   videos be committed. It is still a dedicated directory: the legacy route writes only
+   directly into `uploads/` and never sweeps; the store sweeps only `prepared/`.
+   Alternative for the owner: a `.gitignore` entry for `app/storage/prepared/`.
+4. The upload probe reads the first decoded frame to obtain the frame size (the same size
+   the per-frame check of P1b compares), instead of container properties.
+5. ~~`GET /template` resets the idle TTL even when no template exists (`204`).~~
+   Superseded by §19.1 item 6: a `204` validates the source without resetting the TTL.
+
+**Acceptance coverage (18.3):**
+
+| # | Covered | Not covered |
+|---|---|---|
+| 1 | full flow, replay, superseded/conflict/stale, refused `200`, lost-ACK replay; error bodies and app logs without values; status one-section read (gate between reservation and sink start); default factory on the composed runtime | §9.1 preview-isolation spies on detector/CLIP/worker over HTTP; §9.11 polling over HTTP (covered at store level, P1a) |
+| 2 | upload-probe constructor gate with `DELETE`, expiry and `begin_shutdown`: zero probe/decode calls, one release, file after it; constructor raising | preview-constructor gate with expiry/shutdown (only `DELETE`) |
+| 3 | probe gate with `DELETE`/expiry: no release while busy, one release after; preview decode gate with expiry; second preview → `409 capture_busy`, no second constructor call | shutdown inside probe/decode; release failing right after a gate |
+| 4 | probe release failure → `503` + ids, not `PREPARED`, `POST /` `409`, retry → file deleted, upload again; preview release failure → config/Play `503` before the CAS, `next_attempt` unchanged, retry → Play `STARTED` | — |
+| 5 | stalled capture → no automatic attempt; recovery → one attempt, counts only; success → `204` and the expired file deleted after the release; stalled startup leftover recovered without a source id | concurrent recovery/`DELETE`/sweeper under a gate |
+| 6 | store phases make zero VideoService calls; lifespan order `begin_shutdown` → `shutdown_services` → `finish_shutdown` | Stop timeout with a gated hook in the composed runtime; a capture obligation at shutdown over HTTP |
+| 7 | 4096 accepted, 4097 → `413`, nothing changed, TTL not reset; streamed body without a length header → `413` | the canonical-size `422` guard over HTTP (model test exists) |
+| 8 | (b) `play_in_progress` before the hook, `source_geometry_unstable` after it for `True`/`False`/`None`, re-save refused, `next_attempt` unchanged; (c) capture cleanup → `503` before the CAS; (d) `analysis` informational | (a) required refusal/open failure through the real VideoService over HTTP (P1b covers it at service level) |
+| 9 | private without/with invalid template stays private with no fallback (refused start); legacy routes `409 private_flow_required` before reserving; store only in private mode; startup sweep only its directory | — |
+| 11 | adoption after `DELETE` (preview) and after `DELETE`/expiry/shutdown (upload probe): no decode/probe call | separate `begin_use` (deviation 1) |
+
+**Implementer evidence (Claude, not reviewer results):**
+
+- `test_sources_api.py` 35 passed; the full backend suite serial with a unique basetemp:
+  1445 passed, 1 warning (Starlette deprecation, pre-existing).
+- `test_sources_api.py`, `test_prepared_source.py`, `test_prepared_source_races.py` and
+  `test_video_prepared_playback.py` repeated 30 times: 0 failures.
+- Mutation runs (scratch pytest plugin outside the repository): adoption always busy → 4
+  failures; capture not counted as a file user → 2; no `cleanup_pending` refusal → 1;
+  `begin_shutdown` calling `video.stop()` → 2; envelope cap removed → 4; probe release
+  failure ignored → 2.
+- `pip check` clean; `git diff --check` clean; no control bytes or trailing whitespace;
+  final LF. Nothing staged; no server, provider, real video, webcam, TTS or speaker.
+
+**Integration limits:**
+
+- Not run against a real server, real video files or devices; the decoder is faked.
+- One capture per store serializes previews (`409 capture_busy` for a second tab).
+- A handler thread that never returns from a probe/decode keeps the capture busy and the
+  file in use until restart (same limit as a writer that never returns).
+- `ERROR` until Stop remains operator-driven; the UI must show `analysis.stop_required`
+  and offer Stop (P1d).
+- Shared documents (`ARCHITECTURE.md`, `docs/RELIABILITY.md`, `PLAN.md`) are not updated:
+  they carry uncommitted changes of other authors (18.4).
+
+### 19.1 Fixes for the Codex review of P1c (owner instruction, 2026-10-12)
+
+Preflight: HEAD `3c5446a` = `origin/main`, nothing staged; the committed P1a/P1b test
+files unchanged against HEAD; the twelve P1c files identical to the hashes of §19, so
+the baseline had not moved.
+
+| # | Finding | Fix | Regression test |
+|---|---|---|---|
+| 1 | Async handlers called blocking store operations on the event loop (`store.play()` reaches VideoService; a drain can delete files) | `create`, `save_configuration` (+ snapshot) and `play` run through `run_in_threadpool`; the upload is parsed asynchronously, then `begin_write` and the whole write/probe step run in the threadpool; preview, template, delete, lookup, current and recovery stay plain `def` handlers (FastAPI's threadpool). Cancellation: `anyio.to_thread.run_sync` keeps `abandon_on_cancel=False`, so a cancelled request waits for the thread and the store keeps a consistent owner. **Corrected in §19.2:** this claim did not hold for the upload (two awaits) nor for a native asyncio cancellation | One ASGI event loop (`httpx.ASGITransport`, `asyncio.run`): Play held inside the VideoService start; `DELETE` on the same loop is answered while Play is still held; Play then answers `200 CANCELLED`, no reservation |
+| 2 | A decode that outlived its operation could still answer `200` with a JPEG | After `finish_capture` (the release always happens first) the preview route calls `store.read_still_valid(handle)`, which applies due deadlines and the TTL under the lock and checks the read's source, generation, voiding and shutdown; a stale frame is discarded and the refusal category answered | Decode gated, then expiry (with and without a sweeper pass) or `begin_shutdown`: `409 expired` / `503 closed`, never `image/jpeg`; the capture released once; the file deleted after it (the former test that expected `200` was replaced) |
+| 3 | `503 cleanup_pending` took the identity from the latest snapshot (could be another source) | `SourceError` carries `source_id`/`generation`, captured under the store lock when raised (`_cleanup_pending_error_locked`: the source whose capture is pending); the route answers with the error's identity only | Play of A refused and held after the refusal (delegating store wrapper); A's capture released, A deleted, B created; the answer still names A |
+| 4 | An invalid `file` field reached FastAPI's parameter validation, whose `422` detail echoes the input | The upload route no longer declares the file parameter: it parses the multipart body itself (`await request.form()`), accepts only an `UploadFile` under `file`, answers `422 {category: missing_file / invalid_request / unsupported_type}`, closes the form | A text field `file` carrying a marker, a malformed multipart body with the marker in the boundary and body, and a wrong field name: `422` with a category only; the marker absent from the answer and from every non-client log; nothing created. Evidence for the old shape: a scratch app with the former `file: UploadFile \| None = File(None)` parameter answers `422` **with the marker echoed** |
+| 5 | `Content-Length` was converted with `int()` before validation (a 5000-digit value raises) | `_declared_length` checks the header as text first: empty, non-ASCII, non-digit or signed → `422 invalid_request`; more than 15 digits → too large without conversion; the configuration route answers `413 configuration_too_large`, the small bodies `422`, the upload `422 too_large` above 200 MiB plus the multipart overhead | Raw ASGI calls (a client library would not send these headers): 5000 digits → `413`; `12abc`, `-5`, a non-ASCII digit, empty → `422`; nothing changed; the same on `POST /` and `POST /play` |
+| 6 | A template `204` reset the idle TTL | Without a template the route calls `store.validate_source()` (due deadlines applied, no TTL reset) and answers `204`; an available template still uses `touch_template` (reset, D5) | Fake clock: a `204` at 29 min leaves 60 s to expiry and the source expires at 30 min; an available template at 29 min resets to 1800 s |
+
+**Implementer evidence (Claude, not reviewer results):**
+
+- `test_sources_api.py` 49 passed; full backend suite serial with a unique basetemp: 1459
+  passed, 1 warning (Starlette deprecation, pre-existing); the legacy/retail suites
+  (`test_video_api`, `test_video_upload_rollback`, `test_video_service`,
+  `test_retail_candidate_trigger`, `test_parking_candidate_trigger`) 197 passed.
+- `test_sources_api.py`, `test_prepared_source.py`, `test_prepared_source_races.py` and
+  `test_video_prepared_playback.py` repeated 30 times: 0 failures.
+- Each fix was undone by a scratch pytest plugin outside the repository and its test
+  failed: store calls inline on the loop → 1; no preview revalidation → 3; identity from
+  the snapshot → 1; `int()` before validation → 5; template `204` resetting the TTL → 1.
+  The multipart fix cannot be undone that way (the route shape changed); the scratch-app
+  evidence above shows the old echo.
+- `pip check` clean; `git diff --check` clean; no control bytes or trailing whitespace;
+  final LF. Every test thread is joined (gates have timeouts; the event-loop test also
+  has a safety timer that is cancelled). Nothing staged; no server, provider, real
+  video, webcam or speaker.
+
+**Limits unchanged:** the decoder is faked; a malformed `Content-Length` would normally be
+rejected by the HTTP server before the application (the test calls the ASGI app
+directly); the other §19 integration limits stay open.
+
+### 19.2 Fix: a cancelled upload left a writer without an executor (Codex re-review, BLOCKED)
+
+Codex re-review of §19.1 (`sources.py` `a9e3aa8`, `prepared_source.py` `cca3f05`,
+`test_sources_api.py` `b137bad`, plan `3f6e13c`): the five §19.1 findings and the template
+TTL closed; **one new high finding.** The upload reserved the writer
+(`await run_in_threadpool(store.begin_write, ...)`) and ran the write/probe in a **second**
+await. A request task cancelled between them (reproduced with `asyncio.Task.cancel()` and
+an AnyIO `CancelScope`) left the writer registered (`done=False`, one file user, zero
+decoder calls); `DELETE` answered `202`, and expiry and recovery kept the obligation and
+admission closed.
+
+While fixing it a second cause appeared: a **native** asyncio cancellation is not shielded
+by `run_in_threadpool` — the await is abandoned while the worker keeps running — and the
+handler's `finally` then closed the multipart form, i.e. the file the worker was reading;
+the next read raised `ValueError` (not `OSError`) and the worker died with the writer
+still registered. The docstring and the §19.1 claim relied on shielding; both are
+corrected.
+
+Fix (`backend/app/api/sources.py`, design independent of shielding):
+
+- **One ownership unit** (`_UploadUnit`): `begin_write` and the whole write/probe step run
+  in ONE threadpool call. States under a lock: `pending → running → done`, or `pending →
+  abandoned`. The worker claims the unit before doing anything; a request that ended
+  first (`abandon()` in the handler's `finally`) leaves it `abandoned` and the worker
+  then reserves nothing.
+- **The running unit owns the uploaded file**: only the worker closes it; the handler
+  closes it only while the unit is still `pending`, and never closes the form under a
+  running worker.
+- **The writer is always ended**: the unit's `finally` calls `fail_write(handle,
+  "write_failed")` if the writer it registered is not done, whatever the exception.
+
+Regression tests (`test_sources_api.py`, deterministic, gate with timeout and a cancelled
+safety timer, all threads joined):
+
+| Case | Expected |
+|---|---|
+| Writer reservation held inside its worker; the ASGI request task cancelled with `asyncio.Task.cancel()` | the request is cancelled; the unit runs to its end: the probe runs once, the capture is released, `PREPARED`, zero file users; `DELETE` then deletes the file and admission opens |
+| Same with an AnyIO `CancelScope` around the request task | the worker await is shielded, the request may complete; same end state, no writer left |
+| A unit abandoned before it started | `run` returns without `begin_write`; the uploaded file closed once; the source still `AWAITING_FILE` |
+| An unexpected exception inside the unit (e.g. a closed upload file) | `500` without the message; the writer ended (`fail_write`), the partial file deleted, admission open |
+
+Implementer evidence (Claude, not reviewer results): both cancellation cases failed on
+the reviewed code (writer leaked) and pass now; scratch-plugin mutations — the former two
+awaits → 3 failures, no writer guard in the unit → 3, the handler closing the file of a
+running unit → 2; `test_sources_api.py` 53 passed; full backend suite serial with a
+unique basetemp 1463 passed, 1 warning (Starlette deprecation, pre-existing); the four
+P1 store/API test files repeated 30 times: 0 failures; `pip check`, `git diff --check`,
+control bytes, trailing whitespace and final LF clean; nothing staged; no server,
+provider, real video or device.
+
+Audit of the other handlers: `create`, `save_configuration` and `play` are one store call
+each inside one threadpool unit, after the body was read (nothing is reserved before);
+preview, template, delete, lookup, current and recovery are plain `def` handlers whose
+reservation and release (`begin_read` … `end_read`, capture slot) happen inside one
+threadpool call. A native cancellation can abandon such an await, but the worker then
+still finishes its own `finally` (the reader and the capture slot are ended in the same
+thread), so no reservation is split across awaits.
+
+### 19.3 Closure of P1c — runtime/API integration verified with fakes (owner instruction, 2026-10-12)
+
+**Final review verdict: PASS WITH LIMITATIONS** — Codex, through the owner/PM, on the
+§19.2 delta (`sources.py` `59a4841`, `test_sources_api.py` `c1020c8`, plan `81d2c6c`); the
+reviewer re-checked all twelve candidates (only those three changed since the previous
+round) and found no new blocker. Reviewer results of that round: 175 target tests and
+the full backend suite 1463 passed with one deprecation warning; `pip check`, diff,
+whitespace, newlines of the new candidates and the plan links clean. Verification uses
+fakes; it does not prove a real server, OpenCV decoding or devices.
+
+**Closure per finding** (each with the review that closed it; implementer evidence —
+the 30-fold repetitions and the scratch-plugin mutations — is Claude's, not the
+reviewer's):
+
+| Finding | Fixed in | Closed by (Codex, through the owner/PM) | Tests |
+|---|---|---|---|
+| Blocking store calls (Play) on the event loop | §19.1 item 1 | re-review of §19.1: closed | one-loop Play held + `DELETE` answered |
+| Stale preview after expiry/shutdown | §19.1 item 2 | re-review of §19.1: closed | decode gate + expiry (swept/unswept) / shutdown → no JPEG |
+| Error identity from a later snapshot | §19.1 item 3 | re-review of §19.1: closed | refusal of A held while A deleted and B created → names A |
+| Multipart input echoed | §19.1 item 4 | re-review of §19.1: closed | text field, malformed body, wrong field with a marker → category only |
+| Extreme/malformed `Content-Length` | §19.1 item 5 | re-review of §19.1: closed | raw ASGI: 5000 digits, letters, signed, non-ASCII, empty |
+| Template `204` resetting the TTL | §19.1 item 6 | re-review of §19.1: "koreksi TTL template juga lulus" | fake clock: `204` keeps 60 s; an available template resets to 1800 s |
+| Cancelled upload leaving a writer without an executor | §19.2 | re-review of §19.2: closed (reproduced with `asyncio.Task.cancel()` and an AnyIO `CancelScope`: writer finished, capture released once, `DELETE` completes cleanup, admission open; regressions cover a unit abandoned before it started and an unexpected exception) | both cancellation variants, abandoned unit, unexpected error |
+
+Hash check before the commit (full blobs, identical to the reviewed versions, so the
+suite was not re-run for the closure):
+
+| Path | Blob |
+|---|---|
+| `backend/app/api/sources.py` | `59a4841ba2425c77a3a9ccaf279c54dfb6016fca` |
+| `backend/tests/test_sources_api.py` | `c1020c860be46adfe0d83ab1838dfb1a8480e7c5` |
+| `backend/app/services/prepared_source.py` | `cca3f0553f85afb88c47b1296f9c3e637d345653` |
+| `backend/app/models/sources.py` | `4c7e9ebbec163ac634e15d113fe54f30e454d310` |
+| `backend/app/services/video_service.py` | `0266030c062af4e2ed731fabfcb691a211e11b59` |
+| `backend/app/models/video.py` | `671264b69278d100111d92d129aaf85e25618e4a` |
+| `backend/app/services/runtime.py` | `3fe6deb0bbd3c15649202187771119d7f8ae91e5` |
+| `backend/app/main.py` | `ade37a0256ae90b74eee1efa5147ec0926281a4b` |
+| `backend/app/api/video.py` | `d20364a18cd2504809e89b2fa13b4b4b697c4b13` |
+| `backend/.env.example` | `0831d89d114ebc02c6bec7f255c0022c3f841466` |
+| `backend/tests/test_private_parking_runtime_wiring.py` | `67f35fb52f1294dd066fa1fef5bc73eb94c773eb` |
+
+This plan was reviewed at `81d2c6c`; only this closure record and the status lines were
+added after it.
+
+**Frozen wire contract for the frontend (P1d).** The endpoint table of §19 ("Actual wire
+contract") is frozen as amended by §19.1 (multipart parsed by the route; `Content-Length`
+rules; template `204` without a TTL reset). In addition the frontend relies on:
+
+- **Error bodies:** `{category}` or `{category, field}` only; `503 cleanup_pending` adds
+  `source_id` and `generation` of the source whose cleanup is pending — taken from the
+  refusal itself, never from a later snapshot. No input value, path, file name or
+  exception text is ever returned.
+- **Categories by status:** `404 unknown_source / unknown_attempt`; `409` conflicts of
+  §19 (incl. `capture_busy`, `play_in_progress`, `session_cleanup_pending`,
+  `source_geometry_unstable`, `private_mode_inactive`, `private_flow_required` on the legacy
+  routes); `410 source_gone / outcome_evicted`; `413 configuration_too_large`; `422
+  invalid_request (+field) / invalid_operation_id / invalid_geometry (+field) / missing_file
+  / unsupported_type / too_large / not_decodable`; `500 write_failed / preview_failed`;
+  `503 cleanup_pending (+identity) / storage_unavailable / closed`.
+- **Identity:** every source request carries `source_id` + `generation`; configuration
+  answers carry `revision`; a Play intent is `(attempt = /current.next_attempt,
+  operation_id)` and its record carries `session_ref` and `session_id`;
+  `GET /api/video/status` returns `state`, `session_ref`, `session_id` from one lock
+  section (null once `IDLE`). Results join by `source_session_id == status.session_id`
+  under a matching `session_ref` (§5.3, D8: only as strong as the default `uuid4`
+  factory; no cross-endpoint atomicity).
+- **Readiness:** Play is possible only when `/current.config.ready` is true (an accepted
+  configuration for this generation, state `PREPARED`, no geometry instability, no capture
+  cleanup pending). `/current.analysis` (`stop_required`, `state`, `session_ref`,
+  `session_id`) is a transient observation of VideoService and never a readiness input; when
+  `stop_required` is true the UI offers Stop (`POST /api/video/stop`), never an automatic
+  one. Polling `/current`, `/play/{attempt}`, capabilities or video status never extends
+  the idle TTL; preview, an available template and accepted mutations do.
+- **Reconciliation:** a Play past the CAS always answers `200` with the attempt record
+  (`REFUSED` and `FAILED` included, the attempt used); refusals before the CAS (`409` /
+  `410` / `503`) never use an attempt. After a lost answer the UI replays the same
+  `(attempt, operation_id)` (identical record) or reads `GET /play/{attempt}`; it never
+  creates a new `operation_id` to resolve an unknown outcome and never retries
+  automatically. `410 outcome_evicted` / `source_gone` end the reconciliation. A
+  `frame_size_changed` generation stays unplayable (delete, upload again, confirm a new
+  configuration). Upload identity after a lost `POST /` answer: `/current.upload_operation_id`.
+
+**Remaining limits:** decoder, filesystem and VideoService are fakes in the P1c tests; no
+real server, OpenCV decoding or device is proven; the §19 integration limits stay open;
+shared documents (`ARCHITECTURE.md`, `docs/RELIABILITY.md`, `PLAN.md`) are not updated
+here (uncommitted changes of other authors).

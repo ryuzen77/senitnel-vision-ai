@@ -30,7 +30,11 @@ from app.services.evaluation_worker import EvaluationWorker
 from app.services.event_frame_buffer import EventFrameBuffer
 from app.services.parking_candidate_trigger import ParkingCandidateTrigger
 from app.services.private_parking_coordinator import FrameSinkTee, PrivateParkingCoordinator
+from app.models.private_parking import OperatorConfiguration, operator_template
+from app.services import video_decoder
+from app.services.prepared_source import HandoffTicket, PlaybackRefused
 from app.services.private_parking_evidence_sampler import EpisodeEvidenceSampler
+from app.services.session_config_registry import SessionConfigRegistry
 from app.services.video_service import VideoService, VideoStartRefusedError
 from tests.test_evaluation_worker import FakeClient
 from tests.test_private_parking_evidence_sampler import frame as buffered_frame
@@ -70,6 +74,37 @@ def _config_file(tmp_path: Path, content: str | bytes | None = None, *, name: st
 def _private_env(tmp_path: Path, content: str | bytes | None = None, *, name: str = "private-parking.json") -> dict:
     return {"SENTINEL_PARKING_MODE": "private",
             "SENTINEL_PRIVATE_PARKING_CONFIG_FILE": str(_config_file(tmp_path, content, name=name))}
+
+
+def _operator_config(wiring, size=(1000, 1000)) -> OperatorConfiguration:
+    """The startup template confirmed as the operator configuration (P1c: a template is
+    never used for analysis until it is bound for the session)."""
+    return OperatorConfiguration(size[0], size[1], operator_template(wiring.template))
+
+
+class _Decoder:
+    """The one decoder (P1b) over scripted captures: the capture is created here and
+    owned by the VideoService session."""
+
+    def __init__(self, captures) -> None:
+        self.captures = captures
+
+    def create_capture(self, _path):
+        return self.captures.pop(0)
+
+    probe = staticmethod(video_decoder.probe)
+
+
+def _prepared_start(video, wiring, *, size=(64, 48)) -> HandoffTicket:
+    """Start analysis the P1c way: a handoff ticket and the bound operator configuration."""
+    ticket = HandoffTicket(_prepared_start.serial)
+    _prepared_start.serial += 1
+    video.start_prepared_file(Path("prepared.mp4"), ticket=ticket, session_config=_operator_config(wiring, size),
+                              expected_size=size, on_finished=lambda *_args: None)
+    return ticket
+
+
+_prepared_start.serial = 1
 
 
 class RecordingDevice:
@@ -150,6 +185,8 @@ class Stack:
 
     def start(self, session: str = "s1", lease: str = "op-1") -> None:
         self.lease = lease
+        if self.wiring.registry is not None:            # private: VideoService binds per lease (P1b)
+            self.wiring.registry.bind(session, lease, _operator_config(self.wiring))
         self.wiring.buffer_slot.start_session(session, lease=lease)
         self.detector.start_session(session, lease=lease)
         self.worker.start_session(session)
@@ -245,9 +282,56 @@ def test_the_invalid_config_fixtures_never_overwrite_each_other(tmp_path) -> Non
     assert len(set(on_disk.values())) == len(INVALID_PAYLOADS)            # and the payloads all differ
 
 
-@pytest.mark.parametrize("case", ["invalid mode", "config unset", "config missing", *INVALID_PAYLOADS])
-def test_invalid_mode_or_config_uses_the_disabled_trigger_until_shutdown(tmp_path, monkeypatch, caplog,
-                                                                          case) -> None:
+@pytest.mark.parametrize("case", ["config unset", "config missing", *INVALID_PAYLOADS])
+def test_private_mode_without_a_valid_template_stays_private_with_no_fallback(tmp_path, monkeypatch, caplog,
+                                                                             case) -> None:
+    """P1c: the startup file is only an optional template. Missing or invalid → private
+    mode without a template (never the disabled path), and a session without a bound
+    operator configuration is refused (no fallback to any configuration)."""
+    env = _invalid_env(tmp_path, case)
+    received: list = []
+    real_parse = runtime.parse_private_parking_config
+
+    def spying_parse(text):
+        received.append(text)
+        return real_parse(text)
+
+    monkeypatch.setattr(runtime, "parse_private_parking_config", spying_parse)
+    buffer = EventFrameBuffer()
+    with caplog.at_level(logging.DEBUG):
+        wiring = runtime.build_parking_wiring(env, event_frame_buffer=buffer, audio_gate=None)
+    assert wiring.mode == "private" and wiring.template is None
+    assert isinstance(wiring.registry, SessionConfigRegistry) and len(wiring.registry) == 0
+    assert isinstance(wiring.detector_slot, PrivateParkingCoordinator)
+    assert wiring.worker_enabled_override is False
+    assert caplog.text.count("Private parking template unavailable") == 1
+    assert SECRET_PATH_PART not in caplog.text and "Error" not in caplog.text and "0000000000" not in caplog.text
+    if case in INVALID_PAYLOADS:
+        content, parsed = INVALID_PAYLOADS[case]
+        path = Path(env["SENTINEL_PRIVATE_PARKING_CONFIG_FILE"])
+        assert path.read_bytes() == _payload_bytes(content)
+        assert received == ([_payload_bytes(content).decode("utf-8")] if parsed else [])
+    else:
+        assert received == []
+    # a session that was never bound is refused: no candidate, no fallback configuration
+    detector = DetectorService(model_factory=lambda: (lambda _frame: []), parking_trigger=wiring.detector_slot)
+    video = VideoService(detector=detector, event_frame_buffer=wiring.buffer_slot,
+                         required_sinks=wiring.required_sinks)
+    monkeypatch.setattr("app.services.video_service.cv2.VideoCapture", lambda *_a, **_k: Capture())
+    try:
+        with pytest.raises(VideoStartRefusedError):    # required refusal: no operator binding
+            video.start_webcam()
+        assert video.get_status().state is VideoState.ERROR
+        assert wiring.private_trigger.get_snapshot().source_session_id is None
+        video.stop()
+        assert video.get_status().state is VideoState.IDLE
+    finally:
+        video.stop()
+        detector.close()
+
+
+@pytest.mark.parametrize("case", ["invalid mode"])
+def test_invalid_mode_uses_the_disabled_trigger_until_shutdown(tmp_path, monkeypatch, caplog, case) -> None:
     env = _invalid_env(tmp_path, case)
     received: list = []
     real_parse = runtime.parse_private_parking_config
@@ -264,8 +348,7 @@ def test_invalid_mode_or_config_uses_the_disabled_trigger_until_shutdown(tmp_pat
     assert wiring.worker_trigger is wiring.detector_slot                   # never None, never legacy
     assert wiring.buffer_slot is buffer and wiring.required_sinks == frozenset()
     assert wiring.worker_enabled_override is False and wiring.tee is None
-    assert SECRET_PATH_PART not in caplog.text and "Private" not in caplog.text.replace(
-        "Private parking disabled", "")
+    assert SECRET_PATH_PART not in caplog.text and "Private" not in caplog.text
     assert "Error" not in caplog.text and "0000000000" not in caplog.text      # no exception, no value
     # the case really read its own payload (no fixture overwrote it)
     if case in INVALID_PAYLOADS:
@@ -307,19 +390,20 @@ def test_private_mode_wires_coordinator_tee_sampler_and_required_sinks(tmp_path,
     assert wiring.worker_trigger is wiring.private_trigger and wiring.worker_enabled_override is False
     assert wiring.required_sinks == {"event frame buffer", "detector"}
     # frames reach both the EventFrameBuffer and the sampler through the tee
-    monkeypatch.setattr("app.services.video_service.cv2.VideoCapture", lambda *_a, **_k: Capture())
+    assert isinstance(wiring.registry, SessionConfigRegistry) and wiring.template is not None
     detector = DetectorService(model_factory=lambda: (lambda _frame: []), parking_trigger=wiring.detector_slot)
     video = VideoService(detector=detector, event_frame_buffer=wiring.buffer_slot,
-                         required_sinks=wiring.required_sinks)
+                         required_sinks=wiring.required_sinks, session_config_registry=wiring.registry,
+                         decoder=_Decoder([Capture(), Capture()]))
     try:
-        assert video.start_webcam()
+        _prepared_start(video, wiring)
         assert _wait_for(lambda: buffer.get_snapshot().frame_count > 0 and wiring.sampler.get_snapshot().held_frames > 0)
         video.stop()
-        assert video.get_status().state is VideoState.IDLE
-        # a refused required start → ERROR until Stop (the route answers 503)
+        assert video.get_status().state is VideoState.IDLE and len(wiring.registry) == 0
+        # a refused required start → ERROR until Stop (the store records REFUSED)
         wiring.tee.close()
-        with pytest.raises(VideoStartRefusedError):
-            video.start_webcam()
+        with pytest.raises(PlaybackRefused):
+            _prepared_start(video, wiring)
         assert video.get_status().state is VideoState.ERROR
         video.stop()
         assert video.get_status().state is VideoState.IDLE
@@ -408,10 +492,10 @@ def test_stop_eof_restart_and_a_failed_cleanup_keep_admission_closed(tmp_path, m
     buffer = EventFrameBuffer()
     wiring = runtime.build_parking_wiring(_private_env(tmp_path), event_frame_buffer=buffer, audio_gate=None)
     captures = [Capture(), Capture([np.zeros((48, 64, 3), dtype=np.uint8), "eof"], tail="eof"), Capture()]
-    monkeypatch.setattr("app.services.video_service.cv2.VideoCapture", lambda *_a, **_k: captures.pop(0))
     detector = DetectorService(model_factory=lambda: (lambda _frame: []), parking_trigger=wiring.detector_slot)
     video = VideoService(detector=detector, event_frame_buffer=wiring.buffer_slot,
-                         required_sinks=wiring.required_sinks)
+                         required_sinks=wiring.required_sinks, session_config_registry=wiring.registry,
+                         decoder=_Decoder(captures))
     trigger_end = wiring.private_trigger.end_session
     failures = [RuntimeError("end failed")]
 
@@ -422,19 +506,19 @@ def test_stop_eof_restart_and_a_failed_cleanup_keep_admission_closed(tmp_path, m
 
     wiring.private_trigger.end_session = failing_end
     try:
-        assert video.start_webcam() and _wait_for(lambda: video.get_status().state is VideoState.RUNNING)
+        _prepared_start(video, wiring)
+        assert _wait_for(lambda: video.get_status().state is VideoState.RUNNING)
         old = video._current                                           # noqa: SLF001
         video.stop()                                                   # the trigger end fails once
         assert video.get_status().state is VideoState.ERROR and video.claim_start() is None
         video.stop()                                                   # retry with the same lease
         assert video.get_status().state is VideoState.IDLE
         assert detector.get_lifecycle_diagnostics()["pending_sessions"] == 0
-        upload = tmp_path / "clip.mp4"
-        upload.write_bytes(b"x")
-        video.start_file(upload, video.claim_start())                  # EOF ends it by itself
+        _prepared_start(video, wiring)                                 # EOF ends it by itself
         assert _wait_for(lambda: video.get_status().state is VideoState.IDLE)
         assert wiring.tee.get_diagnostics()["active_sessions"] == 0
-        assert video.start_webcam() and _wait_for(lambda: video.get_status().state is VideoState.RUNNING)
+        _prepared_start(video, wiring)
+        assert _wait_for(lambda: video.get_status().state is VideoState.RUNNING)
         detector.end_session(old.session_id, lease=old.token)          # late, old lease
         wiring.tee.end_session(old.session_id, lease=old.token)
         assert detector.get_lifecycle_diagnostics()["active_sessions"] == 1
@@ -497,11 +581,14 @@ def test_the_runtime_module_selects_the_mode_from_the_environment(tmp_path) -> N
     out = private.stdout
     assert out.startswith("private PrivateParkingCoordinator FrameSinkTee")
     assert "['detector', 'event frame buffer'] EpisodeEvidenceSampler False" in out
-    invalid = _import_runtime({"SENTINEL_PARKING_MODE": "private",
+    missing = _import_runtime({"SENTINEL_PARKING_MODE": "private",
                                "SENTINEL_PRIVATE_PARKING_CONFIG_FILE": str(tmp_path / SECRET_PATH_PART / "x.json")})
-    assert invalid.returncode == 0 and invalid.stdout.startswith("disabled DisabledParkingTrigger EventFrameBuffer")
-    assert "Private parking disabled: invalid configuration" in invalid.stderr
-    assert SECRET_PATH_PART not in invalid.stderr + invalid.stdout
+    assert missing.returncode == 0 and missing.stdout.startswith("private PrivateParkingCoordinator FrameSinkTee")
+    assert "Private parking template unavailable" in missing.stderr        # private, no template
+    assert SECRET_PATH_PART not in missing.stderr + missing.stdout
+    invalid_mode = _import_runtime({"SENTINEL_PARKING_MODE": "Private"})
+    assert invalid_mode.returncode == 0
+    assert invalid_mode.stdout.startswith("disabled DisabledParkingTrigger EventFrameBuffer")
 
 
 # ── delta 1: fail closed only at the config boundary ─────────────────────────
@@ -512,8 +599,8 @@ def test_a_huge_number_in_a_small_config_fails_closed_through_the_builder(tmp_pa
     with caplog.at_level(logging.DEBUG):
         wiring = runtime.build_parking_wiring(_private_env(tmp_path, content=content),
                                               event_frame_buffer=EventFrameBuffer(), audio_gate=None)
-    assert wiring.mode == "disabled" and isinstance(wiring.worker_trigger, DisabledParkingTrigger)
-    assert caplog.text.count("Private parking disabled: invalid configuration") == 1
+    assert wiring.mode == "private" and wiring.template is None          # the template fails closed
+    assert caplog.text.count("Private parking template unavailable") == 1
     assert "OverflowError" not in caplog.text and SECRET_PATH_PART not in caplog.text
 
 

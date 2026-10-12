@@ -22,7 +22,7 @@ from pathlib import Path
 
 import cv2
 from fastapi import APIRouter, HTTPException, UploadFile
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from app.models.video import VideoStartResponse, VideoState, VideoStatusResponse
 from app.services.video_service import UPLOAD_DIR, StaleStartError, VideoStartRefusedError, video_service
@@ -38,6 +38,21 @@ _CHUNK_SIZE = 1024 * 1024  # 1 MB read chunks
 # A required pipeline component refused the session (private mode); the service already
 # rolled the reservation back and stays in ERROR until Stop.
 _REFUSED_DETAIL = "Required pipeline component is unavailable"
+
+
+def _parking_mode() -> str:
+    """The process's parking mode (read lazily; tests replace this function)."""
+    from app.services import runtime
+    return runtime.parking_wiring.mode
+
+
+def _private_flow_required() -> JSONResponse | None:
+    """Private mode (P1c): the legacy start routes refuse before any reservation, write
+    or probe; analysis starts only through ``/api/video/sources`` with an operator
+    configuration bound to the session."""
+    if _parking_mode() == "private":
+        return JSONResponse(status_code=409, content={"category": "private_flow_required"})
+    return None
 
 
 def _delete_owned(path: Path | None) -> None:
@@ -57,6 +72,9 @@ def _delete_owned(path: Path | None) -> None:
 
 @router.post("/webcam/start", response_model=VideoStartResponse)
 async def start_webcam() -> VideoStartResponse:
+    refused = _private_flow_required()
+    if refused is not None:
+        return refused
     # start_webcam() atomically reserves the slot and returns False if not IDLE.
     # This avoids the non-atomic get_status() → start race.
     try:
@@ -83,6 +101,9 @@ async def start_webcam() -> VideoStartResponse:
 
 @router.post("/upload", response_model=VideoStartResponse)
 async def upload_video(file: UploadFile) -> VideoStartResponse:
+    refused = _private_flow_required()
+    if refused is not None:
+        return refused                    # nothing reserved, written or probed
     # FastAPI/Starlette has already received and parsed the multipart body here;
     # backend elapsed timing does not include the browser-to-server transfer.
     handler_entered_at = time.monotonic()

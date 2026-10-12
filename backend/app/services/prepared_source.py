@@ -33,6 +33,16 @@ Contracts (plan §8):
 * Lock order: ``store lock -> ticket lock``; the store never calls VideoService, the
   filesystem or a decoder under its lock, and VideoService calls ``on_finished`` outside
   its own locks.
+* Capture slot (P1c, plan §18.2 item 3): at most one preview/probe capture per store,
+  reserved before its constructor runs and held until a release is proven. Adoption and
+  the busy mark are one lock section (a cancelled operation adopts it idle and the
+  caller releases it without using it). A capture may be released once adopted and not
+  busy; the file is deleted only when no user remains, an unreleased capture counting
+  as a user. A failed release is an obligation (retry, stall, explicit recovery) that
+  refuses new uploads, previews, configurations and Plays.
+* Shutdown for the composed runtime is two-phase (``begin_shutdown`` / ``finish_shutdown``)
+  and never calls VideoService: the runtime's single ``video.stop()`` runs between the
+  phases. ``close()`` (both phases plus its own Stop) is for standalone use.
 
 Durations are the owner's initial defaults (plan §0.1), not calibrated values. Logs are
 generic: no path, file name, configuration value or image data.
@@ -82,6 +92,13 @@ class SourceState(str, enum.Enum):
     CLEANUP_STALLED = "CLEANUP_STALLED"
 
 
+class CaptureState(str, enum.Enum):
+    CREATING = "CREATING"
+    OWNED = "OWNED"
+    RELEASE_PENDING = "RELEASE_PENDING"
+    RELEASE_STALLED = "RELEASE_STALLED"
+
+
 class Outcome(str, enum.Enum):
     PENDING = "PENDING"
     STARTED = "STARTED"
@@ -111,11 +128,16 @@ class CancelResult(str, enum.Enum):
 
 
 class SourceError(Exception):
-    """A refused request. ``category`` is a fixed, safe string (wire category in P1c)."""
+    """A refused request. ``category`` is a fixed, safe string (wire category in P1c).
+    ``source_id``/``generation`` name the source the refusal is about, captured under the
+    store lock when it is raised (e.g. the source whose capture release is pending), so a
+    response never borrows the identity of a later source."""
 
-    def __init__(self, category: str) -> None:
+    def __init__(self, category: str, *, source_id: str | None = None, generation: int | None = None) -> None:
         super().__init__(category)
         self.category = category
+        self.source_id = source_id
+        self.generation = generation
 
 
 class PlaybackRefused(Exception):
@@ -258,6 +280,8 @@ class CurrentSnapshot:
     cleanup_pending: bool
     cleanup_reason: str | None
     cleanup_attempts: int
+    capture_state: str | None = None
+    capture_attempts: int = 0
 
 
 @dataclasses.dataclass(frozen=True)
@@ -313,6 +337,20 @@ class ReadHandle:
 
 
 @dataclasses.dataclass(eq=False)
+class _CaptureSlot:
+    """The store's one preview/probe capture: owner handle, state and release bookkeeping."""
+
+    handle: object
+    source: "_Source"
+    state: CaptureState = CaptureState.CREATING
+    capture: object | None = None
+    busy: bool = False
+    attempts: int = 0
+    next_at: float = 0.0
+    in_flight: bool = False
+
+
+@dataclasses.dataclass(eq=False)
 class _Source:
     source_id: str
     generation: int
@@ -336,9 +374,10 @@ class _Source:
     voided: bool = False
     void_reason: str | None = None
     obligation: _Obligation | None = None
+    capture_held: bool = False          # a capture of this file exists and is not released
 
     def users(self) -> int:
-        return (self.writer is not None) + self.readers + len(self.holding)
+        return (self.writer is not None) + self.readers + len(self.holding) + self.capture_held
 
 
 def _is_int(value: object) -> bool:
@@ -398,9 +437,14 @@ class PreparedSourceStore:
         self._sweeper: threading.Thread | None = None
         self._deferred_obligations: list[_Obligation] = []   # claimed under the lock, run after it
         self._deferred_cancels: list[tuple[int, str]] = []   # (ticket_id, lease) to cancel after it
+        self._capture: _CaptureSlot | None = None
+        self._deferred_captures: list[_CaptureSlot] = []      # claimed releases, run after the lock
+        self._shutdown_final: list[_Obligation] = []
+        self._shutdown_done = False
         self._counts = {name: 0 for name in (
             "stale_hooks", "invalid_hooks", "stale_returns", "cancel_session_calls",
-            "cleanup_attempts", "cleanup_failures", "startup_leftovers")}
+            "cleanup_attempts", "cleanup_failures", "startup_leftovers",
+            "capture_releases", "capture_release_failures")}
         self._startup_sweep()
 
     # ------------------------------------------------------------------ helpers
@@ -453,11 +497,17 @@ class PreparedSourceStore:
             self._deferred_obligations += self._void(source, "expired")
 
     def _drain(self) -> None:
-        """Outside the lock: run deletions/cancels deferred by ``_due_locked``."""
-        with self._lock:
-            obligations, cancels = self._deferred_obligations, self._deferred_cancels
-            self._deferred_obligations, self._deferred_cancels = [], []
-        if obligations or cancels:
+        """Outside the lock: run capture releases, then deletions and cancels deferred
+        under the lock (a release can make a deletion due: repeat until nothing is left)."""
+        for _ in range(4):
+            with self._lock:
+                captures, obligations, cancels = (self._deferred_captures, self._deferred_obligations,
+                                                  self._deferred_cancels)
+                self._deferred_captures, self._deferred_obligations, self._deferred_cancels = [], [], []
+            if not (captures or obligations or cancels):
+                return
+            for slot in captures:
+                self._release_capture(slot)
             self._run(obligations, cancels)
 
     def _live(self, source_id: str, generation: int | None) -> _Source:
@@ -503,6 +553,7 @@ class PreparedSourceStore:
     def _claim(self, obligation: _Obligation | None) -> list[_Obligation]:
         """Caller holds the lock. Single flight: at most one attempt per obligation."""
         if (obligation is None or obligation.in_flight or obligation not in self._obligations
+                or self._shutdown_done
                 or (obligation.source is not None and obligation.source.users() > 0)):
             return []
         obligation.in_flight = True
@@ -616,6 +667,8 @@ class PreparedSourceStore:
             self._due_locked()
             if self._storage_failed:
                 raise SourceError("storage_unavailable")
+            if self._capture_pending_locked():
+                raise self._cleanup_pending_error_locked()
             source = self._slot
             if source is not None:
                 if not source.voided and source.upload_operation_id == operation_id:
@@ -636,6 +689,8 @@ class PreparedSourceStore:
             if self._closed:
                 raise SourceError("closed")
             source = self._live(source_id, generation)
+            if self._capture_pending_locked():
+                raise self._cleanup_pending_error_locked()
             if source.state is not SourceState.AWAITING_FILE:
                 raise SourceError("upload_not_expected")
             source.path = self._directory / f"{uuid.uuid4().hex}{suffix}"     # never reused, no client name
@@ -689,6 +744,173 @@ class PreparedSourceStore:
             self._cond.notify_all()
         return source
 
+    # ------------------------------------------------------------------ capture slot (P1c)
+
+    def _capture_pending_locked(self) -> bool:
+        slot = self._capture
+        return slot is not None and slot.state in (CaptureState.RELEASE_PENDING, CaptureState.RELEASE_STALLED)
+
+    def _cleanup_pending_error_locked(self) -> SourceError:
+        """Caller holds the lock: the refusal names the source whose capture is pending."""
+        source = self._capture.source
+        return SourceError("cleanup_pending", source_id=source.source_id, generation=source.generation)
+
+    def _handle_valid_locked(self, handle) -> bool:
+        if self._closed or handle.done or handle.source.voided:
+            return False
+        return not (isinstance(handle, WriteHandle) and handle.cancelled.is_set())
+
+    def _handle_refusal_locked(self, handle) -> str:
+        source = handle.source
+        if self._closed:
+            return "closed"
+        if isinstance(handle, WriteHandle):
+            return "deadline_exceeded" if source.void_reason == "deadline_exceeded" else "cancelled"
+        return "expired" if source.void_reason == "expired" else "source_gone"
+
+    @_draining
+    def begin_capture(self, handle) -> None:
+        """Reserve the store's one capture slot for ``handle`` BEFORE the constructor
+        runs. Refused: ``capture_busy`` (another capture exists), ``cleanup_pending`` (a
+        release is pending), or the handle's own category when it is no longer valid."""
+        with self._lock:
+            self._due_locked()
+            if self._capture is not None:
+                if self._capture_pending_locked():
+                    raise self._cleanup_pending_error_locked()
+                raise SourceError("capture_busy")
+            if not self._handle_valid_locked(handle):
+                raise SourceError(self._handle_refusal_locked(handle))
+            self._capture = _CaptureSlot(handle=handle, source=handle.source)
+            handle.source.capture_held = True
+
+    @_draining
+    def capture_failed(self, handle) -> None:
+        """The constructor raised: nothing to release; the slot is free again."""
+        with self._lock:
+            slot = self._capture
+            if slot is None or slot.handle is not handle or slot.state is not CaptureState.CREATING:
+                return
+            self._capture = None
+            self._capture_released_locked(slot)
+
+    @_draining
+    def adopt_capture(self, handle, capture) -> bool:
+        """Adopt the constructed capture and, in the same lock section, mark it busy for
+        the caller's next call only while the operation is still valid. ``False``: adopted
+        idle; the caller makes no call on it and releases it with ``finish_capture``."""
+        with self._lock:
+            self._due_locked()
+            slot = self._capture
+            if slot is None or slot.handle is not handle or slot.state is not CaptureState.CREATING:
+                raise RuntimeError("capture slot is not reserved for this handle")
+            slot.capture = capture
+            slot.state = CaptureState.OWNED
+            slot.busy = self._handle_valid_locked(handle)
+            return slot.busy
+
+    @_draining
+    def finish_capture(self, handle) -> bool:
+        """The caller is done with the capture (or never used it): release it now, single
+        flight. True = released (or nothing to release); False = the release failed and
+        is kept as an obligation (retried, never dropped)."""
+        with self._lock:
+            slot = self._capture
+            if slot is None or slot.handle is not handle:
+                return True
+            if slot.state is not CaptureState.OWNED or slot.in_flight:
+                return False
+            slot.busy = False
+            slot.in_flight = True
+        return self._release_capture(slot)
+
+    def _capture_released_locked(self, slot: _CaptureSlot) -> None:
+        source = slot.source
+        source.capture_held = False
+        if source.voided and source.users() == 0 and source.obligation is not None:
+            source.obligation.next_at = min(source.obligation.next_at, self._now())
+            self._deferred_obligations += self._claim(source.obligation)
+        self._cond.notify_all()
+
+    def _release_capture(self, slot: _CaptureSlot) -> bool:
+        """Outside the lock; the caller claimed ``slot`` (in_flight set)."""
+        try:
+            slot.capture.release()
+            released = True
+        except Exception:                                   # noqa: BLE001 - kept as an obligation
+            released = False
+        with self._lock:
+            slot.in_flight = False
+            if released:
+                self._counts["capture_releases"] += 1
+                if self._capture is slot:
+                    self._capture = None
+                self._capture_released_locked(slot)
+            else:
+                self._counts["capture_release_failures"] += 1
+                slot.attempts += 1
+                if slot.attempts >= self._cleanup_attempt_limit:
+                    slot.state = CaptureState.RELEASE_STALLED
+                else:
+                    slot.state = CaptureState.RELEASE_PENDING
+                    slot.next_at = self._now() + self._cleanup_retry_seconds
+                self._cond.notify_all()
+        if not released:
+            self._log("capture release failed; obligation kept")
+        return released
+
+    @_draining
+    def write_refusal(self, handle: WriteHandle) -> str:
+        """Category for a write whose operation was voided (DELETE, deadline, close)."""
+        with self._lock:
+            return self._handle_refusal_locked(handle)
+
+    @_draining
+    def read_refusal(self, handle: ReadHandle) -> str:
+        with self._lock:
+            return self._handle_refusal_locked(handle)
+
+    @_draining
+    def read_still_valid(self, handle: ReadHandle) -> str | None:
+        """After a decode: apply due deadlines and the idle TTL, then None if the read's
+        operation is still valid (same generation, not voided, not shut down), else the
+        refusal category. A stale result must be discarded by the caller."""
+        with self._lock:
+            self._due_locked()
+            return None if self._handle_valid_locked(handle) else self._handle_refusal_locked(handle)
+
+    @_draining
+    def retry_cleanup(self) -> dict:
+        """Operator recovery (§0.2.2): one attempt per STALLED obligation — file deletion
+        (no user, nothing in flight) or capture release (not busy, nothing in flight) —
+        through the same single-flight flags; only what the store recorded itself. No
+        loop, no reset of the attempt counts. Returns counts only."""
+        with self._lock:
+            if self._closed:
+                raise SourceError("closed")
+            attempted = 0
+            slot = self._capture
+            if (slot is not None and slot.state is CaptureState.RELEASE_STALLED
+                    and not slot.in_flight and not slot.busy):
+                slot.in_flight = True
+                self._deferred_captures.append(slot)
+                attempted += 1
+            for obligation in list(self._obligations):
+                if obligation.stalled:
+                    claimed = self._claim(obligation)
+                    attempted += len(claimed)
+                    self._deferred_obligations += claimed
+        self._drain()
+        with self._lock:
+            return dict(self._cleanup_counts_locked(), attempted=attempted)
+
+    def _cleanup_counts_locked(self) -> dict:
+        slot = self._capture
+        capture_pending = slot is not None and slot.state is CaptureState.RELEASE_PENDING
+        capture_stalled = slot is not None and slot.state is CaptureState.RELEASE_STALLED
+        return {"pending": sum(1 for o in self._obligations if not o.stalled) + capture_pending,
+                "stalled": sum(1 for o in self._obligations if o.stalled) + capture_stalled}
+
     # ------------------------------------------------------------------ reads
 
     @_draining
@@ -696,6 +918,8 @@ class PreparedSourceStore:
         """Preview read: a file user around the decode; resets the idle TTL (D5)."""
         with self._lock:
             source = self._live(source_id, generation)
+            if self._capture_pending_locked():
+                raise self._cleanup_pending_error_locked()
             if source.state in (SourceState.AWAITING_FILE, SourceState.WRITING):
                 raise SourceError("not_prepared")
             source.readers += 1
@@ -713,6 +937,16 @@ class PreparedSourceStore:
             if source.voided and source.users() == 0:
                 self._cond.notify_all()                     # a waiting sweeper may act now
         self._run(claimed, [])
+
+    @_draining
+    def validate_source(self, source_id: str, generation: int) -> tuple[int, int]:
+        """Validate a prepared source (due deadlines applied) WITHOUT resetting the idle
+        TTL: used when there is no template to read (``204``)."""
+        with self._lock:
+            source = self._live(source_id, generation)
+            if source.frame_width is None:
+                raise SourceError("not_prepared")
+            return source.frame_width, source.frame_height
 
     @_draining
     def touch_template(self, source_id: str, generation: int) -> tuple[int, int]:
@@ -735,6 +969,8 @@ class PreparedSourceStore:
             raise SourceError("invalid_request")
         with self._lock:
             source = self._live(source_id, generation)
+            if self._capture_pending_locked():
+                raise self._cleanup_pending_error_locked()
             if source.geometry_unstable:
                 raise SourceError("source_geometry_unstable")
             state_refusals = {SourceState.PLAY_PENDING: "play_pending", SourceState.PLAYING: "playing",
@@ -770,6 +1006,8 @@ class PreparedSourceStore:
                 if run is None:
                     raise SourceError("outcome_evicted")
                 return self._record(run)
+            if self._capture_pending_locked():       # before the CAS: no attempt is used
+                raise self._cleanup_pending_error_locked()
             if attempt < source.next_attempt:
                 raise SourceError("attempt_superseded")
             if attempt > source.next_attempt:
@@ -937,6 +1175,11 @@ class PreparedSourceStore:
                 return
             self._due_locked()
             now = self._now()
+            slot = self._capture
+            if (slot is not None and slot.state is CaptureState.RELEASE_PENDING and not slot.in_flight
+                    and not slot.busy and slot.next_at <= now):
+                slot.in_flight = True
+                self._deferred_captures.append(slot)
             for obligation in list(self._obligations):
                 if not obligation.stalled and obligation.next_at <= now:
                     self._deferred_obligations += self._claim(obligation)
@@ -946,11 +1189,14 @@ class PreparedSourceStore:
         reader, writer or session, in flight or stalled has no due time; its release (or
         the attempt's end) notifies the condition instead, so the sweeper never spins.
         Deferred work (a cancel scheduled by a hook) is due now; a pass drains it."""
-        if self._deferred_obligations or self._deferred_cancels:
+        if self._deferred_obligations or self._deferred_cancels or self._deferred_captures:
             return self._now()
+        slot = self._capture
+        capture_due = ([slot.next_at] if slot is not None and slot.state is CaptureState.RELEASE_PENDING
+                       and not slot.in_flight and not slot.busy else [])
         times = [obligation.next_at for obligation in self._obligations
                  if not obligation.stalled and not obligation.in_flight
-                 and (obligation.source is None or obligation.source.users() == 0)]
+                 and (obligation.source is None or obligation.source.users() == 0)] + capture_due
         source = self._slot
         if source is not None and not source.voided:
             times += [t for t in (source.deadline, source.expires_at if source.state is SourceState.PREPARED
@@ -988,51 +1234,90 @@ class PreparedSourceStore:
     # ------------------------------------------------------------------ shutdown
 
     def close(self) -> None:
-        """Close admission for good, cancel the open ticket, stop the sweeper and the
-        video session, then run at most one final deletion attempt per obligation that
-        has no users and no attempt in flight. Waiting is bounded by the shutdown budget;
-        a budget that runs out is not cleanup success. Never raises for a failed deletion."""
-        with self._lock:
-            if self._closed:
-                return
-            self._closed = True
-            source = self._slot
-            cancels = self._deferred_cancels
-            self._deferred_cancels = []
-            # Deletions already claimed (in_flight) but still queued for a drain that may
-            # never come (the sweeper stops): close runs them as their one final attempt.
-            final: list[_Obligation] = self._deferred_obligations
-            self._deferred_obligations = []
-            if source is not None and not source.voided:
-                if source.state is SourceState.PLAY_PENDING:
-                    cancels += self._cancel_active(source, Outcome.CANCELLED)
-                final += self._void(source, "closed")   # claimed only without file users
-            self._cond.notify_all()
-            sweeper = self._sweeper
-        if sweeper is not None:
-            sweeper.join(timeout=self._shutdown_budget_seconds)
+        """Standalone shutdown: ``begin_shutdown``, cancel a consumed open ticket's lease,
+        this store's own ``video.stop()``, then ``finish_shutdown``. The composed runtime
+        never calls this (its single Stop runs between the two phases, plan §18.2 item 2)."""
+        cancels = self._begin_shutdown()
+        if cancels is None:
+            return
         self._run([], cancels)
         try:
             self._video.stop()
         except Exception:                                   # noqa: BLE001
             self._log("video stop failed during shutdown")
+        self.finish_shutdown()
+
+    def begin_shutdown(self) -> None:
+        """Phase 1 (no VideoService call): admission closed for good, an open ticket
+        cancelled (a consumed one is ended by the runtime's single Stop), the slot voided,
+        the sweeper stopped. Idempotent."""
+        self._begin_shutdown()
+
+    def _begin_shutdown(self) -> list[tuple[int, str]] | None:
         with self._lock:
-            for obligation in self._obligations:
-                final += self._claim(obligation)
-        workers = [threading.Thread(target=self._attempt_delete, args=(obligation,),
-                                    name="prepared-source-final-delete", daemon=True) for obligation in final]
-        for worker in workers:
-            worker.start()
+            if self._closed:
+                return None
+            self._closed = True
+            source = self._slot
+            cancels = self._deferred_cancels
+            self._deferred_cancels = []
+            # Deletions/releases already claimed (in_flight) but still queued for a drain
+            # that may never come (the sweeper stops): finish_shutdown runs them as their
+            # one final attempt.
+            self._shutdown_final = self._deferred_obligations
+            self._deferred_obligations = []
+            if source is not None and not source.voided:
+                if source.state is SourceState.PLAY_PENDING:
+                    cancels += self._cancel_active(source, Outcome.CANCELLED)
+                self._shutdown_final += self._void(source, "closed")   # claimed only without users
+            self._cond.notify_all()
+            sweeper = self._sweeper
+        if sweeper is not None:
+            sweeper.join(timeout=self._shutdown_budget_seconds)
+        return cancels
+
+    def finish_shutdown(self) -> None:
+        """Phase 2: at most one final release per capture obligation (not busy, nothing in
+        flight), then at most one final deletion per file obligation without users and
+        without an attempt in flight. Bounded by the shutdown budget; a budget that runs
+        out is not cleanup success; never raises for a failed release or deletion."""
         deadline = time.monotonic() + self._shutdown_budget_seconds
         with self._lock:
-            while any(obligation.in_flight for obligation in self._obligations):
+            if not self._closed or self._shutdown_done:
+                return
+            captures = self._deferred_captures
+            self._deferred_captures = []
+            slot = self._capture
+            if (slot is not None and slot.state in (CaptureState.RELEASE_PENDING, CaptureState.RELEASE_STALLED)
+                    and not slot.in_flight and not slot.busy):
+                slot.in_flight = True
+                captures.append(slot)
+        self._run_bounded(captures, self._release_capture, deadline,
+                          lambda: self._capture is not None and self._capture.in_flight)
+        with self._lock:
+            final = self._shutdown_final + self._deferred_obligations
+            self._shutdown_final, self._deferred_obligations = [], []
+            for obligation in self._obligations:
+                final += self._claim(obligation)
+            self._shutdown_done = True                      # no deletion after this point
+        self._run_bounded(final, self._attempt_delete, deadline,
+                          lambda: any(obligation.in_flight for obligation in self._obligations))
+        with self._lock:
+            left = len(self._obligations) + (self._capture is not None)
+        if left:
+            self._log(f"{left} cleanup obligation(s) remain after shutdown; startup cleanup handles them")
+
+    def _run_bounded(self, items: list, action, deadline: float, busy) -> None:
+        workers = [threading.Thread(target=action, args=(item,), name="prepared-source-final-cleanup",
+                                    daemon=True) for item in items]
+        for worker in workers:
+            worker.start()
+        with self._lock:
+            while busy():
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     break
                 self._cond.wait(timeout=remaining)
-            left = len(self._obligations)
-        if left:
-            self._log(f"{left} cleanup obligation(s) remain after shutdown; startup cleanup handles them")
 
     # ------------------------------------------------------------------ snapshot
 
@@ -1064,12 +1349,17 @@ class PreparedSourceStore:
                 state = SourceState.DELETING
         else:
             state = source.state
+        slot = self._capture
+        capture_state = slot.state.value if slot is not None else None
+        capture_attempts = slot.attempts if slot is not None else 0
+        capture_pending = self._capture_pending_locked()
         if source is None:
             return CurrentSnapshot(None, None, state, None, None, None, None, None, False, False, None, None,
-                                   None, None, True, obligation.reason, obligation.attempts)
+                                   None, None, True, obligation.reason, obligation.attempts,
+                                   capture_state, capture_attempts)
         last = next(reversed(source.records.values()), None)
         ready = (source.config is not None and not source.geometry_unstable and not source.voided
-                 and source.state is SourceState.PREPARED)
+                 and source.state is SourceState.PREPARED and not capture_pending)
         return CurrentSnapshot(
             source.source_id, source.generation, state, source.upload_operation_id,
             source.frame_width, source.frame_height, 1 if source.frame_width is not None else None,
@@ -1077,9 +1367,10 @@ class PreparedSourceStore:
             source.next_attempt, self._record(last) if last is not None else None,
             max(0.0, source.expires_at - now) if source.expires_at is not None else None,
             max(0.0, source.deadline - now) if source.deadline is not None else None,
-            obligation is not None or bool(self._obligations),
-            obligation.reason if obligation is not None else None,
-            obligation.attempts if obligation is not None else 0)
+            obligation is not None or bool(self._obligations) or capture_pending,
+            obligation.reason if obligation is not None else ("capture_release" if capture_pending else None),
+            obligation.attempts if obligation is not None else 0,
+            capture_state, capture_attempts)
 
     def ticket_summary(self, ticket_id: int) -> tuple[int, tuple[str, bool | None] | None] | None:
         with self._lock:
