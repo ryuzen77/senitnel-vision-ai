@@ -7,9 +7,14 @@ with API fakes (frontend plan §23). Real video (cloud and audio off): an agent 
 replay through the API on `67a04fb`, and an owner UI test of Play, Stop, delete, line and
 ROI only (report baseline `67a04fb`; commit of the running app not recorded), both in
 `completed/history.md`. The zone-editor fix that test called for is in
-`8a6b8e5` (frontend plan §24; fakes and independent review, no real-video re-test). P1 as
-a whole stays open until the owner closes it; private-trigger behaviour on real footage,
-accuracy and devices are not proven.**
+`8a6b8e5` (frontend plan §24; fakes and independent review, no real-video re-test).**
+
+**P1 completed (owner closing decision, 2026-10-12; plan moved to `completed/`).** What
+is complete is the **preparation and configuration flow**: upload → preview → access
+line and zones → save → Play/Stop/delete, with its store, API and UI. It is **not** a
+validation of detection or trigger accuracy, of warnings, or of prevention/deterrence:
+private-trigger behaviour on real footage, model accuracy, latency, gesture, the local
+warning sound, real devices and field use remain unproven (T3, R1, C1H).
 Author: Claude
 (implementing agent), 2026-10-11, from source read at `a45c986`. Review history: rev 1
 (`2fc0a08`) BLOCKED (five gaps), rev 2 (`53e27c1`) BLOCKED (R1-R4), rev 3 (`413c5ae`)

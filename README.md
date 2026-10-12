@@ -49,8 +49,8 @@ The backend has one process-wide mode, chosen by `SENTINEL_PARKING_MODE` at star
 An optional startup template (`SENTINEL_PRIVATE_PARKING_CONFIG_FILE`) is only an
 unconfirmed starting point; analysis always uses the configuration the operator saved
 for that source. Design and contracts: [private parking mode](docs/design-docs/private-parking-mode.md),
-[backend plan](docs/exec-plans/active/private-parking-preview-configuration.md),
-[frontend plan](docs/exec-plans/active/private-parking-configuration-ui.md).
+[backend plan](docs/exec-plans/completed/private-parking-preview-configuration.md),
+[frontend plan](docs/exec-plans/completed/private-parking-configuration-ui.md).
 
 ### AI evaluation and audio are off unless configured
 

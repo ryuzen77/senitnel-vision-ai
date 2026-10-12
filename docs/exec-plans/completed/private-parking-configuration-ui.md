@@ -3,6 +3,9 @@
 ## 1. Status, baseline, dan otorisasi
 
 **COMPLETED — frontend verified with API fakes. PASS WITH LIMITATIONS, Claude melalui owner/PM.**
+**P1 ditutup owner (2026-10-12) dan rencana ini dipindah ke `completed/`.** Yang selesai
+adalah alur persiapan/konfigurasi (preview, garis/zona, simpan, Play/Stop/hapus), bukan
+validasi akurasi deteksi/trigger, peringatan, maupun pencegahan.
 Penulis: Codex. Penyelarasan kontrak: 2026-10-12. Owner mengotorisasi implementasi P1d pada blob
 `36022c15460b0167590c4c6ce301ced573ce56d7`, 2026-10-12, dan meminta berhenti
 pada awaiting independent review Claude saat handoff implementasi. Penutupan dan
@@ -34,7 +37,7 @@ Konteks: [AGENTS.md](../../../AGENTS.md), [aturan rencana](../../PLANS.md),
 [arsitektur](../../../ARCHITECTURE.md), [frontend](../../FRONTEND.md),
 [design](../../DESIGN.md), [reliability](../../RELIABILITY.md),
 [security](../../SECURITY.md), [product specs](../../product-specs/index.md),
-[F1](../completed/f1-frontend-ui-ux.md), [T3](t3-private-parking-integration.md).
+[F1](../completed/f1-frontend-ui-ux.md), [T3](../active/t3-private-parking-integration.md).
 Dokumen bersama dapat memiliki delta penulis lain; kontrak implementasi P1c dibaca
 pada commit di atas. Skill frontend-design dipakai untuk arah editor dan acceptance
 visual. Tidak menonton media nyata baru. Bukti visual P1d pada §20 memakai API fake,

@@ -41,13 +41,14 @@ Counts not listed here were not recorded in this log.
 | `1771d6b` | 2026-10-11 | T3d direct Gemini evaluation for private parking (prompt, dispatch gate) | review PASS WITH LIMITATIONS (reviewer 291 target / 1,209 full, relayed); closure PASS; fakes only, no live request; model accuracy unproven |
 | `a45c986` | 2026-10-11 | F1 dashboard for Indonesian operators ([plan](f1-frontend-ui-ux.md)) | implementer (Codex): 61 Vitest tests, build, fake-browser checks at six viewports; independent review (Claude): PASS WITH LIMITATIONS, `npm test` 61 / 8 files and build re-run, no browser/contrast/screen-reader audit; three low findings open (plan §12) |
 | `745cd44` | 2026-10-08 | Reviewer and scoped-fix authorization wording (`AGENTS.md` only) | documentation only |
-| `b3b7f3a` | 2026-10-12 | P1a prepared source store and ownership core (core only) ([backend plan](../active/private-parking-preview-configuration.md) §15.4) | review PASS WITH LIMITATIONS (Codex via owner/PM); reviewer 140 target / 1,349 full (relayed); repetition and mutation runs implementer-only |
+| `b3b7f3a` | 2026-10-12 | P1a prepared source store and ownership core (core only) ([backend plan](private-parking-preview-configuration.md) §15.4) | review PASS WITH LIMITATIONS (Codex via owner/PM); reviewer 140 target / 1,349 full (relayed); repetition and mutation runs implementer-only |
 | `1d13095` | 2026-10-12 | P1a closure attribution and draft references (docs) | documentation only |
 | `c7d4ddc` | 2026-10-12 | R1 risk and validation plan ([plan](../active/r1-risk-validation.md)) | documentation only; planning record approved by the PM |
 | `3c5446a` | 2026-10-12 | P1b prepared video lifecycle and session configuration (backend plan §17.2) | independent review (Codex via owner/PM): 131 target / 1,410 full (relayed); verdict wording not recorded in the plan; fakes only |
 | `eb6a3ac` | 2026-10-12 | P1c private parking preparation API and runtime (backend plan §19.3; wire contract frozen) | review PASS WITH LIMITATIONS (Codex via owner/PM); reviewer 175 target / 1,463 full (relayed); fakes only, no real server, decoder or device |
-| `67a04fb` | 2026-10-12 | P1d private parking configuration workflow, frontend ([plan](../active/private-parking-configuration-ui.md) §23) | independent review (Claude): PASS WITH LIMITATIONS, `npm test` 175 / 16 files and build re-run; browser/visual checks are implementer evidence (Codex, API fakes); real-video checks: see below |
+| `67a04fb` | 2026-10-12 | P1d private parking configuration workflow, frontend ([plan](private-parking-configuration-ui.md) §23) | independent review (Claude): PASS WITH LIMITATIONS, `npm test` 175 / 16 files and build re-run; browser/visual checks are implementer evidence (Codex, API fakes); real-video checks: see below |
 | `8a6b8e5` | 2026-10-12 | Zone-editor pointer conflicts fixed (frontend plan §24) | implementer (Codex): 192 Vitest tests / 16 files, build, fake-browser checks; independent review (Claude): PASS WITH LIMITATIONS, `npm test` 192 / 16 files and build re-run, reviewer's own fake-API browser reproduction of both click orders, corner and line-endpoint clicks, pending-corner cancel/reset, rejected small areas, reversed numbers and blocked invalid save; five low UX findings (tech-debt #22); no real-video re-test |
+| `0c3db3f` | 2026-10-12 | Setup guide and verified prototype status (README, plan/status sync, C1H draft, F1 plan archived) | documentation only; reviewed by Codex before the commit; fresh-machine installation not verified |
 
 Limits of this evidence: the single COMPLETED live result proves the request,
 validation and dashboard path for one NORMAL case. It does not prove detection
@@ -67,3 +68,11 @@ provider request):
   drawing only. It exposed zone-editor pointer conflicts, fixed in `8a6b8e5` with fakes and
   an independent review; the owner has not repeated the real-video test since.
 Neither check proves candidate or warning quality, detection accuracy or latency.
+
+Closure notes:
+- **Keputusan penutupan P1 oleh owner; commit pengarsipan masih pending** (2026-10-12).
+  The [backend plan](private-parking-preview-configuration.md) and the
+  [frontend plan](private-parking-configuration-ui.md) move to `completed/`. Closed scope:
+  the preparation and configuration flow (upload, preview, line and zones, save,
+  Play/Stop/delete). Not a validation of detection or trigger accuracy, warnings or
+  prevention.

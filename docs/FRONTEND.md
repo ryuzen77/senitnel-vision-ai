@@ -29,7 +29,7 @@ Polling only (no WebSocket). Stale responses from an older session/epoch are ign
 - Never render raw provider text that was not validated by the backend.
 - Private mode is chosen from `/api/video/sources/capabilities`, never from the domain;
   Play is offered only from the backend's `config.ready`, and mutations are never
-  retried automatically. Details: [frontend plan](exec-plans/active/private-parking-configuration-ui.md).
+  retried automatically. Details: [frontend plan](exec-plans/completed/private-parking-configuration-ui.md).
 - The frontend shows no local access warning status: no API exposes it yet.
 
 ## Backlog (not implemented)

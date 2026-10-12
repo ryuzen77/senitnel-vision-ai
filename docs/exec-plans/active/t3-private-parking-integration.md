@@ -2337,7 +2337,7 @@ evidence was not included in the relay). Acceptance 24 and 30 finalised.
   jangan pegang motornya.”, Indonesian TTS, natural, questioning then firm, separate from
   the CRITICAL clip, duration within the current validator; asset not created, deterrent
   effect unproven (tech-debt #15). Configuration UI flow:
-  [P1](private-parking-preview-configuration.md), committed `b3b7f3a`…`8a6b8e5` (fakes;
+  [P1](../completed/private-parking-preview-configuration.md), committed `b3b7f3a`…`8a6b8e5` (fakes;
   owner real-video UI test of Play, Stop, delete, line and ROI only, report baseline
   `67a04fb`, commit of the running app not recorded). Camera health: draft
   [C1H](camera-health-monitoring.md).

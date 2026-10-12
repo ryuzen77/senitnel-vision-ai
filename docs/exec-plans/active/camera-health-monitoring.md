@@ -40,7 +40,7 @@ none is fixed in this draft.
   `UNKNOWN`) and shown apart from the AI assessment and the local warning.
 - Recovery: the status clears only after healthy frames return; `VIEW_CHANGED` needs the
   operator to re-verify (or redraw) the line/zones on a new preview (depends on
-  [preview configuration](private-parking-preview-configuration.md)).
+  [preview configuration](../completed/private-parking-preview-configuration.md)).
 - No speaker output, provider dispatch or "tampering" wording from health signals.
 
 ## 5. Acceptance (planned, fakes)
