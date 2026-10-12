@@ -3,6 +3,7 @@ import { VIDEO_STREAM_URL, VideoState } from '../api/videoApi'
 
 interface Props {
   state: VideoState
+  sessionKey?: string | null
 }
 
 /**
@@ -18,7 +19,7 @@ interface Props {
  * RUNNING, so the <img> appears in that same render pass — no extra
  * polling tick needed.
  */
-export function VideoPreview({ state }: Props) {
+export function VideoPreview({ state, sessionKey }: Props) {
   const streamGeneration = useRef(0)
   const [failedStream, setFailedStream] = useState<string | null>(null)
   const streamUrl = useMemo(
@@ -27,7 +28,7 @@ export function VideoPreview({ state }: Props) {
       streamGeneration.current += 1
       return `${VIDEO_STREAM_URL}?sid=${Date.now()}-${streamGeneration.current}`
     },
-    [state],
+    [state, sessionKey],
   )
 
   if (streamUrl !== null && streamUrl !== failedStream) {

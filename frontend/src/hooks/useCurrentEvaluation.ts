@@ -22,6 +22,7 @@ export interface CurrentEvaluationState {
 interface StoredState {
   epoch: number
   view: EvaluationCurrent | null
+  sessionId?: string | null
   fetchError: string | null
   rebinding: boolean
 }
@@ -41,13 +42,13 @@ const EMPTY: CurrentEvaluationState = { view: null, fetchError: null, loading: t
  * to that session and is itself discarded; the next response for the same
  * session is accepted. A new session is therefore never rejected forever.
  *
- * Limitation: /api/video/status carries no session ID, so a backend session
+ * Without an explicit status identity, a backend session
  * change that did not go through this UI is only noticed when an evaluation
  * poll observes it. The poll interval is the delay between one settled request
  * and the next, not an upper bound on detection: a slow or hanging request
  * delays detection further, and re-binding needs one more response.
  */
-export function useCurrentEvaluation(enabled: boolean, epoch: number): CurrentEvaluationState {
+export function useCurrentEvaluation(enabled: boolean, epoch: number, sessionId?: string | null): CurrentEvaluationState {
   const generation = useRef(0)
   const [stored, setStored] = useState<StoredState>({
     epoch: -1, view: null, fetchError: null, rebinding: false,
@@ -73,6 +74,7 @@ export function useCurrentEvaluation(enabled: boolean, epoch: number): CurrentEv
       try {
         const next = await getCurrentEvaluation(controller.signal)
         if (!isCurrent()) return
+        if (sessionId !== undefined && (!sessionId || next.source_session_id !== sessionId || (next.latest_result !== null && next.latest_result.source_session_id !== sessionId))) { setStored({epoch, sessionId, view:null, fetchError:null, rebinding:true}); return }
         if (next.source_session_id !== null) {
           if (pinnedSession !== null && next.source_session_id !== pinnedSession) {
             pinnedSession = next.source_session_id
@@ -81,13 +83,14 @@ export function useCurrentEvaluation(enabled: boolean, epoch: number): CurrentEv
           }
           pinnedSession = next.source_session_id
         }
-        setStored({ epoch, view: next, fetchError: null, rebinding: false })
+        setStored({ epoch, view: next, sessionId, fetchError: null, rebinding: false })
       } catch (err: unknown) {
         if (!isCurrent() || (err instanceof DOMException && err.name === 'AbortError')) return
         // Never keep an older view on screen as if it were current.
         setStored({
           epoch,
           view: null,
+          sessionId,
           fetchError: err instanceof Error ? err.message : String(err),
           rebinding: false,
         })
@@ -104,11 +107,11 @@ export function useCurrentEvaluation(enabled: boolean, epoch: number): CurrentEv
       controller?.abort()
       if (timeoutId !== null) window.clearTimeout(timeoutId)
     }
-  }, [enabled, epoch])
+  }, [enabled, epoch, sessionId])
 
   // Render-time guard: in the render where `enabled`/`epoch` change, the effect
   // has not run yet, so state from the previous lifecycle must not be shown.
-  if (!enabled || stored.epoch !== epoch) return EMPTY
+  if (!enabled || stored.epoch !== epoch || (sessionId !== undefined && (stored.sessionId !== sessionId || (stored.view !== null && stored.view.source_session_id !== sessionId)))) return EMPTY
   return {
     view: stored.view,
     fetchError: stored.fetchError,

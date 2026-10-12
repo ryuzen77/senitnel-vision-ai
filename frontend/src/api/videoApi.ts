@@ -18,6 +18,8 @@ export interface VideoStatusResponse {
   state: VideoState
   source: string | null
   error: string | null
+  session_ref?: string | null
+  session_id?: string | null
 }
 
 export interface VideoStartResponse {

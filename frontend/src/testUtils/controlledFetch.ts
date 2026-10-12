@@ -39,6 +39,7 @@ export function stubControlledFetch(): { calls: (url: string) => ControlledCall[
         scene_sample_count: null, scene_top_score: null, scene_mean_margin: null, scene_consistency: null,
       }))
     }
+    if (url === '/api/video/sources/capabilities') return Promise.resolve(response({mode:'legacy',preparation_available:false,template_available:false,evaluation_enabled:false,source_kinds:['file'],limits:{max_upload_bytes:209715200,accepted_types:['video/mp4','video/webm'],max_zones:8,min_line_length:.05,min_zone_area:.005,max_configuration_bytes:4096}}))
     if (url === '/api/health') return Promise.resolve(response({ status: 'online', service: 'test' }))
     return Promise.reject(new Error(`unexpected ${url}`))
   }))

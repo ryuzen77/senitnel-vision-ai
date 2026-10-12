@@ -1,3 +1,6 @@
+import { privateMutationAvailable, SECURE_CONTEXT_MESSAGE } from './api/preparedSourceApi'
+import { PrivateParkingConfiguration } from './components/PrivateParkingConfiguration'
+import { useSourcePreparation } from './hooks/useSourcePreparation'
 import { useCallback, useEffect, useState } from 'react'
 import { VideoPreview } from './components/VideoPreview'
 import { DetectionPanel } from './components/DetectionPanel'
@@ -40,6 +43,14 @@ function App() {
     setAwaitingFreshStatus(true)
   }, [])
 
+  const handlePrivateLifecycle = useCallback(() => {
+    setLifecycleEpoch(epoch => epoch + 1)
+    setPendingState(null)
+    setAwaitingFreshStatus(true)
+  }, [])
+  const preparation = useSourcePreparation(handlePrivateLifecycle)
+  const privateMode = preparation.capabilities?.mode === 'private'
+  const legacyMode = preparation.capabilities?.mode === 'legacy'
   // The first status read after an action settles is authoritative whatever its
   // value (e.g. IDLE after EOF, RUNNING after a failed Stop), replacing the
   // optimistic or transitional pending state.
@@ -62,13 +73,13 @@ function App() {
   // The optimistic/transitional state of an action wins until a fresh status read.
   const effectiveState = pendingState ?? videoState
   const { result: latestDetection, fetchError: detectionError } = useLatestDetection(
-    videoState === VideoState.RUNNING,
+    videoState === VideoState.RUNNING, lifecycleEpoch, status?.session_id,
   )
   const { snapshot: domainSnapshot, fetchError: domainError } = useCurrentDomain(
-    effectiveState === VideoState.RUNNING,
+    effectiveState === VideoState.RUNNING, lifecycleEpoch, status?.session_id,
   )
   const domainUi = getDomainUiState(effectiveState, domainSnapshot, domainError)
-  const evaluation = useCurrentEvaluation(effectiveState === VideoState.RUNNING, lifecycleEpoch)
+  const evaluation = useCurrentEvaluation(effectiveState === VideoState.RUNNING, lifecycleEpoch, status?.session_id)
   const evaluationUi = getEvaluationUiState(effectiveState === VideoState.RUNNING, evaluation)
   const sourceLabel = status?.source
     ? status.source === 'webcam' ? 'Kamera' : 'File video'
@@ -81,19 +92,25 @@ function App() {
         <span className="backend-badge" title="Koneksi diperiksa saat halaman dibuka; bukan status kesiapan AI atau audio.">Layanan {health?.status === 'online' ? 'terhubung saat membuka halaman' : health ? 'belum terhubung' : 'sedang diperiksa'}</span>
       </header>
       <section className="monitoring-section" aria-label="Pemantauan video dan penilaian AI">
+        {privateMode && effectiveState !== VideoState.RUNNING && <PrivateParkingConfiguration preparation={preparation} />}
+        {!preparation.capabilities && <p className="inline-error" role="status">Mode sumber belum dapat dipastikan. Start baru ditahan.</p>}
+        {preparation.capabilities?.mode === 'disabled' && <p className="inline-error" role="status">Sumber video tidak tersedia pada mode ini.</p>}
+        {privateMode && effectiveState === VideoState.RUNNING && !privateMutationAvailable() && <p className="inline-error" role="alert">{SECURE_CONTEXT_MESSAGE}</p>}
         <div className="video-workspace">
-          <section className="video-column" aria-labelledby="video-heading">
+          {(!privateMode || effectiveState === VideoState.RUNNING || effectiveState === VideoState.ERROR) && <section className="video-column" aria-labelledby="video-heading">
             <div className="section-heading source-heading"><h2 id="video-heading">Video aktif</h2><VideoStatusBadge state={effectiveState} /></div>
             {fetchError && <p className="inline-error" role="status">Status video belum dapat dimuat.</p>}
-            <VideoPreview state={effectiveState} />
-            <VideoSourceSelector
+            <VideoPreview state={effectiveState} sessionKey={status?.session_ref} />
+            {(legacyMode || effectiveState === VideoState.RUNNING || effectiveState === VideoState.ERROR) && <VideoSourceSelector
+              startAllowed={legacyMode}
+              mutationAllowed={true}
               state={videoState}
               pendingState={pendingState}
               onPendingStateChange={handlePendingStateChange}
               onActionSettled={handleActionSettled}
-            />
+            />}
             <div className="video-status-strip" aria-label="Sumber dan lingkungan"><span>Sumber: <strong>{sourceLabel}</strong></span><span>Lingkungan: <DomainStatusBadge value={domainUi} /></span></div>
-          </section>
+          </section>}
           <EvaluationPanel ui={evaluationUi} />
         </div>
         <div className="secondary-details">

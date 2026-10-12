@@ -47,6 +47,7 @@ export function stubAppFetch(): PendingEvaluation[] {
         scene_sample_count: null, scene_top_score: null, scene_mean_margin: null, scene_consistency: null,
       }))
     }
+    if (url === '/api/video/sources/capabilities') return Promise.resolve(jsonResponse({mode:'legacy',preparation_available:false,template_available:false,evaluation_enabled:false,source_kinds:['file'],limits:{max_upload_bytes:209715200,accepted_types:['video/mp4','video/webm'],max_zones:8,min_line_length:.05,min_zone_area:.005,max_configuration_bytes:4096}}))
     if (url === '/api/health') return Promise.resolve(jsonResponse({ status: 'online', service: 'test' }))
     return Promise.reject(new Error(`unexpected ${url}`))
   }))
@@ -74,3 +75,15 @@ export function completedView(session: string, eventId: string, reasoning: strin
     },
   }
 }
+
+/** Fake P1c responses for tests only; never imported by product code. */
+export const sourceId='11111111-1111-4111-8111-111111111111'
+export const intentId='22222222-2222-4222-8222-222222222222'
+export const sessionId='33333333-3333-4333-8333-333333333333'
+export const privateCaps={mode:'private',preparation_available:true,template_available:false,evaluation_enabled:false,source_kinds:['file'],limits:{max_upload_bytes:209715200,accepted_types:['video/mp4','video/webm'],max_zones:8,min_line_length:.05,min_zone_area:.005,max_configuration_bytes:4096}}
+export const validConfiguration={frame_width:640,frame_height:480,line:{p1:[.2,.5] as [number,number],p2:[.8,.5] as [number,number]},inside:'right' as const,zones:[{name:'zona-1',rect:[.1,.1,.5,.5] as [number,number,number,number]}]}
+export function preparedSnapshot(overrides:Record<string,unknown>={}) {
+ return {source_id:sourceId,generation:1,state:'PREPARED',upload_operation_id:intentId,frame_width:640,frame_height:480,preview_revision:1,config:null,geometry_unstable:false,template_available:false,next_attempt:1,last_attempt:null,expires_in_seconds:1800,deadline_in_seconds:null,cleanup:{pending:false,reason:null,attempts:0,capture:null,capture_attempts:0},analysis:{stop_required:false,state:'IDLE',session_ref:null,session_id:null},...overrides}
+}
+export function attemptRecord(outcome='STARTED',overrides:Record<string,unknown>={}) {return {attempt:1,operation_id:intentId,outcome,reason:null,session_ref:sessionId,session_id:sessionId,session:{phase:'RUNNING',end_reason:null,cleanup_ok:null},...overrides}}
+export function sourceResponse(body:unknown,status=200) {return {ok:status>=200&&status<300,status,json:async()=>body} as Response}

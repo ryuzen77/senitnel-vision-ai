@@ -193,6 +193,26 @@ describe('useCurrentEvaluation session pinning', () => {
 })
 
 describe('useCurrentEvaluation errors', () => {
+  it('preserves a fetch error while explicitly pinned to the status session', async () => {
+    const { result } = renderHook(() => useCurrentEvaluation(true, 0, 'B'))
+    calls[0].reject(new Error('HTTP 503'))
+    await flush()
+    expect(result.current.fetchError).toBe('HTTP 503')
+    expect(result.current.loading).toBe(false)
+  })
+
+  it('drops an old result even if its envelope claims the current status session', async () => {
+    const { result } = renderHook(() => useCurrentEvaluation(true, 0, 'B'))
+    calls[0].resolve(view('B', { latest_result: { source_session_id: 'A' } as EvaluationCurrent['latest_result'] }))
+    await flush()
+    expect(result.current.view).toBeNull()
+    expect(result.current.rebinding).toBe(true)
+    await flush(EVALUATION_POLL_INTERVAL_MS)
+    calls[1].resolve(view('B'))
+    await flush()
+    expect(result.current.view?.source_session_id).toBe('B')
+  })
+
   it('network error clears the view, keeps the normal interval and recovers', async () => {
     const { result } = render(true, 0)
     calls[0].resolve(view('A', { process_state: 'COMPLETED' }))

@@ -9,6 +9,8 @@ import {
 } from '../api/videoApi'
 
 interface Props {
+  startAllowed?: boolean
+  mutationAllowed?: boolean
   /** Last backend status read in the current lifecycle (IDLE while unknown). */
   state: VideoState
   /** Optimistic state owned by App; cleared by App on the first fresh status read. */
@@ -32,7 +34,7 @@ function actionMessage(error: unknown): string {
   return 'Layanan tidak dapat dihubungi. Periksa koneksi ke aplikasi.'
 }
 
-export function VideoSourceSelector({ state, pendingState, onPendingStateChange, onActionSettled }: Props) {
+export function VideoSourceSelector({ state, pendingState, onPendingStateChange, onActionSettled, startAllowed = true, mutationAllowed = true }: Props) {
   const [activeTab, setActiveTab] = useState<Tab>('webcam')
   const [actionError, setActionError] = useState<string | null>(null)
   const [isActing, setIsActing] = useState(false)
@@ -42,7 +44,7 @@ export function VideoSourceSelector({ state, pendingState, onPendingStateChange,
   const isTransitioning =
     effectiveState === VideoState.STARTING || effectiveState === VideoState.STOPPING
   const sourceControlsDisabled =
-    isTransitioning || isActing || effectiveState === VideoState.RUNNING || effectiveState === VideoState.ERROR
+    !startAllowed || !mutationAllowed || isTransitioning || isActing || effectiveState === VideoState.RUNNING || effectiveState === VideoState.ERROR
 
   // On failure the transitional pending state is kept: App replaces it with the
   // first status read after the action settles, never with a pre-action status.
@@ -110,7 +112,7 @@ export function VideoSourceSelector({ state, pendingState, onPendingStateChange,
         {(effectiveState === VideoState.RUNNING || effectiveState === VideoState.ERROR || effectiveState === VideoState.STOPPING) ? (
           <button
             onClick={handleWebcamClick}
-            disabled={isTransitioning || isActing}
+            disabled={isTransitioning || isActing || !mutationAllowed}
             className="stop-button"
           >
             {effectiveState === VideoState.STOPPING
